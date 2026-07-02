@@ -1,0 +1,16 @@
+.env
+__pycache__/
+*.py[cod]
+
+.venv/
+
+*/data/
+*/output/
+
+acceptance_outputs/
+real_acceptance_data/
+real_acceptance_data_smoke/
+real_acceptance_outputs/
+real_acceptance_outputs_smoke/
+
+.agents/
