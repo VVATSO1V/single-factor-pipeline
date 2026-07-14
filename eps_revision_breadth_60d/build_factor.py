@@ -1,11 +1,11 @@
-"""Build factor.csv for the 20-day reversal example.
+"""Build factor.csv for the 60-day EPS revision breadth factor.
 
 The factor is:
 
-    reverse_20d(T) = -(P_T / P_{T-20} - 1)
+    eps_revision_breadth_60d(T) = (up analysts - down analysts) / covered analysts
 
-It downloads the historical index-component universe and adjusted close prices
-directly from Ricequant, then writes reverse_20d/data/factor.csv.
+An analyst/institute is classified as up or down when its latest visible EPS
+forecast changes versus its previous visible forecast for the same fiscal year.
 """
 
 from __future__ import annotations
@@ -91,11 +91,10 @@ def build_universe(
     start_date: str,
     end_date: str,
     index_code: str,
-) -> pd.DataFrame:
-    trading_dates = [
-        pd.Timestamp(date).normalize()
-        for date in rq.get_trading_dates(start_date, end_date)
-    ]
+) -> tuple[pd.DataFrame, pd.DatetimeIndex]:
+    trading_dates = pd.DatetimeIndex(
+        [pd.Timestamp(date).normalize() for date in rq.get_trading_dates(start_date, end_date)]
+    )
     raw_components = rq.index_components(
         index_code,
         start_date=start_date,
@@ -129,7 +128,8 @@ def build_universe(
         for stock in current_stocks:
             rows.append({"date": date, "stock_code": stock})
 
-    return pd.DataFrame(rows).drop_duplicates(KEYS).sort_values(KEYS)
+    universe = pd.DataFrame(rows).drop_duplicates(KEYS).sort_values(KEYS)
+    return universe, trading_dates
 
 
 def lookback_start_date(rq: Any, start_date: str, lookback_days: int) -> str:
@@ -146,38 +146,77 @@ def iter_stock_chunks(stocks: list[str], chunk_size: int = 100):
         yield start, stocks[start : start + chunk_size]
 
 
-def fetch_post_close(
+def fetch_eps_reports(
     rq: Any,
     stocks: list[str],
     start_date: str,
     end_date: str,
+    eps_field: str,
 ) -> pd.DataFrame:
     parts = []
     total = len(stocks)
     for offset, chunk in iter_stock_chunks(stocks):
-        raw = rq.get_price(
+        raw = rq.consensus.get_indicator(
             chunk,
+            fiscal_year=None,
+            fields=[eps_field],
             start_date=start_date,
             end_date=end_date,
-            frequency="1d",
-            fields=["close"],
-            adjust_type="post",
-            skip_suspended=False,
+            date_rule="rpt_dt",
         )
-        frame = normalize_rq_frame(raw).rename(columns={"close": "post_close"})
-        parts.append(frame[[*KEYS, "post_close"]])
+        if raw is not None:
+            frame = normalize_rq_frame(raw)
+            frame[eps_field] = pd.to_numeric(frame[eps_field], errors="coerce")
+            parts.append(frame)
         done = min(offset + len(chunk), total)
-        print(f"download post_close progress: {done}/{total} stocks", flush=True)
+        print(f"download EPS report progress: {done}/{total} stocks", flush=True)
+
     if not parts:
-        return pd.DataFrame(columns=[*KEYS, "post_close"])
-    return pd.concat(parts, ignore_index=True).drop_duplicates(KEYS).sort_values(KEYS)
+        return pd.DataFrame(columns=[*KEYS, "institute", "fiscal_year", eps_field])
+    result = pd.concat(parts, ignore_index=True)
+    result = result.dropna(subset=["date", "stock_code", "institute", eps_field])
+    if "fiscal_year" not in result.columns:
+        result["fiscal_year"] = np.nan
+    return result.sort_values(["stock_code", "institute", "fiscal_year", "date"])
 
 
-def wide_post_close(price: pd.DataFrame) -> pd.DataFrame:
-    frame = price.copy()
-    frame["date"] = pd.to_datetime(frame["date"]).dt.normalize()
-    frame["post_close"] = pd.to_numeric(frame["post_close"], errors="coerce")
-    return frame.pivot(index="date", columns="stock_code", values="post_close").sort_index()
+def classify_revision_events(reports: pd.DataFrame, eps_field: str) -> pd.DataFrame:
+    frame = reports.copy()
+    frame[eps_field] = pd.to_numeric(frame[eps_field], errors="coerce")
+    frame = frame.dropna(subset=[eps_field])
+    frame = frame.sort_values(["stock_code", "institute", "fiscal_year", "date"])
+    group_keys = ["stock_code", "institute", "fiscal_year"]
+    frame["previous_eps"] = frame.groupby(group_keys, dropna=False)[eps_field].shift(1)
+    frame = frame.dropna(subset=["previous_eps"])
+    frame["up"] = (frame[eps_field] > frame["previous_eps"]).astype(float)
+    frame["down"] = (frame[eps_field] < frame["previous_eps"]).astype(float)
+    frame["covered"] = 1.0
+    return frame[[*KEYS, "institute", "up", "down", "covered"]]
+
+
+def rolling_unique_count(
+    events: pd.DataFrame,
+    dates: pd.DatetimeIndex,
+    stocks: list[str],
+    value_column: str,
+    window: int,
+) -> pd.DataFrame:
+    result = pd.DataFrame(index=dates, columns=stocks, dtype=float)
+    for done, stock in enumerate(stocks, start=1):
+        stock_events = events.loc[events["stock_code"] == stock, ["date", "institute", value_column]]
+        stock_events = stock_events[stock_events[value_column] > 0]
+        if not stock_events.empty:
+            matrix = (
+                stock_events.assign(value=1.0)
+                .drop_duplicates(["date", "institute"])
+                .pivot(index="date", columns="institute", values="value")
+                .reindex(dates)
+                .fillna(0.0)
+            )
+            result[stock] = matrix.rolling(window=window, min_periods=1).max().sum(axis=1)
+        if done % 100 == 0 or done == len(stocks):
+            print(f"build rolling breadth progress: {done}/{len(stocks)} stocks", flush=True)
+    return result
 
 
 def long_factor_from_wide(values: pd.DataFrame, start_date: str) -> pd.DataFrame:
@@ -194,45 +233,52 @@ def long_factor_from_wide(values: pd.DataFrame, start_date: str) -> pd.DataFrame
     return result[[*KEYS, "factor_value"]].sort_values(KEYS)
 
 
-def build_reversal_factor(close: pd.DataFrame, lookback: int, start_date: str) -> pd.DataFrame:
-    factor = -(close / close.shift(lookback) - 1.0)
+def build_factor(
+    reports: pd.DataFrame,
+    dates: pd.DatetimeIndex,
+    stocks: list[str],
+    eps_field: str,
+    window: int,
+    start_date: str,
+) -> pd.DataFrame:
+    events = classify_revision_events(reports, eps_field)
+    if events.empty:
+        return pd.DataFrame(columns=[*KEYS, "factor_value"])
+    up = rolling_unique_count(events, dates, stocks, "up", window)
+    down = rolling_unique_count(events, dates, stocks, "down", window)
+    covered = rolling_unique_count(events, dates, stocks, "covered", window)
+    factor = (up - down).div(covered.where(covered > 0))
+    factor = factor.replace([np.inf, -np.inf], np.nan)
     return long_factor_from_wide(factor, start_date)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build a 20-day reversal factor CSV.")
+    parser = argparse.ArgumentParser(description="Build eps_revision_breadth_60d factor CSV.")
     parser.add_argument("--start-date", default="2019-01-01")
     parser.add_argument("--end-date", default="2025-12-31")
-    parser.add_argument(
-        "--index-code",
-        default=CSI1000,
-        help="Index code, e.g. CSI1000=000852.XSHG, CSI500=000905.XSHG.",
-    )
+    parser.add_argument("--index-code", default=CSI1000)
     parser.add_argument("--env-path", type=Path, default=DEFAULT_ENV_PATH)
     parser.add_argument(
         "--output-path",
         type=Path,
         default=SCRIPT_DIR / "data" / "factor.csv",
     )
-    parser.add_argument("--lookback", type=int, default=20)
-    parser.add_argument(
-        "--sample-size",
-        type=int,
-        help="Optional stock count for a quick interface check. Omit for full index.",
-    )
+    parser.add_argument("--eps-field", default="eps_t1")
+    parser.add_argument("--window", type=int, default=60)
+    parser.add_argument("--sample-size", type=int)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     rq = init_rqdatac(args.env_path)
-    price_start = lookback_start_date(rq, args.start_date, args.lookback + 1)
-    universe = build_universe(rq, args.start_date, args.end_date, args.index_code)
+    query_start = lookback_start_date(rq, args.start_date, args.window * 2 + 5)
+    universe, dates = build_universe(rq, args.start_date, args.end_date, args.index_code)
     stocks = sorted(universe["stock_code"].unique())
     if args.sample_size:
         stocks = stocks[: args.sample_size]
-    price = fetch_post_close(rq, stocks, price_start, args.end_date)
-    factor = build_reversal_factor(wide_post_close(price), args.lookback, args.start_date)
+    reports = fetch_eps_reports(rq, stocks, query_start, args.end_date, args.eps_field)
+    factor = build_factor(reports, dates, stocks, args.eps_field, args.window, args.start_date)
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
     factor.to_csv(args.output_path, index=False, encoding="utf-8-sig")
     print(f"factor written: {args.output_path.resolve()} shape={factor.shape}")

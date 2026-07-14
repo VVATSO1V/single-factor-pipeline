@@ -1,11 +1,9 @@
-"""Build factor.csv for the 20-day reversal example.
+"""Build factor.csv for the 20-day idiosyncratic volatility factor.
 
-The factor is:
+For each stock and date T, use the latest 20 visible daily returns ending at T:
 
-    reverse_20d(T) = -(P_T / P_{T-20} - 1)
-
-It downloads the historical index-component universe and adjusted close prices
-directly from Ricequant, then writes reverse_20d/data/factor.csv.
+    r_i = a + b * r_mkt_i + e_i
+    ivol_20d(T) = std(e_i)
 """
 
 from __future__ import annotations
@@ -173,6 +171,27 @@ def fetch_post_close(
     return pd.concat(parts, ignore_index=True).drop_duplicates(KEYS).sort_values(KEYS)
 
 
+def fetch_index_close(
+    rq: Any,
+    index_code: str,
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
+    raw = rq.get_price(
+        index_code,
+        start_date=start_date,
+        end_date=end_date,
+        frequency="1d",
+        fields=["close"],
+        adjust_type="none",
+        skip_suspended=False,
+    )
+    frame = normalize_rq_frame(raw).rename(columns={"close": "index_close"})
+    if "date" not in frame.columns:
+        raise RuntimeError("index price data has no date column")
+    return frame[["date", "index_close"]].drop_duplicates("date").sort_values("date")
+
+
 def wide_post_close(price: pd.DataFrame) -> pd.DataFrame:
     frame = price.copy()
     frame["date"] = pd.to_datetime(frame["date"]).dt.normalize()
@@ -194,45 +213,60 @@ def long_factor_from_wide(values: pd.DataFrame, start_date: str) -> pd.DataFrame
     return result[[*KEYS, "factor_value"]].sort_values(KEYS)
 
 
-def build_reversal_factor(close: pd.DataFrame, lookback: int, start_date: str) -> pd.DataFrame:
-    factor = -(close / close.shift(lookback) - 1.0)
+def build_factor(
+    close: pd.DataFrame,
+    index_close: pd.DataFrame,
+    window: int,
+    start_date: str,
+) -> pd.DataFrame:
+    stock_return = close.pct_change()
+    market_return = (
+        index_close.set_index("date")["index_close"]
+        .sort_index()
+        .astype(float)
+        .pct_change()
+    )
+    market_return = market_return.reindex(stock_return.index)
+
+    stock_var = stock_return.rolling(window=window, min_periods=window).var()
+    market_var = market_return.rolling(window=window, min_periods=window).var()
+    stock_market_cov = stock_return.rolling(window=window, min_periods=window).cov(
+        market_return
+    )
+    residual_var = stock_var - stock_market_cov.pow(2).div(market_var, axis=0)
+    residual_var = residual_var.mask(market_var <= 0, axis=0)
+    residual_var = residual_var.where(residual_var >= 0, 0.0)
+    factor = np.sqrt(residual_var)
     return long_factor_from_wide(factor, start_date)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build a 20-day reversal factor CSV.")
+    parser = argparse.ArgumentParser(description="Build ivol_20d factor CSV.")
     parser.add_argument("--start-date", default="2019-01-01")
     parser.add_argument("--end-date", default="2025-12-31")
-    parser.add_argument(
-        "--index-code",
-        default=CSI1000,
-        help="Index code, e.g. CSI1000=000852.XSHG, CSI500=000905.XSHG.",
-    )
+    parser.add_argument("--index-code", default=CSI1000)
     parser.add_argument("--env-path", type=Path, default=DEFAULT_ENV_PATH)
     parser.add_argument(
         "--output-path",
         type=Path,
         default=SCRIPT_DIR / "data" / "factor.csv",
     )
-    parser.add_argument("--lookback", type=int, default=20)
-    parser.add_argument(
-        "--sample-size",
-        type=int,
-        help="Optional stock count for a quick interface check. Omit for full index.",
-    )
+    parser.add_argument("--window", type=int, default=20)
+    parser.add_argument("--sample-size", type=int)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     rq = init_rqdatac(args.env_path)
-    price_start = lookback_start_date(rq, args.start_date, args.lookback + 1)
+    price_start = lookback_start_date(rq, args.start_date, args.window + 2)
     universe = build_universe(rq, args.start_date, args.end_date, args.index_code)
     stocks = sorted(universe["stock_code"].unique())
     if args.sample_size:
         stocks = stocks[: args.sample_size]
     price = fetch_post_close(rq, stocks, price_start, args.end_date)
-    factor = build_reversal_factor(wide_post_close(price), args.lookback, args.start_date)
+    index_close = fetch_index_close(rq, args.index_code, price_start, args.end_date)
+    factor = build_factor(wide_post_close(price), index_close, args.window, args.start_date)
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
     factor.to_csv(args.output_path, index=False, encoding="utf-8-sig")
     print(f"factor written: {args.output_path.resolve()} shape={factor.shape}")

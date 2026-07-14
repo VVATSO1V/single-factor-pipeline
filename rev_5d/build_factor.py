@@ -1,11 +1,8 @@
-"""Build factor.csv for the 20-day reversal example.
+"""Build factor.csv for the 5-day reversal factor.
 
 The factor is:
 
-    reverse_20d(T) = -(P_T / P_{T-20} - 1)
-
-It downloads the historical index-component universe and adjusted close prices
-directly from Ricequant, then writes reverse_20d/data/factor.csv.
+    rev_5d(T) = -(P_T / P_{T-5} - 1)
 """
 
 from __future__ import annotations
@@ -194,45 +191,36 @@ def long_factor_from_wide(values: pd.DataFrame, start_date: str) -> pd.DataFrame
     return result[[*KEYS, "factor_value"]].sort_values(KEYS)
 
 
-def build_reversal_factor(close: pd.DataFrame, lookback: int, start_date: str) -> pd.DataFrame:
-    factor = -(close / close.shift(lookback) - 1.0)
+def build_factor(close: pd.DataFrame, start_date: str) -> pd.DataFrame:
+    factor = -(close / close.shift(5) - 1.0)
     return long_factor_from_wide(factor, start_date)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build a 20-day reversal factor CSV.")
+    parser = argparse.ArgumentParser(description="Build rev_5d factor CSV.")
     parser.add_argument("--start-date", default="2019-01-01")
     parser.add_argument("--end-date", default="2025-12-31")
-    parser.add_argument(
-        "--index-code",
-        default=CSI1000,
-        help="Index code, e.g. CSI1000=000852.XSHG, CSI500=000905.XSHG.",
-    )
+    parser.add_argument("--index-code", default=CSI1000)
     parser.add_argument("--env-path", type=Path, default=DEFAULT_ENV_PATH)
     parser.add_argument(
         "--output-path",
         type=Path,
         default=SCRIPT_DIR / "data" / "factor.csv",
     )
-    parser.add_argument("--lookback", type=int, default=20)
-    parser.add_argument(
-        "--sample-size",
-        type=int,
-        help="Optional stock count for a quick interface check. Omit for full index.",
-    )
+    parser.add_argument("--sample-size", type=int)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     rq = init_rqdatac(args.env_path)
-    price_start = lookback_start_date(rq, args.start_date, args.lookback + 1)
+    price_start = lookback_start_date(rq, args.start_date, 6)
     universe = build_universe(rq, args.start_date, args.end_date, args.index_code)
     stocks = sorted(universe["stock_code"].unique())
     if args.sample_size:
         stocks = stocks[: args.sample_size]
     price = fetch_post_close(rq, stocks, price_start, args.end_date)
-    factor = build_reversal_factor(wide_post_close(price), args.lookback, args.start_date)
+    factor = build_factor(wide_post_close(price), args.start_date)
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
     factor.to_csv(args.output_path, index=False, encoding="utf-8-sig")
     print(f"factor written: {args.output_path.resolve()} shape={factor.shape}")

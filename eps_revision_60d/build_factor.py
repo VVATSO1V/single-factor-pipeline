@@ -1,11 +1,10 @@
-"""Build factor.csv for the 20-day reversal example.
+"""Build factor.csv for the 60-day EPS revision factor.
 
 The factor is:
 
-    reverse_20d(T) = -(P_T / P_{T-20} - 1)
+    eps_revision_60d(T) = consensus_eps_T / consensus_eps_{T-60} - 1
 
-It downloads the historical index-component universe and adjusted close prices
-directly from Ricequant, then writes reverse_20d/data/factor.csv.
+Only consensus values available on or before T are used.
 """
 
 from __future__ import annotations
@@ -146,38 +145,32 @@ def iter_stock_chunks(stocks: list[str], chunk_size: int = 100):
         yield start, stocks[start : start + chunk_size]
 
 
-def fetch_post_close(
+def fetch_consensus_eps(
     rq: Any,
     stocks: list[str],
     start_date: str,
     end_date: str,
+    eps_field: str,
 ) -> pd.DataFrame:
     parts = []
     total = len(stocks)
     for offset, chunk in iter_stock_chunks(stocks):
-        raw = rq.get_price(
+        raw = rq.consensus.get_factor(
             chunk,
+            factors=[eps_field],
             start_date=start_date,
             end_date=end_date,
-            frequency="1d",
-            fields=["close"],
-            adjust_type="post",
-            skip_suspended=False,
         )
-        frame = normalize_rq_frame(raw).rename(columns={"close": "post_close"})
-        parts.append(frame[[*KEYS, "post_close"]])
+        if raw is not None:
+            frame = normalize_rq_frame(raw)
+            frame[eps_field] = pd.to_numeric(frame[eps_field], errors="coerce")
+            parts.append(frame[[*KEYS, eps_field]])
         done = min(offset + len(chunk), total)
-        print(f"download post_close progress: {done}/{total} stocks", flush=True)
+        print(f"download consensus EPS progress: {done}/{total} stocks", flush=True)
+
     if not parts:
-        return pd.DataFrame(columns=[*KEYS, "post_close"])
+        return pd.DataFrame(columns=[*KEYS, eps_field])
     return pd.concat(parts, ignore_index=True).drop_duplicates(KEYS).sort_values(KEYS)
-
-
-def wide_post_close(price: pd.DataFrame) -> pd.DataFrame:
-    frame = price.copy()
-    frame["date"] = pd.to_datetime(frame["date"]).dt.normalize()
-    frame["post_close"] = pd.to_numeric(frame["post_close"], errors="coerce")
-    return frame.pivot(index="date", columns="stock_code", values="post_close").sort_index()
 
 
 def long_factor_from_wide(values: pd.DataFrame, start_date: str) -> pd.DataFrame:
@@ -194,45 +187,47 @@ def long_factor_from_wide(values: pd.DataFrame, start_date: str) -> pd.DataFrame
     return result[[*KEYS, "factor_value"]].sort_values(KEYS)
 
 
-def build_reversal_factor(close: pd.DataFrame, lookback: int, start_date: str) -> pd.DataFrame:
-    factor = -(close / close.shift(lookback) - 1.0)
+def build_factor(
+    eps: pd.DataFrame,
+    eps_field: str,
+    window: int,
+    start_date: str,
+) -> pd.DataFrame:
+    frame = eps.copy()
+    frame["date"] = pd.to_datetime(frame["date"]).dt.normalize()
+    wide = frame.pivot(index="date", columns="stock_code", values=eps_field).sort_index()
+    factor = wide / wide.shift(window) - 1.0
+    factor = factor.replace([np.inf, -np.inf], np.nan)
     return long_factor_from_wide(factor, start_date)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build a 20-day reversal factor CSV.")
+    parser = argparse.ArgumentParser(description="Build eps_revision_60d factor CSV.")
     parser.add_argument("--start-date", default="2019-01-01")
     parser.add_argument("--end-date", default="2025-12-31")
-    parser.add_argument(
-        "--index-code",
-        default=CSI1000,
-        help="Index code, e.g. CSI1000=000852.XSHG, CSI500=000905.XSHG.",
-    )
+    parser.add_argument("--index-code", default=CSI1000)
     parser.add_argument("--env-path", type=Path, default=DEFAULT_ENV_PATH)
     parser.add_argument(
         "--output-path",
         type=Path,
         default=SCRIPT_DIR / "data" / "factor.csv",
     )
-    parser.add_argument("--lookback", type=int, default=20)
-    parser.add_argument(
-        "--sample-size",
-        type=int,
-        help="Optional stock count for a quick interface check. Omit for full index.",
-    )
+    parser.add_argument("--eps-field", default="EPS_T1")
+    parser.add_argument("--window", type=int, default=60)
+    parser.add_argument("--sample-size", type=int)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     rq = init_rqdatac(args.env_path)
-    price_start = lookback_start_date(rq, args.start_date, args.lookback + 1)
+    query_start = lookback_start_date(rq, args.start_date, args.window + 2)
     universe = build_universe(rq, args.start_date, args.end_date, args.index_code)
     stocks = sorted(universe["stock_code"].unique())
     if args.sample_size:
         stocks = stocks[: args.sample_size]
-    price = fetch_post_close(rq, stocks, price_start, args.end_date)
-    factor = build_reversal_factor(wide_post_close(price), args.lookback, args.start_date)
+    eps = fetch_consensus_eps(rq, stocks, query_start, args.end_date, args.eps_field)
+    factor = build_factor(eps, args.eps_field, args.window, args.start_date)
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
     factor.to_csv(args.output_path, index=False, encoding="utf-8-sig")
     print(f"factor written: {args.output_path.resolve()} shape={factor.shape}")

@@ -29,6 +29,8 @@
       ├─ turnover.csv
       ├─ yearly_performance.csv
       ├─ data_quality.csv
+      ├─ report.html
+      ├─ figures/
       └─ run_config.json
 ```
 
@@ -39,6 +41,12 @@
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install pandas numpy rqdatac
+```
+
+也可以直接安装项目依赖：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
 根目录 `.env` 用来保存米筐账号密码，`.env.example` 是可以上传的空模板：
@@ -237,6 +245,13 @@ short_turnover       = 1 - 相邻两日尾部组合重合比例
 |---|---|
 | `yearly_performance.csv` | 分年度表现，用于观察因子是否衰减 |
 
+如果运行主流水线时添加 `--report`，程序还会生成：
+
+| 文件 | 内容 |
+|---|---|
+| `report.html` | 自动汇总 IC、分组收益、多空净值、换手率和年度表现的 HTML 报告 |
+| `figures/` | 报告中使用的图表，包括 IC、累计 IC、分组收益、多空净值、换手率和年度表现 |
+
 ## 运行 20 日反转示例
 
 ### 第一步：填写 `.env`
@@ -302,7 +317,8 @@ reverse_20d/data/factor.csv
   --quantiles 10 `
   --min-listing-days 120 `
   --mad-width 3 `
-  --direction positive
+  --direction positive `
+  --report
 ```
 
 如果测试新的因子，需要把 `--factor-name`、`--factor-path`、`--market-panel-path` 和 `--output-dir` 改成新因子文件夹对应的路径。

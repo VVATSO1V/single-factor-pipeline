@@ -812,6 +812,11 @@ def parse_args() -> argparse.Namespace:
         choices=["positive", "negative"],
         default="positive",
     )
+    parser.add_argument(
+        "--report",
+        action="store_true",
+        help="Generate report.html and figures after writing CSV outputs.",
+    )
     return parser.parse_args()
 
 
@@ -835,6 +840,11 @@ def main() -> None:
     )
     run_pipeline(config)
     print(f"Pipeline completed: {config.output_dir}")
+    if args.report:
+        from report_generator import generate_report
+
+        report_path = generate_report(config.output_dir)
+        print(f"Report generated: {report_path}")
 
 
 if __name__ == "__main__":
