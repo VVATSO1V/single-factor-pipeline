@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from datetime import date
+import hashlib
+import importlib.util
+import json
 from pathlib import Path
+import sys
 import tomllib
 from typing import Any
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = SCRIPT_DIR / "config.toml"
-COMMANDS = ("doctor", "fetch-market", "prepare-data")
 REQUIRED_SECTIONS = (
     "project",
     "paths",
@@ -32,7 +36,6 @@ REQUIRED_PATHS = (
     "runs_dir",
 )
 SPLIT_NAMES = ("train", "validation", "test", "final_train")
-ALLOWED_HORIZONS = {1, 5, 10}
 
 
 def resolve_config_path(config_path: Path, raw_path: str) -> Path:
@@ -88,14 +91,9 @@ def validate_config(config: dict[str, Any], path: Path) -> None:
         raise ValueError(f"{path}: [factors].paths contains duplicates")
 
     horizons = config["target"].get("horizons")
-    if (
-        not isinstance(horizons, list)
-        or not horizons
-        or len(set(horizons)) != len(horizons)
-        or not set(horizons).issubset(ALLOWED_HORIZONS)
-    ):
+    if horizons != [1, 5, 10]:
         raise ValueError(
-            f"{path}: target horizons must be unique values from [1, 5, 10]"
+            f"{path}: target horizons must be exactly [1, 5, 10]"
         )
     if config["target"].get("type") != "absolute_open_to_open_return":
         raise ValueError(f"{path}: unsupported target.type")
@@ -212,6 +210,254 @@ def command_fetch_market(
     )
 
 
+def _factor_paths(config: dict[str, Any], config_path: Path) -> list[Path]:
+    return [
+        resolve_config_path(config_path, raw_path)
+        for raw_path in config["factors"]["paths"]
+    ]
+
+
+def _split_periods(
+    config: dict[str, Any],
+) -> dict[str, tuple[str, str]]:
+    return {
+        name: (
+            config["split"][name]["start"],
+            config["split"][name]["end"],
+        )
+        for name in ("train", "validation", "test")
+    }
+
+
+def _read_csv_columns(path: Path) -> list[str]:
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        try:
+            columns = next(csv.reader(handle))
+        except StopIteration as exc:
+            raise ValueError(f"{path} is empty") from exc
+    if len(columns) != len(set(columns)):
+        raise ValueError(f"{path} contains duplicate columns")
+    return columns
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def run_doctor(
+    config: dict[str, Any],
+    config_path: Path,
+) -> list[str]:
+    """Validate environment, source contracts, and existing artifact lineage."""
+    from model.stages.features import infer_factor_name
+
+    if sys.version_info < (3, 11):
+        raise RuntimeError("Python 3.11 or newer is required")
+    messages = [f"Python {sys.version.split()[0]}"]
+    for module_name in ("pandas", "numpy", "pyarrow", "rqdatac"):
+        if importlib.util.find_spec(module_name) is None:
+            raise RuntimeError(f"missing Python dependency: {module_name}")
+    messages.append("dependencies: pandas, numpy, pyarrow, rqdatac")
+
+    paths = {
+        name: _configured_path(config, config_path, name)
+        for name in REQUIRED_PATHS
+    }
+    factor_paths = _factor_paths(config, config_path)
+    factor_names: list[str] = []
+    required_factor_columns = {"date", "stock_code", "factor_value"}
+    for factor_path in factor_paths:
+        if not factor_path.exists():
+            raise FileNotFoundError(f"factor file not found: {factor_path}")
+        columns = set(_read_csv_columns(factor_path))
+        missing = sorted(required_factor_columns.difference(columns))
+        if missing:
+            raise ValueError(
+                f"{factor_path} is missing required columns: {missing}"
+            )
+        factor_names.append(infer_factor_name(factor_path))
+    if len(factor_names) != len(set(factor_names)):
+        duplicates = sorted(
+            {
+                name
+                for name in factor_names
+                if factor_names.count(name) > 1
+            }
+        )
+        raise ValueError(f"duplicate inferred factor names: {duplicates}")
+    messages.append(f"{len(factor_names)} factor files: ready")
+
+    source_contracts = {
+        paths["market_panel"]: {
+            "date",
+            "stock_code",
+            "in_universe",
+            "post_open",
+        },
+        paths["trading_calendar"]: {"date"},
+    }
+    for source_path, required_columns in source_contracts.items():
+        if not source_path.exists():
+            raise FileNotFoundError(f"market source not found: {source_path}")
+        columns = set(_read_csv_columns(source_path))
+        missing = sorted(required_columns.difference(columns))
+        if missing:
+            raise ValueError(
+                f"{source_path} is missing required columns: {missing}"
+            )
+    messages.append("market panel and trading calendar: ready")
+
+    schema_path = paths["model_schema"]
+    dataset_path = paths["model_dataset"]
+    schema: dict[str, Any] | None = None
+    if schema_path.exists():
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        if schema.get("feature_columns") != factor_names:
+            raise ValueError(
+                f"{schema_path} feature_columns do not match config factors"
+            )
+        if not dataset_path.exists():
+            raise FileNotFoundError(
+                f"schema exists but model dataset is missing: {dataset_path}"
+            )
+        expected_hash = schema.get("parquet_sha256")
+        actual_hash = _file_sha256(dataset_path)
+        if expected_hash != actual_hash:
+            raise ValueError(
+                "model dataset hash does not match schema: "
+                f"expected={expected_hash} actual={actual_hash}"
+            )
+        messages.append("model dataset and schema hash: matched")
+    elif dataset_path.exists():
+        raise FileNotFoundError(
+            f"model dataset exists but schema is missing: {schema_path}"
+        )
+    else:
+        messages.append("model dataset: not built")
+
+    sample_path = paths["sample_index"]
+    summary_path = paths["split_summary"]
+    if sample_path.exists() != summary_path.exists():
+        missing_path = summary_path if sample_path.exists() else sample_path
+        raise FileNotFoundError(f"incomplete sample-index bundle: {missing_path}")
+    if sample_path.exists():
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        if summary.get("uses_entry_tradeable") is not False:
+            raise ValueError(
+                f"{summary_path} must set uses_entry_tradeable to false"
+            )
+        expected_split_periods = {
+            name: {
+                "start": config["split"][name]["start"],
+                "end": config["split"][name]["end"],
+            }
+            for name in ("train", "validation", "test")
+        }
+        if summary.get("split_periods") != expected_split_periods:
+            raise ValueError(
+                f"{summary_path} split_periods do not match config"
+            )
+        expected_final_train = {
+            "start": config["split"]["final_train"]["start"],
+            "end": config["split"]["final_train"]["end"],
+        }
+        if summary.get("final_train_period") != expected_final_train:
+            raise ValueError(
+                f"{summary_path} final_train_period does not match config"
+            )
+        if schema is not None and summary.get(
+            "source_model_dataset_sha256"
+        ) != schema.get("parquet_sha256"):
+            raise ValueError(
+                f"{summary_path} references a different model dataset"
+            )
+        actual_sample_hash = _file_sha256(sample_path)
+        if summary.get("sample_index_sha256") != actual_sample_hash:
+            raise ValueError(
+                "sample index hash does not match split summary: "
+                f"{sample_path}"
+            )
+        messages.append("sample index and split summary hash: matched")
+    else:
+        messages.append("sample index: not built")
+    return messages
+
+
+def command_doctor(config: dict[str, Any], config_path: Path) -> None:
+    for message in run_doctor(config, config_path):
+        print(f"[ok] {message}")
+
+
+def command_prepare_data(
+    config: dict[str, Any],
+    config_path: Path,
+) -> None:
+    """Build every local data artifact without accessing Ricequant."""
+    from model.stages import dataset, features, labels
+
+    paths = {
+        name: _configured_path(config, config_path, name)
+        for name in REQUIRED_PATHS
+    }
+    factor_paths = _factor_paths(config, config_path)
+    required_inputs = [
+        paths["market_panel"],
+        paths["trading_calendar"],
+        *factor_paths,
+    ]
+    missing = [path for path in required_inputs if not path.exists()]
+    if missing:
+        formatted = "\n".join(f"  - {path}" for path in missing)
+        raise FileNotFoundError(
+            "prepare-data requires existing local inputs:\n"
+            f"{formatted}\n"
+            "Run fetch-market only when the market sources are missing."
+        )
+
+    print("stage 1/4: build factor-wide table", flush=True)
+    features.build_factor_table(
+        paths["market_panel"],
+        factor_paths,
+        paths["factor_wide"],
+    )
+    print("stage 2/4: build return targets", flush=True)
+    labels.build_target_table(
+        paths["market_panel"],
+        paths["trading_calendar"],
+        paths["factor_wide"],
+        paths["target"],
+    )
+    print("stage 3/4: build raw model dataset", flush=True)
+    dataset.build_model_dataset(
+        paths["factor_wide"],
+        paths["target"],
+        paths["market_panel"],
+        paths["trading_calendar"],
+        paths["model_dataset"],
+        paths["model_schema"],
+        min_listing_days=config["execution"]["min_listing_days"],
+    )
+    print("stage 4/4: build sample time index", flush=True)
+    final_train = config["split"]["final_train"]
+    dataset.build_sample_index(
+        paths["model_dataset"],
+        paths["model_schema"],
+        paths["trading_calendar"],
+        paths["sample_index"],
+        paths["split_summary"],
+        split_periods=_split_periods(config),
+        final_train_period=(
+            final_train["start"],
+            final_train["end"],
+        ),
+    )
+    print("prepare-data completed", flush=True)
+
+
 def main() -> None:
     args = make_parser().parse_args()
     config_path = Path(args.config).resolve()
@@ -219,7 +465,10 @@ def main() -> None:
     if args.command == "fetch-market":
         command_fetch_market(config, config_path, force=args.force)
         return
-    raise RuntimeError(f"{args.command} stage is not migrated yet")
+    if args.command == "prepare-data":
+        command_prepare_data(config, config_path)
+        return
+    command_doctor(config, config_path)
 
 
 if __name__ == "__main__":
