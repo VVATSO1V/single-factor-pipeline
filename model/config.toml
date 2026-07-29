@@ -1,0 +1,63 @@
+[project]
+name = "csi1000_multifactor"
+index_code = "000852.XSHG"
+start_date = "2019-01-01"
+end_date = "2025-12-31"
+industry_source = "citics_2019"
+env_path = "../.env"
+
+[paths]
+market_panel = "data/market_panel.csv"
+trading_calendar = "data/trading_calendar.csv"
+factor_wide = "data/factor_wide.csv"
+target = "data/target.csv"
+model_dataset = "data/model_dataset.parquet"
+model_schema = "data/model_dataset_schema.json"
+sample_index = "data/model_sample_index.parquet"
+split_summary = "data/model_split_summary.json"
+runs_dir = "runs"
+
+[factors]
+paths = [
+  "../rev_1d/data/factor.csv",
+  "../rev_5d/data/factor.csv",
+  "../rev_20d_skip1/data/factor.csv",
+  "../ivol_20d/data/factor.csv",
+  "../volume_price_divergence_20d/data/factor.csv",
+  "../overnight_rev_5d/data/factor.csv",
+  "../intraday_rev_5d/data/factor.csv",
+  "../downside_ivol_20d/data/factor.csv",
+  "../tail_strength_20d/data/factor.csv",
+  "../eps_revision_60d/data/factor.csv",
+  "../eps_revision_breadth_60d/data/factor.csv",
+  "../sue_latest/data/factor.csv",
+  "../cash_earnings_quality/data/factor.csv",
+  "../gross_margin_stability/data/factor.csv",
+  "../roe_quality/data/factor.csv",
+  "../leverage_risk/data/factor.csv",
+  "../reverse_20d/data/factor.csv",
+]
+
+[target]
+horizons = [1, 5, 10]
+type = "absolute_open_to_open_return"
+entry_price = "post_open"
+
+[split.train]
+start = "2019-01-01"
+end = "2022-12-31"
+
+[split.validation]
+start = "2023-01-01"
+end = "2023-12-31"
+
+[split.test]
+start = "2024-01-01"
+end = "2025-12-31"
+
+[split.final_train]
+start = "2019-01-01"
+end = "2023-12-31"
+
+[execution]
+min_listing_days = 120
