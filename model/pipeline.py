@@ -155,9 +155,14 @@ def make_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("doctor", help="Validate configuration and inputs.")
-    subparsers.add_parser(
+    fetch_parser = subparsers.add_parser(
         "fetch-market",
         help="Explicitly download Ricequant market data.",
+    )
+    fetch_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing market source files.",
     )
     subparsers.add_parser(
         "prepare-data",
@@ -166,12 +171,55 @@ def make_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _configured_path(
+    config: dict[str, Any],
+    config_path: Path,
+    name: str,
+) -> Path:
+    return resolve_config_path(config_path, config["paths"][name])
+
+
+def command_fetch_market(
+    config: dict[str, Any],
+    config_path: Path,
+    *,
+    force: bool,
+) -> None:
+    """Download market sources only after an explicit online command."""
+    from model.stages import market
+
+    project = config["project"]
+    panel_path = _configured_path(config, config_path, "market_panel")
+    calendar_path = _configured_path(config, config_path, "trading_calendar")
+    existing = [path for path in (panel_path, calendar_path) if path.exists()]
+    if existing and not force:
+        joined = ", ".join(str(path) for path in existing)
+        raise FileExistsError(
+            f"market source already exists: {joined}; use --force to overwrite"
+        )
+    panel, calendar = market.build_market_panel(
+        env_path=resolve_config_path(config_path, project["env_path"]),
+        start_date=project["start_date"],
+        end_date=project["end_date"],
+        index_code=project["index_code"],
+        industry_source=project["industry_source"],
+    )
+    market.write_market_outputs(
+        panel,
+        calendar,
+        panel_path,
+        calendar_path,
+    )
+
+
 def main() -> None:
     args = make_parser().parse_args()
-    load_config(args.config)
-    raise RuntimeError(
-        f"{args.command} is registered but its stage is not migrated yet"
-    )
+    config_path = Path(args.config).resolve()
+    config = load_config(config_path)
+    if args.command == "fetch-market":
+        command_fetch_market(config, config_path, force=args.force)
+        return
+    raise RuntimeError(f"{args.command} stage is not migrated yet")
 
 
 if __name__ == "__main__":
