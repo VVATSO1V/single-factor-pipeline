@@ -17,6 +17,10 @@ lambda = 1.0
 
 [models.lightgbm_rank_regression]
 
+[models.xgboost_pairwise_rank]
+
+[models.lightgbm_lambdarank]
+
 [features]
 forbidden_columns = [
   "date",

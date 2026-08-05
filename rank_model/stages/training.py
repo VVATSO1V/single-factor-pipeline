@@ -24,6 +24,7 @@ from rank_model.stages.preprocessing import (
     equal_date_weights,
     predicted_percentiles,
 )
+from rank_model.stages.ranking import lightgbm_relevance, sorted_group_layout
 
 
 KEY_COLUMNS = ["date", "stock_code"]
@@ -75,6 +76,20 @@ LGB_PARAMS = {
     "verbosity": -1,
 }
 LGB_BOOSTING_ROUNDS = 21
+XGB_PAIRWISE_PARAMS = {
+    **XGB_PARAMS,
+    "objective": "rank:pairwise",
+    "eval_metric": "ndcg@100",
+}
+LGB_LAMBDARANK_PARAMS = {
+    **LGB_PARAMS,
+    "objective": "lambdarank",
+    "metric": "ndcg",
+    "ndcg_eval_at": [100],
+    "label_gain": list(range(100)),
+    "lambdarank_truncation_level": 100,
+}
+NATIVE_TREE_RELOAD_TOLERANCE = 1e-6
 MLP_HIDDEN_LAYERS = [128, 64, 32]
 MLP_BATCH_SIZE = 8192
 MLP_EPOCHS = 12
@@ -231,6 +246,155 @@ def train_lightgbm_rank_regression(
     )
 
 
+def _native_ranking_training_inputs(
+    train: pd.DataFrame,
+    validation: pd.DataFrame,
+    schema: dict[str, Any],
+) -> tuple[
+    RankPreprocessor,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    pd.Series,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    train = _finite_label_rows(train)
+    if train.empty:
+        raise ValueError("native ranking requires at least one finite rank label")
+    if validation.empty:
+        raise ValueError("native ranking validation frame is empty")
+    try:
+        continuous_columns = schema["continuous_feature_columns"]
+        industry_column = schema["industry_column"]
+    except (KeyError, TypeError) as error:
+        raise ValueError("native ranking requires schema features") from error
+
+    train_layout, train_group_sizes = sorted_group_layout(train)
+    validation_with_position = validation.copy()
+    validation_with_position["_rank_row_position"] = np.arange(len(validation))
+    validation_layout, validation_group_sizes = sorted_group_layout(
+        validation_with_position
+    )
+    preprocessor = RankPreprocessor.fit(
+        train,
+        continuous_columns=continuous_columns,
+        industry_column=industry_column,
+    )
+    query_ids = pd.factorize(train_layout["date"], sort=False)[0].astype("int32")
+    group_weights = np.ones(len(train_group_sizes), dtype="float64")
+    validation_positions = validation_layout["_rank_row_position"].to_numpy(
+        dtype="int64"
+    )
+    return (
+        preprocessor,
+        preprocessor.transform(train_layout, scale_continuous=False),
+        preprocessor.transform(validation_layout, scale_continuous=False),
+        train_layout[RANK_TARGET_COLUMN].to_numpy(dtype="float64"),
+        train_group_sizes,
+        validation_group_sizes,
+        query_ids,
+        group_weights,
+        train_layout["date"],
+        validation_positions,
+    )
+
+
+def _restore_validation_order(scores: np.ndarray, positions: np.ndarray) -> np.ndarray:
+    restored = np.empty(len(scores), dtype="float64")
+    restored[positions] = scores
+    return restored
+
+
+def train_xgboost_pairwise_rank(
+    train: pd.DataFrame,
+    validation: pd.DataFrame,
+    schema: dict[str, Any],
+    params: dict[str, Any],
+) -> TrainingOutcome:
+    """Fit fixed XGBoost pairwise ranking with one query per trading date."""
+    del params
+    (
+        preprocessor,
+        x_train,
+        x_validation,
+        y_train,
+        train_group_sizes,
+        _validation_group_sizes,
+        query_ids,
+        group_weights,
+        _train_dates,
+        validation_positions,
+    ) = _native_ranking_training_inputs(train, validation, schema)
+    del train_group_sizes
+    model = xgb.train(
+        XGB_PAIRWISE_PARAMS,
+        xgb.DMatrix(x_train, label=y_train, weight=group_weights, qid=query_ids),
+        num_boost_round=XGB_BOOSTING_ROUNDS,
+    )
+    sorted_scores = model.predict(xgb.DMatrix(x_validation))
+    score_validation = _restore_validation_order(sorted_scores, validation_positions)
+    if not np.isfinite(score_validation).all():
+        raise ValueError("xgboost pairwise ranking produced non-finite validation scores")
+    return TrainingOutcome(
+        score_validation=score_validation,
+        model_objects={"preprocessor": preprocessor, "model": model},
+        metadata={
+            "objective": XGB_PAIRWISE_PARAMS["objective"],
+            "boosting_rounds": XGB_BOOSTING_ROUNDS,
+            "grouping": "date",
+            "reload_tolerance": NATIVE_TREE_RELOAD_TOLERANCE,
+        },
+    )
+
+
+def train_lightgbm_lambdarank(
+    train: pd.DataFrame,
+    validation: pd.DataFrame,
+    schema: dict[str, Any],
+    params: dict[str, Any],
+) -> TrainingOutcome:
+    """Fit fixed LightGBM LambdaRank with one group per trading date."""
+    del params
+    (
+        preprocessor,
+        x_train,
+        x_validation,
+        y_train,
+        train_group_sizes,
+        _validation_group_sizes,
+        _query_ids,
+        _group_weights,
+        train_dates,
+        validation_positions,
+    ) = _native_ranking_training_inputs(train, validation, schema)
+    model = lgb.train(
+        LGB_LAMBDARANK_PARAMS,
+        lgb.Dataset(
+            x_train,
+            label=lightgbm_relevance(pd.Series(y_train)),
+            weight=equal_date_weights(train_dates),
+            group=train_group_sizes,
+        ),
+        num_boost_round=LGB_BOOSTING_ROUNDS,
+    )
+    sorted_scores = model.predict(x_validation)
+    score_validation = _restore_validation_order(sorted_scores, validation_positions)
+    if not np.isfinite(score_validation).all():
+        raise ValueError("LightGBM LambdaRank produced non-finite validation scores")
+    return TrainingOutcome(
+        score_validation=score_validation,
+        model_objects={"preprocessor": preprocessor, "model": model},
+        metadata={
+            "objective": LGB_LAMBDARANK_PARAMS["objective"],
+            "boosting_rounds": LGB_BOOSTING_ROUNDS,
+            "grouping": "date",
+            "reload_tolerance": NATIVE_TREE_RELOAD_TOLERANCE,
+        },
+    )
 def _build_mlp_rank_regression_model(input_dim: int, output_bias: float) -> Any:
     """Build the fixed ReLU network used by the MLP rank regressor."""
     import torch
@@ -350,6 +514,8 @@ MODEL_REGISTRY: dict[str, Trainer] = {
     "xgboost_rank_regression": train_xgboost_rank_regression,
     "lightgbm_rank_regression": train_lightgbm_rank_regression,
     "mlp_rank_regression": train_mlp_rank_regression,
+    "xgboost_pairwise_rank": train_xgboost_pairwise_rank,
+    "lightgbm_lambdarank": train_lightgbm_lambdarank,
 }
 
 
@@ -501,6 +667,7 @@ def _verify_reloaded_predictions(
     temporary_run: Path,
     validation: pd.DataFrame,
     expected_scores: np.ndarray,
+    tolerance: float = 1e-12,
 ) -> None:
     with warnings.catch_warnings():
         warnings.filterwarnings(
@@ -517,9 +684,6 @@ def _verify_reloaded_predictions(
             validation,
             scale_continuous=not isinstance(model, (xgb.Booster, lgb.Booster)),
         ),
-    )
-    tolerance = (
-        1e-6 if model.__class__.__module__.startswith("torch") else 1e-12
     )
     if not np.allclose(
         reloaded_scores,
@@ -608,7 +772,12 @@ def train_registered_model(
             outcome,
             predictions,
         )
-        _verify_reloaded_predictions(temporary_run, validation, outcome.score_validation)
+        _verify_reloaded_predictions(
+            temporary_run,
+            validation,
+            outcome.score_validation,
+            tolerance=float(outcome.metadata.get("reload_tolerance", 1e-12)),
+        )
         _write_manifest(
             temporary_run,
             config_path,
