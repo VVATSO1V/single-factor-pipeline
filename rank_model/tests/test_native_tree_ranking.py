@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 import warnings
+from typing import get_args, get_type_hints
 
 import joblib
 import lightgbm as lgb
@@ -16,6 +17,7 @@ import xgboost as xgb
 from rank_model.stages.ranking import lightgbm_relevance, sorted_group_layout
 from rank_model.stages.training import (
     MODEL_REGISTRY,
+    _native_ranking_training_inputs,
     train_lightgbm_lambdarank,
     train_registered_model,
     train_xgboost_pairwise_rank,
@@ -92,6 +94,15 @@ class NativeTreeRankingTests(unittest.TestCase):
         actual = lightgbm_relevance(pd.Series([0.0, 0.009, 0.01, 0.999, 1.0]))
 
         np.testing.assert_array_equal(actual, [0, 0, 1, 99, 99])
+
+    def test_native_ranking_input_annotation_matches_return_contract(self) -> None:
+        return_types = get_args(
+            get_type_hints(_native_ranking_training_inputs)["return"]
+        )
+
+        self.assertEqual(len(return_types), 10)
+        self.assertIs(return_types[5], np.ndarray)
+        self.assertIs(return_types[8], pd.Series)
 
     def test_native_tree_rankers_return_finite_scores_and_fixed_metadata(self) -> None:
         trainers = (

@@ -259,7 +259,6 @@ def _native_ranking_training_inputs(
     np.ndarray,
     np.ndarray,
     np.ndarray,
-    np.ndarray,
     pd.Series,
     np.ndarray,
 ]:
