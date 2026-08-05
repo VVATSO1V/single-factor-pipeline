@@ -1,0 +1,24 @@
+[project]
+name = "csi1000_rank_model_10d"
+development_end = "2023-12-31"
+
+[paths]
+source_dataset = "../model/data/context_dataset_10d.parquet"
+source_schema = "../model/data/context_dataset_10d_schema.json"
+rank_dataset = "data/rank_dataset_10d.parquet"
+rank_schema = "data/rank_dataset_10d_schema.json"
+rank_label_coverage = "data/rank_label_coverage.csv"
+
+[features]
+forbidden_columns = [
+  "date",
+  "stock_code",
+  "target_10d",
+  "rank_target_10d",
+  "market_target_10d",
+  "industry_target_10d",
+  "alpha_target_10d",
+  "exit_date_10d",
+  "split_10d",
+  "entry_tradeable",
+]
