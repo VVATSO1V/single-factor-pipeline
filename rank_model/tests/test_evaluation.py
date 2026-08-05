@@ -8,7 +8,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from rank_model.pipeline import parse_run_ids
+from rank_model.pipeline import parse_run_id, parse_run_ids
 from rank_model.stages.dataset import file_sha256
 from rank_model.stages.evaluation import (
     compare_runs,
@@ -191,6 +191,25 @@ class EvaluationOutputTests(unittest.TestCase):
 
             self.assertFalse((run / "metrics_summary.json").exists())
 
+    def test_evaluation_rejects_value_mismatch_after_hash_is_updated(self) -> None:
+        bundle = evaluate_predictions(_prediction_frame().iloc[:20])
+        with tempfile.TemporaryDirectory() as temporary_name:
+            root = Path(temporary_name)
+            run = self._run_directory(root, "value-mismatch", bundle.predictions)
+            artifact_path = run / "predictions_10d.parquet"
+            artifact = pd.read_parquet(artifact_path)
+            artifact.loc[artifact.index[0], "score_raw"] += 1.0
+            artifact.to_parquet(artifact_path, index=False)
+            manifest_path = run / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["predictions_10d_sha256"] = file_sha256(artifact_path)
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "do not match"):
+                write_evaluation(bundle, run)
+
+            self.assertFalse((run / "metrics_summary.json").exists())
+
     @staticmethod
     def _run_directory(root: Path, run_id: str, predictions: pd.DataFrame) -> Path:
         run = root / run_id
@@ -212,6 +231,12 @@ class EvaluationOutputTests(unittest.TestCase):
 
 
 class PipelineArgumentTests(unittest.TestCase):
+    def test_parse_run_id_rejects_blank_and_whitespace_values(self) -> None:
+        self.assertEqual(parse_run_id("first"), "first")
+        for value in ("", "   "):
+            with self.assertRaisesRegex(ValueError, "run_id"):
+                parse_run_id(value)
+
     def test_parse_run_ids_rejects_blank_components(self) -> None:
         self.assertEqual(parse_run_ids("first, second"), ["first", "second"])
         for value in ("first,,second", ",first", "first,", "   "):

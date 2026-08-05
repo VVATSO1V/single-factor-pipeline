@@ -12,7 +12,7 @@ import pandas as pd
 
 from rank_model.stages.dataset import build_rank_dataset
 from rank_model.stages.evaluation import compare_runs, evaluate_predictions, write_evaluation
-from rank_model.stages.training import MODEL_NAMES, train_registered_model
+from rank_model.stages.training import MODEL_NAMES, train_registered_model, validate_run_id
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -73,7 +73,15 @@ def parse_run_ids(raw_run_ids: str) -> list[str]:
     run_ids = [run_id.strip() for run_id in raw_run_ids.split(",")]
     if not run_ids or any(not run_id for run_id in run_ids):
         raise ValueError("run IDs must not contain blank components")
+    for run_id in run_ids:
+        validate_run_id(run_id)
     return run_ids
+
+
+def parse_run_id(raw_run_id: str) -> str:
+    """Validate one immutable run ID before it can be resolved as a path."""
+    validate_run_id(raw_run_id)
+    return raw_run_id
 
 
 def make_parser() -> argparse.ArgumentParser:
@@ -108,8 +116,12 @@ def main() -> None:
         print(f"rank model run written: {run_directory}")
         return
     if args.command == "evaluate":
-        run_directory = resolve_config_path(config_path, config["paths"]["runs_dir"]) / args.run_id
         try:
+            run_id = parse_run_id(args.run_id)
+            run_directory = (
+                resolve_config_path(config_path, config["paths"]["runs_dir"])
+                / run_id
+            )
             predictions = pd.read_parquet(run_directory / "predictions_10d.parquet")
             if "split" not in predictions:
                 raise ValueError("prediction artifact is missing split")
@@ -123,9 +135,11 @@ def main() -> None:
         print(f"rank model evaluation written: {run_directory}")
         return
     if args.command == "compare":
-        runs_directory = resolve_config_path(config_path, config["paths"]["runs_dir"])
         try:
             run_ids = parse_run_ids(args.run_ids)
+            runs_directory = resolve_config_path(
+                config_path, config["paths"]["runs_dir"]
+            )
             comparison = compare_runs(
                 [runs_directory / run_id for run_id in run_ids],
                 runs_directory / "rank_model_comparison.csv",

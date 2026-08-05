@@ -706,7 +706,7 @@ MODEL_REGISTRY: dict[str, Trainer] = {
 }
 
 
-def _validate_run_id(run_id: str) -> None:
+def validate_run_id(run_id: str) -> None:
     if not isinstance(run_id, str) or not _RUN_ID_PATTERN.fullmatch(run_id):
         raise ValueError(
             "run_id must contain only letters, numbers, dots, hyphens, and underscores"
@@ -938,7 +938,7 @@ def train_registered_model(
     trainer = MODEL_REGISTRY.get(model_name)
     if trainer is None:
         raise NotImplementedError(f"model is not registered in this task: {model_name}")
-    _validate_run_id(run_id)
+    validate_run_id(run_id)
     config_path = Path(config_path).resolve()
     try:
         paths = config["paths"]
