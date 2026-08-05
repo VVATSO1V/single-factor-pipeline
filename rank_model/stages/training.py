@@ -75,6 +75,11 @@ LGB_PARAMS = {
     "verbosity": -1,
 }
 LGB_BOOSTING_ROUNDS = 21
+MLP_HIDDEN_LAYERS = [128, 64, 32]
+MLP_BATCH_SIZE = 8192
+MLP_EPOCHS = 12
+MLP_GRADIENT_CLIP_NORM = 1.0
+MLP_SEED = 42
 
 
 @dataclass
@@ -226,10 +231,124 @@ def train_lightgbm_rank_regression(
     )
 
 
+def _build_mlp_rank_regression_model(input_dim: int, output_bias: float) -> Any:
+    """Build the fixed ReLU network used by the MLP rank regressor."""
+    import torch
+
+    layers: list[torch.nn.Module] = []
+    previous_width = input_dim
+    for width in MLP_HIDDEN_LAYERS:
+        layers.extend((torch.nn.Linear(previous_width, width), torch.nn.ReLU()))
+        previous_width = width
+    output_layer = torch.nn.Linear(previous_width, 1)
+    torch.nn.init.zeros_(output_layer.weight)
+    torch.nn.init.constant_(output_layer.bias, output_bias)
+    layers.append(output_layer)
+    return torch.nn.Sequential(*layers)
+
+
+def _predict_mlp_rank_regression(model: Any, features: np.ndarray) -> np.ndarray:
+    import torch
+
+    model.eval()
+    with torch.inference_mode():
+        predictions = model(
+            torch.from_numpy(np.ascontiguousarray(features, dtype=np.float32))
+        ).squeeze(-1)
+    return predictions.cpu().numpy().astype("float64", copy=False)
+
+
+def train_mlp_rank_regression(
+    train: pd.DataFrame,
+    validation: pd.DataFrame,
+    schema: dict[str, Any],
+    params: dict[str, Any],
+) -> TrainingOutcome:
+    """Fit the fixed deterministic MLP with equal total weight per date."""
+    import torch
+
+    del params
+    train = _finite_label_rows(train)
+    if train.empty:
+        raise ValueError("MLP training requires at least one finite rank label")
+    if validation.empty:
+        raise ValueError("MLP validation frame is empty")
+    try:
+        continuous_columns = schema["continuous_feature_columns"]
+        industry_column = schema["industry_column"]
+    except (KeyError, TypeError) as error:
+        raise ValueError("MLP training requires schema features") from error
+
+    preprocessor = RankPreprocessor.fit(
+        train,
+        continuous_columns=continuous_columns,
+        industry_column=industry_column,
+    )
+    x_train = preprocessor.transform(train, scale_continuous=True)
+    x_validation = preprocessor.transform(validation, scale_continuous=True)
+    y_train = train[RANK_TARGET_COLUMN].to_numpy(dtype="float32")
+    row_weights = equal_date_weights(train["date"]).astype("float32")
+
+    np.random.seed(MLP_SEED)
+    torch.manual_seed(MLP_SEED)
+    torch.use_deterministic_algorithms(True)
+    torch.set_num_threads(1)
+    model = _build_mlp_rank_regression_model(
+        x_train.shape[1], float(np.mean(y_train))
+    )
+    optimizer = torch.optim.AdamW(model.parameters())
+    features = torch.from_numpy(np.ascontiguousarray(x_train, dtype=np.float32))
+    targets = torch.from_numpy(np.ascontiguousarray(y_train, dtype=np.float32))
+    weights = torch.from_numpy(np.ascontiguousarray(row_weights, dtype=np.float32))
+
+    model.train()
+    for _ in range(MLP_EPOCHS):
+        for start in range(0, len(features), MLP_BATCH_SIZE):
+            end = min(start + MLP_BATCH_SIZE, len(features))
+            prediction = model(features[start:end]).squeeze(-1)
+            weighted_loss = (
+                weights[start:end] * torch.square(prediction - targets[start:end])
+            ).sum()
+            weighted_loss = weighted_loss / weights[start:end].sum()
+            optimizer.zero_grad(set_to_none=True)
+            weighted_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), MLP_GRADIENT_CLIP_NORM)
+            optimizer.step()
+
+    score_validation = _predict_mlp_rank_regression(model, x_validation)
+    if not np.isfinite(score_validation).all():
+        raise ValueError("MLP produced non-finite validation scores")
+    return TrainingOutcome(
+        score_validation=score_validation,
+        model_objects={
+            "preprocessor": preprocessor,
+            "model": model,
+            "model_type": "pytorch_mlp",
+            "architecture": {
+                "model_name": "mlp_rank_regression",
+                "input_dim": int(x_train.shape[1]),
+                "hidden_layers": MLP_HIDDEN_LAYERS,
+                "activation": "relu",
+                "output_bias": float(np.mean(y_train)),
+            },
+        },
+        metadata={
+            "hidden_layers": MLP_HIDDEN_LAYERS,
+            "epochs": MLP_EPOCHS,
+            "loss": "mse",
+            "optimizer": "adamw",
+            "batch_size": MLP_BATCH_SIZE,
+            "gradient_clip_norm": MLP_GRADIENT_CLIP_NORM,
+            "seed": MLP_SEED,
+        },
+    )
+
+
 MODEL_REGISTRY: dict[str, Trainer] = {
     "ridge_rank_regression": train_ridge_rank_regression,
     "xgboost_rank_regression": train_xgboost_rank_regression,
     "lightgbm_rank_regression": train_lightgbm_rank_regression,
+    "mlp_rank_regression": train_mlp_rank_regression,
 }
 
 
@@ -319,6 +438,17 @@ def _write_run_bundle(
         model.save_model(temporary_run / "model.json")
     elif isinstance(model, lgb.Booster):
         model.save_model(temporary_run / "model.txt")
+    elif outcome.model_objects.get("model_type") == "pytorch_mlp":
+        import torch
+
+        architecture = outcome.model_objects.get("architecture")
+        if not isinstance(architecture, dict):
+            raise ValueError("PyTorch model is missing architecture metadata")
+        (temporary_run / "model_architecture.json").write_text(
+            json.dumps(architecture, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        torch.save(model.state_dict(), temporary_run / "model_state_dict.pt")
     else:
         joblib.dump(model, temporary_run / "model.joblib")
     predictions.to_parquet(predictions_path, index=False)
@@ -327,18 +457,42 @@ def _write_run_bundle(
 def _load_persisted_model(temporary_run: Path) -> Any:
     xgboost_path = temporary_run / "model.json"
     lightgbm_path = temporary_run / "model.txt"
+    architecture_path = temporary_run / "model_architecture.json"
     if xgboost_path.exists():
         model = xgb.Booster()
         model.load_model(xgboost_path)
         return model
     if lightgbm_path.exists():
         return lgb.Booster(model_file=str(lightgbm_path))
+    if architecture_path.exists():
+        import torch
+
+        architecture = json.loads(architecture_path.read_text(encoding="utf-8"))
+        try:
+            input_dim = int(architecture["input_dim"])
+            hidden_layers = architecture["hidden_layers"]
+            output_bias = float(architecture["output_bias"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("invalid PyTorch model architecture") from error
+        if hidden_layers != MLP_HIDDEN_LAYERS:
+            raise ValueError("unexpected PyTorch MLP architecture")
+        model = _build_mlp_rank_regression_model(input_dim, output_bias)
+        model.load_state_dict(
+            torch.load(
+                temporary_run / "model_state_dict.pt",
+                map_location="cpu",
+                weights_only=True,
+            )
+        )
+        return model
     return joblib.load(temporary_run / "model.joblib")
 
 
 def _predict_model(model: Any, features: np.ndarray) -> np.ndarray:
     if isinstance(model, xgb.Booster):
         return model.predict(xgb.DMatrix(features))
+    if model.__class__.__module__.startswith("torch"):
+        return _predict_mlp_rank_regression(model, features)
     return model.predict(features)
 
 
@@ -363,14 +517,22 @@ def _verify_reloaded_predictions(
             scale_continuous=not isinstance(model, (xgb.Booster, lgb.Booster)),
         ),
     )
-    if not np.allclose(reloaded_scores, expected_scores, rtol=1e-12, atol=1e-12):
+    tolerance = (
+        1e-6 if model.__class__.__module__.startswith("torch") else 1e-12
+    )
+    if not np.allclose(
+        reloaded_scores,
+        expected_scores,
+        rtol=tolerance,
+        atol=tolerance,
+    ):
         raise ValueError("reloaded model predictions do not match staged predictions")
     persisted = pd.read_parquet(temporary_run / "predictions_10d.parquet")
     if not np.allclose(
         persisted["score_raw"].to_numpy(dtype="float64"),
         expected_scores,
-        rtol=1e-12,
-        atol=1e-12,
+        rtol=tolerance,
+        atol=tolerance,
     ):
         raise ValueError("staged prediction artifact does not match model predictions")
 
