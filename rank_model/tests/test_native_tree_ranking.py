@@ -233,6 +233,136 @@ runs_dir = "runs"
                         atol=1e-6,
                     )
 
+    def test_shuffled_inputs_preserve_published_prediction_key_alignment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_name:
+            root = Path(temporary_name)
+            ordered_root = root / "ordered"
+            shuffled_root = root / "shuffled"
+            ordered_root.mkdir()
+            shuffled_root.mkdir()
+            ordered_dataset = self._published_dataset(self.train, self.validation)
+            shuffled_dataset = self._published_dataset(
+                self.train.sample(frac=1.0, random_state=17),
+                self.validation.sample(frac=1.0, random_state=29),
+            )
+            ordered_config, ordered_config_path = self._write_training_inputs(
+                ordered_root, ordered_dataset
+            )
+            shuffled_config, shuffled_config_path = self._write_training_inputs(
+                shuffled_root, shuffled_dataset
+            )
+
+            expected_keys = (
+                self.validation.loc[:, ["date", "stock_code"]]
+                .sort_values(["date", "stock_code"])
+                .reset_index(drop=True)
+            )
+            for model_name in ("xgboost_pairwise_rank", "lightgbm_lambdarank"):
+                with self.subTest(model_name=model_name):
+                    ordered_run = train_registered_model(
+                        ordered_config, ordered_config_path, model_name, model_name
+                    )
+                    shuffled_run = train_registered_model(
+                        shuffled_config, shuffled_config_path, model_name, model_name
+                    )
+                    ordered_predictions = pd.read_parquet(
+                        ordered_run / "predictions_10d.parquet"
+                    ).sort_values(["date", "stock_code"])
+                    shuffled_predictions = pd.read_parquet(
+                        shuffled_run / "predictions_10d.parquet"
+                    ).sort_values(["date", "stock_code"])
+
+                    pd.testing.assert_frame_equal(
+                        shuffled_predictions.loc[:, ["date", "stock_code"]].reset_index(
+                            drop=True
+                        ),
+                        expected_keys,
+                    )
+                    np.testing.assert_allclose(
+                        shuffled_predictions["score_raw"].to_numpy(dtype="float64"),
+                        ordered_predictions["score_raw"].to_numpy(dtype="float64"),
+                        rtol=1e-6,
+                        atol=1e-6,
+                    )
+
+    def _published_dataset(
+        self, train: pd.DataFrame, validation: pd.DataFrame
+    ) -> pd.DataFrame:
+        return pd.concat(
+            [
+                train.assign(
+                    target_10d=train["rank_target_10d"],
+                    split_10d="train",
+                    exit_date_10d=pd.Timestamp("2023-01-13"),
+                ),
+                validation.assign(
+                    target_10d=validation["rank_target_10d"],
+                    split_10d="validation",
+                    exit_date_10d=pd.Timestamp("2023-01-17"),
+                ),
+            ],
+            ignore_index=True,
+        )
+
+    def _write_training_inputs(
+        self, root: Path, dataset: pd.DataFrame
+    ) -> tuple[dict[str, object], Path]:
+        dataset_path = root / "rank_dataset.parquet"
+        schema_path = root / "rank_schema.json"
+        config_path = root / "config.toml"
+        columns = [
+            "date",
+            "stock_code",
+            "factor_a",
+            "factor_b",
+            "industry",
+            "target_10d",
+            "rank_target_10d",
+            "split_10d",
+            "exit_date_10d",
+        ]
+        dataset.loc[:, columns].to_parquet(dataset_path, index=False)
+        schema_path.write_text(
+            json.dumps(
+                {
+                    **self.schema,
+                    "key_columns": ["date", "stock_code"],
+                    "target_column": "target_10d",
+                    "rank_target_column": "rank_target_10d",
+                    "split_column": "split_10d",
+                    "output_columns": columns,
+                    "parquet_sha256": hashlib.sha256(dataset_path.read_bytes()).hexdigest(),
+                }
+            ),
+            encoding="utf-8",
+        )
+        config_path.write_text(
+            """[paths]
+rank_dataset = "rank_dataset.parquet"
+rank_schema = "rank_schema.json"
+runs_dir = "runs"
+
+[models.xgboost_pairwise_rank]
+
+[models.lightgbm_lambdarank]
+""",
+            encoding="utf-8",
+        )
+        return (
+            {
+                "paths": {
+                    "rank_dataset": "rank_dataset.parquet",
+                    "rank_schema": "rank_schema.json",
+                    "runs_dir": "runs",
+                },
+                "models": {
+                    "xgboost_pairwise_rank": {},
+                    "lightgbm_lambdarank": {},
+                },
+            },
+            config_path,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
