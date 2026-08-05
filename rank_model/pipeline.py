@@ -8,7 +8,10 @@ from pathlib import Path
 import tomllib
 from typing import Any
 
+import pandas as pd
+
 from rank_model.stages.dataset import build_rank_dataset
+from rank_model.stages.evaluation import compare_runs, evaluate_predictions, write_evaluation
 from rank_model.stages.training import MODEL_NAMES, train_registered_model
 
 
@@ -73,8 +76,12 @@ def make_parser() -> argparse.ArgumentParser:
     train_parser = subparsers.add_parser("train", help="Train one registered rank model.")
     train_parser.add_argument("--model", required=True, choices=MODEL_NAMES)
     train_parser.add_argument("--run-id", required=True)
-    for command in ("doctor", "evaluate", "compare"):
-        subparsers.add_parser(command, help=f"Reserved for a later stage: {command}.")
+    subparsers.add_parser("doctor", help="Reserved for a later stage: doctor.")
+    evaluate_parser = subparsers.add_parser("evaluate", help="Evaluate one completed run.")
+    evaluate_parser.add_argument("--run-id", required=True)
+    evaluate_parser.add_argument("--split", required=True, choices=("validation",))
+    compare_parser = subparsers.add_parser("compare", help="Compare completed runs.")
+    compare_parser.add_argument("--run-ids", required=True)
     return parser
 
 
@@ -91,6 +98,34 @@ def main() -> None:
             parser = make_parser()
             parser.error(str(error))
         print(f"rank model run written: {run_directory}")
+        return
+    if args.command == "evaluate":
+        run_directory = resolve_config_path(config_path, config["paths"]["runs_dir"]) / args.run_id
+        try:
+            predictions = pd.read_parquet(run_directory / "predictions_10d.parquet")
+            if "split" not in predictions:
+                raise ValueError("prediction artifact is missing split")
+            bundle = evaluate_predictions(
+                predictions.loc[predictions["split"].eq(args.split)].copy()
+            )
+            write_evaluation(bundle, run_directory)
+        except (FileNotFoundError, ValueError, FileExistsError) as error:
+            parser = make_parser()
+            parser.error(str(error))
+        print(f"rank model evaluation written: {run_directory}")
+        return
+    if args.command == "compare":
+        run_ids = [run_id.strip() for run_id in args.run_ids.split(",") if run_id.strip()]
+        runs_directory = resolve_config_path(config_path, config["paths"]["runs_dir"])
+        try:
+            comparison = compare_runs(
+                [runs_directory / run_id for run_id in run_ids],
+                runs_directory / "rank_model_comparison.csv",
+            )
+        except (FileNotFoundError, ValueError) as error:
+            parser = make_parser()
+            parser.error(str(error))
+        print(f"rank model comparison written: rows={len(comparison)}")
         return
     if args.command != "prepare":
         raise NotImplementedError(f"{args.command} is not wired in this task")

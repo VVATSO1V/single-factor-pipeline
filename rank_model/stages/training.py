@@ -907,6 +907,7 @@ def _write_manifest(
     predictions: pd.DataFrame,
 ) -> None:
     manifest = {
+        "status": "completed",
         "run_id": run_id,
         "model_name": model_name,
         "training_rows": int(outcome.metadata["training_rows"]),
