@@ -621,9 +621,11 @@ def train_mlp_pairwise_rank(
         np.ascontiguousarray(direction, dtype=np.float32)
     )
     batch_ranges = _pairwise_date_batch_ranges(train["date"])
+    training_date_count = len(unique_dates)
 
     model.train()
     for _ in range(MLP_EPOCHS):
+        optimizer.zero_grad(set_to_none=True)
         for batch_start, batch_end, batch_codes in batch_ranges:
             pair_mask = np.isin(pair_date_codes, batch_codes)
             batch_left = left_tensor[pair_mask] - batch_start
@@ -642,11 +644,10 @@ def train_mlp_pairwise_rank(
                         batch_direction[date_pair_mask],
                     )
                 )
-            loss = torch.stack(date_losses).mean()
-            optimizer.zero_grad(set_to_none=True)
+            loss = torch.stack(date_losses).sum() / training_date_count
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), MLP_GRADIENT_CLIP_NORM)
-            optimizer.step()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), MLP_GRADIENT_CLIP_NORM)
+        optimizer.step()
 
     score_validation = _predict_mlp_rank_regression(model, x_validation)
     if not np.isfinite(score_validation).all():
@@ -679,6 +680,8 @@ def train_mlp_pairwise_rank(
             "learning_rate": MLP_LEARNING_RATE,
             "weight_decay": MLP_WEIGHT_DECAY,
             "gradient_clip_norm": MLP_GRADIENT_CLIP_NORM,
+            "optimizer_steps_per_epoch": 1,
+            "global_date_loss_normalization": True,
             "seed": MLP_SEED,
             "dates_per_batch": MLP_PAIRWISE_DATES_PER_BATCH,
             "pairs_per_stock": MLP_PAIRWISE_PAIRS_PER_STOCK,
