@@ -9,6 +9,7 @@ import tomllib
 from typing import Any
 
 from rank_model.stages.dataset import build_rank_dataset
+from rank_model.stages.training import MODEL_NAMES, train_registered_model
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -44,6 +45,7 @@ def load_config(config_path: Path) -> dict[str, Any]:
         "rank_dataset",
         "rank_schema",
         "rank_label_coverage",
+        "runs_dir",
     ):
         if not isinstance(config["paths"].get(name), str):
             raise ValueError(f"{path} requires paths.{name}")
@@ -68,7 +70,10 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("prepare", help="Build the rank-label dataset.")
-    for command in ("doctor", "train", "evaluate", "compare"):
+    train_parser = subparsers.add_parser("train", help="Train one registered rank model.")
+    train_parser.add_argument("--model", required=True, choices=MODEL_NAMES)
+    train_parser.add_argument("--run-id", required=True)
+    for command in ("doctor", "evaluate", "compare"):
         subparsers.add_parser(command, help=f"Reserved for a later stage: {command}.")
     return parser
 
@@ -77,6 +82,16 @@ def main() -> None:
     args = make_parser().parse_args()
     config_path = Path(args.config).resolve()
     config = load_config(config_path)
+    if args.command == "train":
+        try:
+            run_directory = train_registered_model(
+                config, config_path, args.model, args.run_id
+            )
+        except (NotImplementedError, ValueError, FileExistsError) as error:
+            parser = make_parser()
+            parser.error(str(error))
+        print(f"rank model run written: {run_directory}")
+        return
     if args.command != "prepare":
         raise NotImplementedError(f"{args.command} is not wired in this task")
     result = command_prepare(config, config_path)
