@@ -62,9 +62,9 @@ def _load_source_schema(source_schema: Path, source_dataset: Path) -> dict[str, 
     if not source_dataset.exists():
         raise FileNotFoundError(source_dataset)
     schema = json.loads(source_schema.read_text(encoding="utf-8"))
-    expected_hash = schema.get("parquet_sha256")
+    expected_hash = schema.get("context_dataset_sha256")
     if not isinstance(expected_hash, str) or len(expected_hash) != 64:
-        raise ValueError(f"{source_schema} has no valid parquet_sha256")
+        raise ValueError(f"{source_schema} has no valid context_dataset_sha256")
     actual_hash = file_sha256(source_dataset)
     if actual_hash != expected_hash:
         raise ValueError(
@@ -76,15 +76,30 @@ def _load_source_schema(source_schema: Path, source_dataset: Path) -> dict[str, 
 
 def _source_columns(schema: dict[str, Any]) -> tuple[list[str], list[str]]:
     key_columns = schema.get("key_columns")
-    feature_columns = schema.get("feature_columns")
     if key_columns != KEY_COLUMNS:
         raise ValueError("source schema key_columns must be ['date', 'stock_code']")
-    if not isinstance(feature_columns, list) or not feature_columns:
-        raise ValueError("source schema requires a non-empty feature_columns list")
-    if not all(isinstance(column, str) and column for column in feature_columns):
-        raise ValueError("source schema feature_columns must contain non-empty strings")
+    factor_features = schema.get("factor_feature_columns")
+    continuous_features = schema.get("continuous_feature_columns")
+    industry_column = schema.get("industry_column")
+    if not isinstance(factor_features, list) or not factor_features:
+        raise ValueError("source schema requires factor_feature_columns")
+    if not isinstance(continuous_features, list) or not continuous_features:
+        raise ValueError("source schema requires continuous_feature_columns")
+    if not isinstance(industry_column, str) or not industry_column:
+        raise ValueError("source schema requires industry_column")
+    if not all(
+        isinstance(column, str) and column
+        for column in [*factor_features, *continuous_features]
+    ):
+        raise ValueError("source schema feature groups must contain non-empty strings")
+    if not set(factor_features).issubset(continuous_features):
+        raise ValueError(
+            "source schema factor_feature_columns must be included in "
+            "continuous_feature_columns"
+        )
+    feature_columns = [*continuous_features, industry_column]
     if len(set(feature_columns)) != len(feature_columns):
-        raise ValueError("source schema feature_columns contains duplicates")
+        raise ValueError("source schema feature columns contain duplicates")
     forbidden = sorted(
         column for column in feature_columns if _is_forbidden_feature(column)
     )
@@ -97,10 +112,10 @@ def _is_forbidden_feature(column: str) -> bool:
     normalized = column.lower()
     return (
         normalized in FORBIDDEN_FEATURE_COLUMNS
-        or normalized.startswith("entry_")
-        or normalized.startswith("future_")
+        or normalized.startswith(("target_", "split_", "exit_"))
+        or normalized.startswith(("entry_", "future_", "next_"))
         or "t+1" in normalized
-        or "t_plus_1" in normalized
+        or "t_plus_" in normalized
     )
 
 
@@ -111,6 +126,17 @@ def _read_source_dataset(
     import pyarrow.parquet as pq
 
     key_columns, feature_columns = _source_columns(schema)
+    target_columns = schema.get("target_columns")
+    sample_columns = schema.get("sample_columns")
+    if not isinstance(target_columns, list) or TARGET_COLUMN not in target_columns:
+        raise ValueError(f"source schema must declare {TARGET_COLUMN}")
+    if not isinstance(sample_columns, list) or not {
+        SPLIT_COLUMN,
+        EXIT_DATE_COLUMN,
+    }.issubset(sample_columns):
+        raise ValueError(
+            f"source schema must declare {SPLIT_COLUMN} and {EXIT_DATE_COLUMN}"
+        )
     required_columns = [
         *key_columns,
         *feature_columns,
@@ -156,29 +182,19 @@ def _validate_source_dates(
         )
 
 
-def _expected_rows_per_date(schema: dict[str, Any]) -> int:
-    """Allow compact synthetic contracts while production defaults to CSI1000."""
-    expected = schema.get("expected_rows_per_date", 1000)
-    if not isinstance(expected, int) or isinstance(expected, bool) or expected < 2:
-        raise ValueError("source schema expected_rows_per_date must be an integer >= 2")
-    return expected
-
-
 def _validate_date_sizes(
     frame: pd.DataFrame,
     source_dataset: Path,
-    schema: dict[str, Any],
 ) -> None:
-    expected = _expected_rows_per_date(schema)
     sizes = frame.groupby("date", sort=False).size()
-    invalid = sizes.loc[sizes.ne(expected)]
+    invalid = sizes.loc[sizes.ne(1000)]
     if not invalid.empty:
         sample = {
             timestamp.strftime("%Y-%m-%d"): int(size)
             for timestamp, size in invalid.head(5).items()
         }
         raise ValueError(
-            f"{source_dataset} must contain exactly {expected} source rows per date: "
+            f"{source_dataset} must contain exactly 1000 source rows per date: "
             f"{sample}"
         )
 
@@ -225,15 +241,46 @@ def _coverage_rows(frame: pd.DataFrame) -> list[dict[str, Any]]:
     return rows
 
 
-def _temporary_path(path: Path) -> Path:
+def _temporary_path(path: Path, suffix: str = ".tmp") -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
         dir=path.parent,
         prefix=f".{path.name}.",
-        suffix=".tmp",
+        suffix=suffix,
     )
     os.close(descriptor)
     return Path(temporary_name)
+
+
+def _publish_bundle(
+    temporary_paths: list[Path],
+    output_paths: list[Path],
+) -> None:
+    """Publish a bundle or restore every pre-existing file after a failure."""
+    backups: list[tuple[Path, Path]] = []
+    published: list[Path] = []
+    try:
+        for output_path in output_paths:
+            if output_path.exists():
+                backup_path = _temporary_path(output_path, suffix=".bak")
+                backup_path.unlink()
+                output_path.replace(backup_path)
+                backups.append((output_path, backup_path))
+        for temporary_path, output_path in zip(temporary_paths, output_paths):
+            temporary_path.replace(output_path)
+            published.append(output_path)
+    except Exception:
+        for output_path in reversed(published):
+            if output_path.exists():
+                output_path.unlink()
+        for output_path, backup_path in reversed(backups):
+            if backup_path.exists():
+                backup_path.replace(output_path)
+        raise
+    finally:
+        for backup_path in (backup for _, backup in backups):
+            if backup_path.exists():
+                backup_path.unlink()
 
 
 def _write_bundle(
@@ -274,9 +321,10 @@ def _write_bundle(
             )
             writer.writeheader()
             writer.writerows(coverage_rows)
-        temporary_dataset.replace(output_dataset)
-        temporary_schema.replace(output_schema)
-        temporary_coverage.replace(coverage_path)
+        _publish_bundle(
+            [temporary_dataset, temporary_schema, temporary_coverage],
+            [output_dataset, output_schema, coverage_path],
+        )
         return published_schema
     finally:
         for temporary_path in (
@@ -307,7 +355,7 @@ def build_rank_dataset(
     dataset, feature_columns = _read_source_dataset(source_dataset, source_contract)
     dataset = _normalize_keys(dataset, source_dataset)
     _validate_source_dates(dataset, source_dataset, development_end)
-    _validate_date_sizes(dataset, source_dataset, source_contract)
+    _validate_date_sizes(dataset, source_dataset)
     dataset = _normalize_target(dataset, source_dataset)
     dataset[RANK_TARGET_COLUMN] = np.nan
     for timestamp, index in dataset.groupby("date", sort=False).groups.items():
