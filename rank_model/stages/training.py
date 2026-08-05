@@ -300,6 +300,7 @@ def train_mlp_rank_regression(
     features = torch.from_numpy(np.ascontiguousarray(x_train, dtype=np.float32))
     targets = torch.from_numpy(np.ascontiguousarray(y_train, dtype=np.float32))
     weights = torch.from_numpy(np.ascontiguousarray(row_weights, dtype=np.float32))
+    total_weight = weights.sum()
 
     model.train()
     for _ in range(MLP_EPOCHS):
@@ -309,7 +310,7 @@ def train_mlp_rank_regression(
             weighted_loss = (
                 weights[start:end] * torch.square(prediction - targets[start:end])
             ).sum()
-            weighted_loss = weighted_loss / weights[start:end].sum()
+            weighted_loss = weighted_loss / total_weight
             optimizer.zero_grad(set_to_none=True)
             weighted_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), MLP_GRADIENT_CLIP_NORM)

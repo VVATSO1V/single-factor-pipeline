@@ -11,10 +11,17 @@ import pandas as pd
 import torch
 
 from rank_model.stages.training import (
+    MLP_BATCH_SIZE,
+    MLP_EPOCHS,
+    MLP_GRADIENT_CLIP_NORM,
+    MLP_SEED,
     MODEL_REGISTRY,
+    _build_mlp_rank_regression_model,
+    _predict_mlp_rank_regression,
     train_mlp_rank_regression,
     train_registered_model,
 )
+from rank_model.stages.preprocessing import RankPreprocessor, equal_date_weights
 
 
 class MlpRankRegressionTests(unittest.TestCase):
@@ -149,6 +156,93 @@ runs_dir = "runs"
                 rtol=1e-6,
                 atol=1e-6,
             )
+
+    def test_mlp_uses_global_date_equal_normalization_across_batches(self) -> None:
+        train = self._uneven_large_training_frame()
+        validation = self._frame(pd.to_datetime(["2023-01-03"]))
+
+        outcome = train_mlp_rank_regression(train, validation, self.schema, {})
+        expected = self._global_normalization_reference(train, validation)
+
+        np.testing.assert_allclose(
+            outcome.score_validation,
+            expected,
+            rtol=1e-7,
+            atol=1e-7,
+        )
+
+    def _global_normalization_reference(
+        self, train: pd.DataFrame, validation: pd.DataFrame
+    ) -> np.ndarray:
+        preprocessor = RankPreprocessor.fit(
+            train,
+            continuous_columns=self.schema["continuous_feature_columns"],
+            industry_column=self.schema["industry_column"],
+        )
+        features = preprocessor.transform(train, scale_continuous=True)
+        validation_features = preprocessor.transform(
+            validation, scale_continuous=True
+        )
+        targets = train["rank_target_10d"].to_numpy(dtype="float32")
+        weights = equal_date_weights(train["date"]).astype("float32")
+
+        np.random.seed(MLP_SEED)
+        torch.manual_seed(MLP_SEED)
+        torch.use_deterministic_algorithms(True)
+        torch.set_num_threads(1)
+        model = _build_mlp_rank_regression_model(
+            features.shape[1], float(np.mean(targets))
+        )
+        optimizer = torch.optim.AdamW(model.parameters())
+        feature_tensor = torch.from_numpy(np.ascontiguousarray(features, dtype=np.float32))
+        target_tensor = torch.from_numpy(np.ascontiguousarray(targets, dtype=np.float32))
+        weight_tensor = torch.from_numpy(np.ascontiguousarray(weights, dtype=np.float32))
+        total_weight = weight_tensor.sum()
+
+        model.train()
+        for _ in range(MLP_EPOCHS):
+            for start in range(0, len(feature_tensor), MLP_BATCH_SIZE):
+                end = min(start + MLP_BATCH_SIZE, len(feature_tensor))
+                prediction = model(feature_tensor[start:end]).squeeze(-1)
+                loss = (
+                    weight_tensor[start:end]
+                    * torch.square(prediction - target_tensor[start:end])
+                ).sum() / total_weight
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), MLP_GRADIENT_CLIP_NORM
+                )
+                optimizer.step()
+        return _predict_mlp_rank_regression(model, validation_features)
+
+    @staticmethod
+    def _uneven_large_training_frame() -> pd.DataFrame:
+        sizes = [9000, 23, 401]
+        dates = pd.to_datetime(["2019-01-02", "2020-01-02", "2022-01-03"])
+        date_values = np.repeat(dates, sizes)
+        positions = np.arange(len(date_values), dtype="float64")
+        signals = (positions % 97.0) / 96.0
+        targets = np.concatenate(
+            [
+                0.05 + 0.15 * signals[: sizes[0]],
+                0.75 + 0.20 * signals[sizes[0] : sizes[0] + sizes[1]],
+                0.35 + 0.30 * signals[sizes[0] + sizes[1] :],
+            ]
+        )
+        return pd.DataFrame(
+            {
+                "date": date_values,
+                "stock_code": [f"L{index:05d}" for index in range(len(date_values))],
+                "factor_a": signals,
+                "factor_b": np.cos(signals * np.pi),
+                "industry": np.where(positions.astype("int64") % 2 == 0, "A", "B"),
+                "target_10d": targets,
+                "rank_target_10d": targets,
+                "split_10d": "train",
+                "exit_date_10d": date_values,
+            }
+        )
 
 
 if __name__ == "__main__":
