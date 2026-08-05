@@ -1,6 +1,10 @@
 [project]
 name = "csi1000_rank_model_10d"
 development_end = "2023-12-31"
+training_start = "2019-01-01"
+training_end = "2022-12-31"
+validation_start = "2023-01-01"
+validation_end = "2023-12-31"
 
 [paths]
 source_dataset = "../model/data/context_dataset_10d.parquet"
