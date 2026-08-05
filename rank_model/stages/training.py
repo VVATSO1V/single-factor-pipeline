@@ -72,6 +72,7 @@ LGB_PARAMS = {
     "deterministic": True,
     "force_col_wise": True,
     "seed": 42,
+    "verbosity": -1,
 }
 LGB_BOOSTING_ROUNDS = 21
 

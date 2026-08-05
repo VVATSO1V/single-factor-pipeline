@@ -5,9 +5,13 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import warnings
 
+import joblib
+import lightgbm as lgb
 import numpy as np
 import pandas as pd
+import xgboost as xgb
 
 from rank_model.stages.training import (
     MODEL_REGISTRY,
@@ -27,6 +31,12 @@ class TreeRankRegressionTests(unittest.TestCase):
         self.validation = self._frame(
             pd.date_range("2023-01-03", periods=2, freq="B")
         )
+        self.learning_train = self._learning_frame(
+            pd.bdate_range("2019-01-02", "2022-12-30")
+        )
+        self.learning_validation = self._learning_frame(
+            pd.bdate_range("2023-01-03", periods=2)
+        )
 
     @staticmethod
     def _frame(dates: pd.DatetimeIndex) -> pd.DataFrame:
@@ -39,6 +49,21 @@ class TreeRankRegressionTests(unittest.TestCase):
                 "factor_b": np.tile(np.arange(30, dtype="float64"), len(dates)),
                 "industry": np.where(positions % 2 == 0, "A", "B"),
                 "rank_target_10d": positions / 29.0,
+            }
+        )
+
+    @staticmethod
+    def _learning_frame(dates: pd.DatetimeIndex) -> pd.DataFrame:
+        row_count = len(dates) * 30
+        positions = np.tile(np.arange(30), len(dates))
+        signal = positions / 29.0
+        return pd.DataFrame(
+            {
+                "date": np.repeat(dates, 30),
+                "factor_a": signal,
+                "factor_b": np.arange(row_count, dtype="float64") / row_count,
+                "industry": np.where(positions % 2 == 0, "A", "B"),
+                "rank_target_10d": signal,
             }
         )
 
@@ -64,7 +89,19 @@ class TreeRankRegressionTests(unittest.TestCase):
         self.assertEqual(outcome.metadata["boosting_rounds"], 21)
         self.assertIs(MODEL_REGISTRY["lightgbm_rank_regression"], train_lightgbm_rank_regression)
 
-    def test_registered_tree_models_publish_native_reloaded_artifacts(self) -> None:
+    def test_tree_models_learn_nonconstant_validation_scores(self) -> None:
+        for trainer in (
+            train_xgboost_rank_regression,
+            train_lightgbm_rank_regression,
+        ):
+            outcome = trainer(
+                self.learning_train, self.learning_validation, self.schema, {}
+            )
+
+            self.assertTrue(np.isfinite(outcome.score_validation).all())
+            self.assertGreater(np.std(outcome.score_validation), 1e-12)
+
+    def test_registered_tree_models_publish_reloaded_nonconstant_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_name:
             root = Path(temporary_name)
             dataset_path = root / "rank_dataset.parquet"
@@ -72,15 +109,19 @@ class TreeRankRegressionTests(unittest.TestCase):
             config_path = root / "config.toml"
             dataset = pd.concat(
                 [
-                    self.train.assign(
-                        stock_code=[f"T{index}" for index in range(len(self.train))],
-                        target_10d=self.train["rank_target_10d"],
+                    self.learning_train.assign(
+                        stock_code=[
+                            f"T{index}" for index in range(len(self.learning_train))
+                        ],
+                        target_10d=self.learning_train["rank_target_10d"],
                         split_10d="train",
-                        exit_date_10d=pd.Timestamp("2019-01-16"),
+                        exit_date_10d=pd.Timestamp("2023-01-13"),
                     ),
-                    self.validation.assign(
-                        stock_code=[f"V{index}" for index in range(len(self.validation))],
-                        target_10d=self.validation["rank_target_10d"],
+                    self.learning_validation.assign(
+                        stock_code=[
+                            f"V{index}" for index in range(len(self.learning_validation))
+                        ],
+                        target_10d=self.learning_validation["rank_target_10d"],
                         split_10d="validation",
                         exit_date_10d=pd.Timestamp("2023-01-17"),
                     ),
@@ -150,6 +191,34 @@ runs_dir = "runs"
                 self.assertTrue((run_directory / "preprocessor.joblib").exists())
                 predictions = pd.read_parquet(run_directory / "predictions_10d.parquet")
                 self.assertTrue(np.isfinite(predictions["score_raw"]).all())
+                self.assertGreater(np.std(predictions["score_raw"]), 1e-12)
+
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message="^Setting the shape on a NumPy array has been deprecated",
+                        category=DeprecationWarning,
+                        module=r"^joblib\.numpy_pickle$",
+                    )
+                    preprocessor = joblib.load(run_directory / "preprocessor.joblib")
+                features = preprocessor.transform(
+                    self.learning_validation, scale_continuous=False
+                )
+                if model_name == "xgboost_rank_regression":
+                    reloaded_model = xgb.Booster()
+                    reloaded_model.load_model(run_directory / artifact_name)
+                    reloaded_scores = reloaded_model.predict(xgb.DMatrix(features))
+                else:
+                    reloaded_model = lgb.Booster(
+                        model_file=str(run_directory / artifact_name)
+                    )
+                    reloaded_scores = reloaded_model.predict(features)
+                np.testing.assert_allclose(
+                    reloaded_scores,
+                    predictions["score_raw"].to_numpy(dtype="float64"),
+                    rtol=1e-12,
+                    atol=1e-12,
+                )
 
 
 if __name__ == "__main__":
