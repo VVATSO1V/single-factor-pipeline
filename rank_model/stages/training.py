@@ -12,8 +12,10 @@ from typing import Any, Callable
 import warnings
 
 import joblib
+import lightgbm as lgb
 import numpy as np
 import pandas as pd
+import xgboost as xgb
 from sklearn.linear_model import Ridge
 
 from rank_model.stages.dataset import file_sha256, load_rank_dataset
@@ -41,6 +43,37 @@ _JOBLIB_NUMPY_SHAPE_WARNING = (
     "As an alternative, you can create a new view using np.reshape "
     "(with copy=False if needed)."
 )
+XGB_PARAMS = {
+    "objective": "reg:squarederror",
+    "eval_metric": "rmse",
+    "tree_method": "hist",
+    "eta": 0.05,
+    "max_depth": 4,
+    "min_child_weight": 100.0,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "lambda": 10.0,
+    "alpha": 0.1,
+    "seed": 42,
+}
+XGB_BOOSTING_ROUNDS = 81
+LGB_PARAMS = {
+    "objective": "regression",
+    "metric": "rmse",
+    "learning_rate": 0.05,
+    "num_leaves": 31,
+    "max_depth": 5,
+    "min_data_in_leaf": 1000,
+    "bagging_fraction": 0.8,
+    "bagging_freq": 1,
+    "feature_fraction": 0.8,
+    "lambda_l2": 10.0,
+    "lambda_l1": 0.1,
+    "deterministic": True,
+    "force_col_wise": True,
+    "seed": 42,
+}
+LGB_BOOSTING_ROUNDS = 21
 
 
 @dataclass
@@ -105,8 +138,97 @@ def train_ridge_rank_regression(
     )
 
 
+def _tree_training_inputs(
+    train: pd.DataFrame,
+    validation: pd.DataFrame,
+    schema: dict[str, Any],
+) -> tuple[RankPreprocessor, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    train = _finite_label_rows(train)
+    if train.empty:
+        raise ValueError("tree training requires at least one finite rank label")
+    if validation.empty:
+        raise ValueError("tree validation frame is empty")
+    try:
+        continuous_columns = schema["continuous_feature_columns"]
+        industry_column = schema["industry_column"]
+    except (KeyError, TypeError) as error:
+        raise ValueError("tree training requires schema features") from error
+    preprocessor = RankPreprocessor.fit(
+        train,
+        continuous_columns=continuous_columns,
+        industry_column=industry_column,
+    )
+    return (
+        preprocessor,
+        preprocessor.transform(train, scale_continuous=False),
+        preprocessor.transform(validation, scale_continuous=False),
+        train[RANK_TARGET_COLUMN].to_numpy(dtype="float64"),
+        equal_date_weights(train["date"]),
+    )
+
+
+def train_xgboost_rank_regression(
+    train: pd.DataFrame,
+    validation: pd.DataFrame,
+    schema: dict[str, Any],
+    params: dict[str, Any],
+) -> TrainingOutcome:
+    """Fit the fixed XGBoost rank-regression baseline."""
+    del params
+    preprocessor, x_train, x_validation, y_train, weights = _tree_training_inputs(
+        train, validation, schema
+    )
+    model = xgb.train(
+        XGB_PARAMS,
+        xgb.DMatrix(x_train, label=y_train, weight=weights),
+        num_boost_round=XGB_BOOSTING_ROUNDS,
+    )
+    score_validation = model.predict(xgb.DMatrix(x_validation))
+    if not np.isfinite(score_validation).all():
+        raise ValueError("xgboost produced non-finite validation scores")
+    return TrainingOutcome(
+        score_validation=np.asarray(score_validation, dtype="float64"),
+        model_objects={"preprocessor": preprocessor, "model": model},
+        metadata={
+            "objective": XGB_PARAMS["objective"],
+            "boosting_rounds": XGB_BOOSTING_ROUNDS,
+        },
+    )
+
+
+def train_lightgbm_rank_regression(
+    train: pd.DataFrame,
+    validation: pd.DataFrame,
+    schema: dict[str, Any],
+    params: dict[str, Any],
+) -> TrainingOutcome:
+    """Fit the fixed LightGBM rank-regression baseline."""
+    del params
+    preprocessor, x_train, x_validation, y_train, weights = _tree_training_inputs(
+        train, validation, schema
+    )
+    model = lgb.train(
+        LGB_PARAMS,
+        lgb.Dataset(x_train, label=y_train, weight=weights),
+        num_boost_round=LGB_BOOSTING_ROUNDS,
+    )
+    score_validation = model.predict(x_validation)
+    if not np.isfinite(score_validation).all():
+        raise ValueError("lightgbm produced non-finite validation scores")
+    return TrainingOutcome(
+        score_validation=np.asarray(score_validation, dtype="float64"),
+        model_objects={"preprocessor": preprocessor, "model": model},
+        metadata={
+            "objective": LGB_PARAMS["objective"],
+            "boosting_rounds": LGB_BOOSTING_ROUNDS,
+        },
+    )
+
+
 MODEL_REGISTRY: dict[str, Trainer] = {
     "ridge_rank_regression": train_ridge_rank_regression,
+    "xgboost_rank_regression": train_xgboost_rank_regression,
+    "lightgbm_rank_regression": train_lightgbm_rank_regression,
 }
 
 
@@ -190,11 +312,33 @@ def _write_run_bundle(
         encoding="utf-8",
     )
     preprocessor_path = temporary_run / "preprocessor.joblib"
-    model_path = temporary_run / "model.joblib"
     predictions_path = temporary_run / "predictions_10d.parquet"
     joblib.dump(preprocessor, preprocessor_path)
-    joblib.dump(model, model_path)
+    if isinstance(model, xgb.Booster):
+        model.save_model(temporary_run / "model.json")
+    elif isinstance(model, lgb.Booster):
+        model.save_model(temporary_run / "model.txt")
+    else:
+        joblib.dump(model, temporary_run / "model.joblib")
     predictions.to_parquet(predictions_path, index=False)
+
+
+def _load_persisted_model(temporary_run: Path) -> Any:
+    xgboost_path = temporary_run / "model.json"
+    lightgbm_path = temporary_run / "model.txt"
+    if xgboost_path.exists():
+        model = xgb.Booster()
+        model.load_model(xgboost_path)
+        return model
+    if lightgbm_path.exists():
+        return lgb.Booster(model_file=str(lightgbm_path))
+    return joblib.load(temporary_run / "model.joblib")
+
+
+def _predict_model(model: Any, features: np.ndarray) -> np.ndarray:
+    if isinstance(model, xgb.Booster):
+        return model.predict(xgb.DMatrix(features))
+    return model.predict(features)
 
 
 def _verify_reloaded_predictions(
@@ -210,9 +354,13 @@ def _verify_reloaded_predictions(
             module=r"^joblib\.numpy_pickle$",
         )
         preprocessor = joblib.load(temporary_run / "preprocessor.joblib")
-        model = joblib.load(temporary_run / "model.joblib")
-    reloaded_scores = model.predict(
-        preprocessor.transform(validation, scale_continuous=True)
+        model = _load_persisted_model(temporary_run)
+    reloaded_scores = _predict_model(
+        model,
+        preprocessor.transform(
+            validation,
+            scale_continuous=not isinstance(model, (xgb.Booster, lgb.Booster)),
+        ),
     )
     if not np.allclose(reloaded_scores, expected_scores, rtol=1e-12, atol=1e-12):
         raise ValueError("reloaded model predictions do not match staged predictions")

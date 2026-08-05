@@ -13,6 +13,10 @@ runs_dir = "runs"
 [models.ridge_rank_regression]
 lambda = 1.0
 
+[models.xgboost_rank_regression]
+
+[models.lightgbm_rank_regression]
+
 [features]
 forbidden_columns = [
   "date",
