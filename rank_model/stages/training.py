@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import tempfile
 from typing import Any, Callable
+import warnings
 
 import joblib
 import numpy as np
@@ -35,6 +36,11 @@ MODEL_NAMES = (
     "mlp_pairwise_rank",
 )
 _RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
+_JOBLIB_NUMPY_SHAPE_WARNING = (
+    "Setting the shape on a NumPy array has been deprecated in NumPy 2.5.\n"
+    "As an alternative, you can create a new view using np.reshape "
+    "(with copy=False if needed)."
+)
 
 
 @dataclass
@@ -196,8 +202,15 @@ def _verify_reloaded_predictions(
     validation: pd.DataFrame,
     expected_scores: np.ndarray,
 ) -> None:
-    preprocessor = joblib.load(temporary_run / "preprocessor.joblib")
-    model = joblib.load(temporary_run / "model.joblib")
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=rf"^{re.escape(_JOBLIB_NUMPY_SHAPE_WARNING)}$",
+            category=DeprecationWarning,
+            module=r"^joblib\.numpy_pickle$",
+        )
+        preprocessor = joblib.load(temporary_run / "preprocessor.joblib")
+        model = joblib.load(temporary_run / "model.joblib")
     reloaded_scores = model.predict(
         preprocessor.transform(validation, scale_continuous=True)
     )

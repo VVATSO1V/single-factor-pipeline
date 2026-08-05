@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -140,18 +141,28 @@ lambda = 1.0
                 encoding="utf-8",
             )
 
-            run_directory = train_registered_model(
-                {
-                    "paths": {
-                        "rank_dataset": "rank_dataset.parquet",
-                        "rank_schema": "rank_schema.json",
-                        "runs_dir": "runs",
+            with warnings.catch_warnings(record=True) as captured_warnings:
+                warnings.simplefilter("always")
+                warnings.warn("unrelated reload warning", UserWarning)
+                run_directory = train_registered_model(
+                    {
+                        "paths": {
+                            "rank_dataset": "rank_dataset.parquet",
+                            "rank_schema": "rank_schema.json",
+                            "runs_dir": "runs",
+                        },
+                        "models": {"ridge_rank_regression": self.params},
                     },
-                    "models": {"ridge_rank_regression": self.params},
-                },
-                config_path,
-                "ridge_rank_regression",
-                "ridge-synthetic",
+                    config_path,
+                    "ridge_rank_regression",
+                    "ridge-synthetic",
+                )
+
+            warning_messages = [str(warning.message) for warning in captured_warnings]
+            self.assertIn("unrelated reload warning", warning_messages)
+            self.assertNotIn(
+                "Setting the shape on a NumPy array has been deprecated in NumPy 2.5.",
+                warning_messages,
             )
 
             for filename in (
