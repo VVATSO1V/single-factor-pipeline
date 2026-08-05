@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 from typing import Any
 
@@ -33,6 +34,9 @@ FORBIDDEN_FEATURE_COLUMNS = {
     "entry_tradeable",
 }
 MAXIMUM_DEVELOPMENT_END = date(2023, 12, 31)
+FUTURE_STATUS_TIME_PATTERN = re.compile(
+    r"t(?:_|\+|_?plus_?)?0*([1-9][0-9]*)"
+)
 
 
 def file_sha256(path: Path) -> str:
@@ -118,6 +122,10 @@ def _is_forbidden_feature(column: str) -> bool:
         or normalized.startswith(("entry_", "future_", "next_"))
         or "t+1" in normalized
         or "t_plus_" in normalized
+        or (
+            "status" in normalized
+            and FUTURE_STATUS_TIME_PATTERN.search(normalized) is not None
+        )
     )
 
 

@@ -62,6 +62,38 @@ class RankPreprocessorTests(unittest.TestCase):
                 industry_column="industry",
             )
 
+    def test_fit_rejects_t_plus_status_feature_variants(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "factor_a": [1.0, 2.0],
+                "industry": ["Bank", "Tech"],
+            }
+        )
+
+        for column in (
+            "status_t1",
+            "status_t2",
+            "status_t_1",
+            "status_tplus2",
+            "status_t_plus_3",
+            "status_t+4",
+            "t5_status",
+            "t_6_status",
+            "tplus7_status",
+            "t_plus_8_status",
+            "t+9_status",
+            "statusT10",
+            "t11Status",
+        ):
+            with self.subTest(column=column), self.assertRaisesRegex(
+                ValueError, "forbidden"
+            ):
+                RankPreprocessor.fit(
+                    frame.assign(**{column: [0.0, 1.0]}),
+                    continuous_columns=[column],
+                    industry_column="industry",
+                )
+
 
 class DateUtilityTests(unittest.TestCase):
     def test_equal_date_weights_sum_to_one_per_date(self) -> None:
@@ -81,6 +113,27 @@ class DateUtilityTests(unittest.TestCase):
         )
 
         np.testing.assert_allclose(actual, [1.0, 0.0, 0.5])
+
+    def test_predicted_percentiles_normalize_same_day_timestamps(self) -> None:
+        actual = predicted_percentiles(
+            np.array([3.0, 1.0, 2.0]),
+            pd.Series(
+                [
+                    "2023-01-03 09:30:00",
+                    "2023-01-03 15:00:00",
+                    "2023-01-04 09:30:00",
+                ]
+            ),
+        )
+
+        np.testing.assert_allclose(actual, [1.0, 0.0, 0.0])
+
+    def test_predicted_percentiles_reject_missing_dates(self) -> None:
+        with self.assertRaisesRegex(ValueError, "dates must be non-missing"):
+            predicted_percentiles(
+                np.array([1.0, 2.0]),
+                pd.Series([pd.Timestamp("2023-01-03"), pd.NaT]),
+            )
 
 
 if __name__ == "__main__":

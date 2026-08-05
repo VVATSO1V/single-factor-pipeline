@@ -125,7 +125,10 @@ def equal_date_weights(dates: pd.Series) -> np.ndarray:
 
 
 def predicted_percentiles(scores: np.ndarray, dates: pd.Series) -> np.ndarray:
-    frame = pd.DataFrame({"date": pd.to_datetime(dates), "score": scores})
+    normalized_dates = pd.to_datetime(dates, errors="raise").dt.normalize()
+    if normalized_dates.isna().any():
+        raise ValueError("prediction dates must be non-missing")
+    frame = pd.DataFrame({"date": normalized_dates, "score": scores})
     if not np.isfinite(frame["score"]).all():
         raise ValueError("prediction scores must be finite")
     return frame.groupby("date", sort=False)["score"].transform(

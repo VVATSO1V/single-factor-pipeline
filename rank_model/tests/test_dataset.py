@@ -218,6 +218,9 @@ class RankDatasetTests(unittest.TestCase):
             "entry_is_suspended",
             "future_status",
             "t_plus_1_status",
+            "status_t1",
+            "status_t2",
+            "t_3_status",
         ):
             with self.subTest(column=column), tempfile.TemporaryDirectory() as temporary_name:
                 directory = Path(temporary_name)
