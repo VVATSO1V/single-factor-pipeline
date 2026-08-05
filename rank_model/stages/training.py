@@ -916,6 +916,9 @@ def _write_manifest(
         "metadata": outcome.metadata,
         "config_sha256": file_sha256(config_path),
         "rank_dataset_sha256": schema.get("parquet_sha256"),
+        "predictions_10d_sha256": file_sha256(
+            temporary_run / "predictions_10d.parquet"
+        ),
     }
     (temporary_run / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",

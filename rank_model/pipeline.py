@@ -68,6 +68,14 @@ def command_prepare(config: dict[str, Any], config_path: Path) -> dict[str, Any]
     )
 
 
+def parse_run_ids(raw_run_ids: str) -> list[str]:
+    """Parse a comma-delimited run list without silently dropping empty IDs."""
+    run_ids = [run_id.strip() for run_id in raw_run_ids.split(",")]
+    if not run_ids or any(not run_id for run_id in run_ids):
+        raise ValueError("run IDs must not contain blank components")
+    return run_ids
+
+
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="CSI1000 10-day rank-model pipeline")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
@@ -115,9 +123,9 @@ def main() -> None:
         print(f"rank model evaluation written: {run_directory}")
         return
     if args.command == "compare":
-        run_ids = [run_id.strip() for run_id in args.run_ids.split(",") if run_id.strip()]
         runs_directory = resolve_config_path(config_path, config["paths"]["runs_dir"])
         try:
+            run_ids = parse_run_ids(args.run_ids)
             comparison = compare_runs(
                 [runs_directory / run_id for run_id in run_ids],
                 runs_directory / "rank_model_comparison.csv",

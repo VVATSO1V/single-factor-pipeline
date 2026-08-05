@@ -8,6 +8,8 @@ import unittest
 import numpy as np
 import pandas as pd
 
+from rank_model.pipeline import parse_run_ids
+from rank_model.stages.dataset import file_sha256
 from rank_model.stages.evaluation import (
     compare_runs,
     evaluate_predictions,
@@ -95,14 +97,30 @@ class EvaluationMetricTests(unittest.TestCase):
         self.assertEqual(bundle.daily_metrics.loc[0, "recall_100"], 1.0)
         self.assertEqual(bundle.daily_metrics.loc[0, "ndcg_100"], 1.0)
 
+    def test_rank_errors_repercentile_only_the_finite_target_subset(self) -> None:
+        predictions = pd.DataFrame(
+            {
+                "date": pd.Timestamp("2023-01-03"),
+                "stock_code": ["S0", "S1", "S2", "S3", "S4"],
+                "target_10d": [0.0, 0.1, 0.2, 0.3, 0.4],
+                "rank_target_10d": [np.nan, 0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0],
+                "score_raw": [0.0, 1.0, 2.0, 3.0, 4.0],
+            }
+        )
+
+        bundle = evaluate_predictions(predictions)
+
+        self.assertEqual(bundle.daily_metrics.loc[0, "rank_mae"], 0.0)
+        self.assertEqual(bundle.daily_metrics.loc[0, "rank_rmse"], 0.0)
+
 
 class EvaluationOutputTests(unittest.TestCase):
     def test_writes_standard_reports_and_compares_completed_runs(self) -> None:
         bundle = evaluate_predictions(_prediction_frame().iloc[:20].copy(), top_k=10)
         with tempfile.TemporaryDirectory() as temporary_name:
             root = Path(temporary_name)
-            first = self._run_directory(root, "first")
-            second = self._run_directory(root, "second")
+            first = self._run_directory(root, "first", bundle.predictions)
+            second = self._run_directory(root, "second", bundle.predictions)
             write_evaluation(bundle, first)
             write_evaluation(bundle, second)
 
@@ -129,7 +147,9 @@ class EvaluationOutputTests(unittest.TestCase):
     def test_comparison_rejects_duplicate_or_incomplete_runs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_name:
             root = Path(temporary_name)
-            run = self._run_directory(root, "only")
+            run = self._run_directory(
+                root, "only", evaluate_predictions(_prediction_frame().iloc[:20]).predictions
+            )
             (run / "metrics_summary.json").write_text("{}\n", encoding="utf-8")
 
             with self.assertRaisesRegex(ValueError, "duplicate"):
@@ -143,15 +163,60 @@ class EvaluationOutputTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "completed"):
                 compare_runs([run], root / "comparison.csv")
 
+    def test_evaluation_requires_existing_completed_run_and_prediction_artifact(self) -> None:
+        bundle = evaluate_predictions(_prediction_frame().iloc[:20])
+        with tempfile.TemporaryDirectory() as temporary_name:
+            root = Path(temporary_name)
+            missing = root / "missing"
+            with self.assertRaises(FileNotFoundError):
+                write_evaluation(bundle, missing)
+            self.assertFalse(missing.exists())
+
+            missing_manifest = root / "missing-manifest"
+            missing_manifest.mkdir()
+            with self.assertRaises(FileNotFoundError):
+                write_evaluation(bundle, missing_manifest)
+
+    def test_evaluation_rejects_tampered_prediction_scores(self) -> None:
+        bundle = evaluate_predictions(_prediction_frame().iloc[:20])
+        with tempfile.TemporaryDirectory() as temporary_name:
+            root = Path(temporary_name)
+            run = self._run_directory(root, "tampered", bundle.predictions)
+            artifact = pd.read_parquet(run / "predictions_10d.parquet")
+            artifact.loc[artifact.index[0], "score_raw"] += 1.0
+            artifact.to_parquet(run / "predictions_10d.parquet", index=False)
+
+            with self.assertRaisesRegex(ValueError, "hash"):
+                write_evaluation(bundle, run)
+
+            self.assertFalse((run / "metrics_summary.json").exists())
+
     @staticmethod
-    def _run_directory(root: Path, run_id: str) -> Path:
+    def _run_directory(root: Path, run_id: str, predictions: pd.DataFrame) -> Path:
         run = root / run_id
         run.mkdir()
+        predictions_path = run / "predictions_10d.parquet"
+        predictions.to_parquet(predictions_path, index=False)
         (run / "manifest.json").write_text(
-            json.dumps({"run_id": run_id, "model_name": "ridge", "status": "completed"}),
+            json.dumps(
+                {
+                    "run_id": run_id,
+                    "model_name": "ridge",
+                    "status": "completed",
+                    "predictions_10d_sha256": file_sha256(predictions_path),
+                }
+            ),
             encoding="utf-8",
         )
         return run
+
+
+class PipelineArgumentTests(unittest.TestCase):
+    def test_parse_run_ids_rejects_blank_components(self) -> None:
+        self.assertEqual(parse_run_ids("first, second"), ["first", "second"])
+        for value in ("first,,second", ",first", "first,", "   "):
+            with self.assertRaisesRegex(ValueError, "blank"):
+                parse_run_ids(value)
 
 
 if __name__ == "__main__":

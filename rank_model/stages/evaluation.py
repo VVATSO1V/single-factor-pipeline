@@ -13,6 +13,8 @@ import numpy as np
 import pandas as pd
 from scipy.stats import kendalltau, spearmanr
 
+from rank_model.stages.dataset import file_sha256
+
 
 KEY_COLUMNS = ["date", "stock_code"]
 _REQUIRED_COLUMNS = {
@@ -160,6 +162,9 @@ def _daily_metrics(group: pd.DataFrame, top_k: int) -> tuple[dict[str, Any], pd.
     unique_score_count = int(score_data["score_raw"].nunique())
     rank_data = score_data.loc[_finite(score_data["rank_target_10d"])].copy()
     valid_target_count = len(rank_data)
+    rank_data["_metric_pred_rank_pct"] = _predicted_percentiles(
+        rank_data["score_raw"]
+    )
     metric: dict[str, Any] = {
         "date": date,
         "valid_target_count": valid_target_count,
@@ -185,7 +190,9 @@ def _daily_metrics(group: pd.DataFrame, top_k: int) -> tuple[dict[str, Any], pd.
         else np.nan
     )
     if valid_target_count:
-        rank_error = rank_data["_pred_rank_pct"] - rank_data["rank_target_10d"]
+        rank_error = (
+            rank_data["_metric_pred_rank_pct"] - rank_data["rank_target_10d"]
+        )
         metric["rank_mae"] = float(rank_error.abs().mean())
         metric["rank_rmse"] = float(np.sqrt(np.square(rank_error).mean()))
         selection_size = min(top_k, valid_target_count)
@@ -417,10 +424,10 @@ def _write_parquet(path: Path, frame: pd.DataFrame) -> None:
             temporary.unlink()
 
 
-def _completed_manifest(run_dir: Path) -> dict[str, Any] | None:
+def _completed_manifest(run_dir: Path) -> dict[str, Any]:
     path = run_dir / "manifest.json"
     if not path.exists():
-        return None
+        raise FileNotFoundError(path)
     try:
         manifest = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as error:
@@ -433,20 +440,20 @@ def _completed_manifest(run_dir: Path) -> dict[str, Any] | None:
 def write_evaluation(bundle: EvaluationBundle, run_dir: Path) -> None:
     """Write an evaluation exactly once into an immutable completed run."""
     destination = Path(run_dir)
-    destination.mkdir(parents=True, exist_ok=True)
+    if not destination.is_dir():
+        raise FileNotFoundError(destination)
     manifest = _completed_manifest(destination)
-    if manifest is None:
-        _write_json(
-            destination / "manifest.json",
-            {"run_id": destination.name, "status": "completed"},
-        )
     predictions_path = destination / "predictions_10d.parquet"
-    if predictions_path.exists():
-        existing = _normalize_predictions(pd.read_parquet(predictions_path))
-        if not existing[KEY_COLUMNS].equals(bundle.predictions[KEY_COLUMNS]):
-            raise ValueError("evaluation prediction keys do not match the immutable run")
-    else:
-        _write_parquet(predictions_path, bundle.predictions)
+    if not predictions_path.exists():
+        raise FileNotFoundError(predictions_path)
+    expected_hash = manifest.get("predictions_10d_sha256")
+    if not isinstance(expected_hash, str) or not expected_hash:
+        raise ValueError("completed manifest is missing predictions_10d_sha256")
+    if file_sha256(predictions_path) != expected_hash:
+        raise ValueError("prediction artifact hash does not match the completed manifest")
+    existing = _normalize_predictions(pd.read_parquet(predictions_path))
+    if not existing.equals(bundle.predictions):
+        raise ValueError("evaluation predictions do not match the immutable training artifact")
     outputs = {
         "metrics_summary.json": lambda path: _write_json(path, bundle.summary),
         "daily_metrics.csv": lambda path: _write_csv(path, bundle.daily_metrics),
@@ -473,8 +480,6 @@ def compare_runs(run_dirs: list[Path], output_path: Path) -> pd.DataFrame:
         if not run_dir.is_dir():
             raise FileNotFoundError(run_dir)
         manifest = _completed_manifest(run_dir)
-        if manifest is None:
-            raise ValueError(f"run is missing manifest: {run_dir}")
         run_id = manifest.get("run_id")
         if not isinstance(run_id, str) or not run_id:
             raise ValueError(f"run manifest has no valid run_id: {run_dir}")
