@@ -24,7 +24,12 @@ from rank_model.stages.preprocessing import (
     equal_date_weights,
     predicted_percentiles,
 )
-from rank_model.stages.ranking import lightgbm_relevance, sorted_group_layout
+from rank_model.stages.ranking import (
+    lightgbm_relevance,
+    pairwise_logistic_loss,
+    sample_date_pairs,
+    sorted_group_layout,
+)
 
 
 KEY_COLUMNS = ["date", "stock_code"]
@@ -95,6 +100,13 @@ MLP_BATCH_SIZE = 8192
 MLP_EPOCHS = 12
 MLP_GRADIENT_CLIP_NORM = 1.0
 MLP_SEED = 42
+MLP_DROPOUT = 0.1
+MLP_LEARNING_RATE = 0.001
+MLP_WEIGHT_DECAY = 0.0001
+MLP_PAIRWISE_PAIRS_PER_STOCK = 8
+MLP_PAIRWISE_ADJACENT_FRACTION = 0.5
+MLP_PAIRWISE_DATES_PER_BATCH = 8
+MLP_RELOAD_TOLERANCE = 1e-6
 
 
 @dataclass
@@ -509,6 +521,177 @@ def train_mlp_rank_regression(
     )
 
 
+def _build_mlp_pairwise_rank_model(input_dim: int) -> Any:
+    """Build the fixed dropout MLP used by pairwise ranking."""
+    import torch
+
+    layers: list[torch.nn.Module] = []
+    previous_width = input_dim
+    for width in MLP_HIDDEN_LAYERS:
+        layers.extend(
+            (
+                torch.nn.Linear(previous_width, width),
+                torch.nn.ReLU(),
+                torch.nn.Dropout(MLP_DROPOUT),
+            )
+        )
+        previous_width = width
+    output_layer = torch.nn.Linear(previous_width, 1)
+    torch.nn.init.zeros_(output_layer.weight)
+    torch.nn.init.zeros_(output_layer.bias)
+    layers.append(output_layer)
+    return torch.nn.Sequential(*layers)
+
+
+def _pairwise_date_batch_ranges(dates: pd.Series) -> list[tuple[int, int, np.ndarray]]:
+    """Return contiguous row ranges containing at most eight whole date groups."""
+    date_codes, unique_dates = pd.factorize(dates, sort=False)
+    ranges: list[tuple[int, int, np.ndarray]] = []
+    for start_code in range(0, len(unique_dates), MLP_PAIRWISE_DATES_PER_BATCH):
+        batch_codes = np.arange(
+            start_code,
+            min(start_code + MLP_PAIRWISE_DATES_PER_BATCH, len(unique_dates)),
+            dtype="int64",
+        )
+        positions = np.flatnonzero(np.isin(date_codes, batch_codes))
+        if positions.size == 0:
+            raise ValueError("pairwise date batching produced an empty batch")
+        if not np.array_equal(positions, np.arange(positions[0], positions[-1] + 1)):
+            raise ValueError("pairwise date batches require contiguous date rows")
+        ranges.append((int(positions[0]), int(positions[-1]) + 1, batch_codes))
+    return ranges
+
+
+def train_mlp_pairwise_rank(
+    train: pd.DataFrame,
+    validation: pd.DataFrame,
+    schema: dict[str, Any],
+    params: dict[str, Any],
+) -> TrainingOutcome:
+    """Fit the fixed date-batched MLP with deterministic same-date pairs."""
+    import torch
+
+    del params
+    train = _finite_label_rows(train)
+    if train.empty:
+        raise ValueError("pairwise MLP training requires at least one finite rank label")
+    if validation.empty:
+        raise ValueError("MLP validation frame is empty")
+    try:
+        continuous_columns = schema["continuous_feature_columns"]
+        industry_column = schema["industry_column"]
+    except (KeyError, TypeError) as error:
+        raise ValueError("pairwise MLP training requires schema features") from error
+
+    train, _ = sorted_group_layout(train)
+    preprocessor = RankPreprocessor.fit(
+        train,
+        continuous_columns=continuous_columns,
+        industry_column=industry_column,
+    )
+    x_train = preprocessor.transform(train, scale_continuous=True)
+    x_validation = preprocessor.transform(validation, scale_continuous=True)
+    targets = train[RANK_TARGET_COLUMN].to_numpy(dtype="float64")
+    left, right, direction = sample_date_pairs(
+        train["date"],
+        targets,
+        MLP_PAIRWISE_PAIRS_PER_STOCK,
+        MLP_PAIRWISE_ADJACENT_FRACTION,
+        MLP_SEED,
+    )
+    date_codes, unique_dates = pd.factorize(train["date"], sort=False)
+    pair_date_codes = date_codes[left]
+    pair_counts_by_date = {
+        pd.Timestamp(date).date().isoformat(): int(np.sum(pair_date_codes == code))
+        for code, date in enumerate(unique_dates)
+    }
+
+    np.random.seed(MLP_SEED)
+    torch.manual_seed(MLP_SEED)
+    torch.use_deterministic_algorithms(True)
+    torch.set_num_threads(1)
+    model = _build_mlp_pairwise_rank_model(x_train.shape[1])
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=MLP_LEARNING_RATE, weight_decay=MLP_WEIGHT_DECAY
+    )
+    features = torch.from_numpy(np.ascontiguousarray(x_train, dtype=np.float32))
+    left_tensor = torch.from_numpy(np.ascontiguousarray(left, dtype=np.int64))
+    right_tensor = torch.from_numpy(np.ascontiguousarray(right, dtype=np.int64))
+    direction_tensor = torch.from_numpy(
+        np.ascontiguousarray(direction, dtype=np.float32)
+    )
+    batch_ranges = _pairwise_date_batch_ranges(train["date"])
+
+    model.train()
+    for _ in range(MLP_EPOCHS):
+        for batch_start, batch_end, batch_codes in batch_ranges:
+            pair_mask = np.isin(pair_date_codes, batch_codes)
+            batch_left = left_tensor[pair_mask] - batch_start
+            batch_right = right_tensor[pair_mask] - batch_start
+            batch_direction = direction_tensor[pair_mask]
+            scores = model(features[batch_start:batch_end]).squeeze(-1)
+            date_losses = []
+            batch_pair_codes = pair_date_codes[pair_mask]
+            for date_code in batch_codes:
+                date_pair_mask = torch.from_numpy(batch_pair_codes == date_code)
+                date_losses.append(
+                    pairwise_logistic_loss(
+                        scores,
+                        batch_left[date_pair_mask],
+                        batch_right[date_pair_mask],
+                        batch_direction[date_pair_mask],
+                    )
+                )
+            loss = torch.stack(date_losses).mean()
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), MLP_GRADIENT_CLIP_NORM)
+            optimizer.step()
+
+    score_validation = _predict_mlp_rank_regression(model, x_validation)
+    if not np.isfinite(score_validation).all():
+        raise ValueError("pairwise MLP produced non-finite validation scores")
+    broad_pairs = MLP_PAIRWISE_PAIRS_PER_STOCK - int(
+        MLP_PAIRWISE_PAIRS_PER_STOCK * MLP_PAIRWISE_ADJACENT_FRACTION
+    )
+    adjacent_pairs = MLP_PAIRWISE_PAIRS_PER_STOCK - broad_pairs
+    return TrainingOutcome(
+        score_validation=score_validation,
+        model_objects={
+            "preprocessor": preprocessor,
+            "model": model,
+            "model_type": "pytorch_mlp",
+            "architecture": {
+                "model_name": "mlp_pairwise_rank",
+                "input_dim": int(x_train.shape[1]),
+                "hidden_layers": MLP_HIDDEN_LAYERS,
+                "activation": "relu",
+                "dropout": MLP_DROPOUT,
+                "output_bias": 0.0,
+            },
+        },
+        metadata={
+            "hidden_layers": MLP_HIDDEN_LAYERS,
+            "dropout": MLP_DROPOUT,
+            "epochs": MLP_EPOCHS,
+            "loss": "pairwise_logistic",
+            "optimizer": "adamw",
+            "learning_rate": MLP_LEARNING_RATE,
+            "weight_decay": MLP_WEIGHT_DECAY,
+            "gradient_clip_norm": MLP_GRADIENT_CLIP_NORM,
+            "seed": MLP_SEED,
+            "dates_per_batch": MLP_PAIRWISE_DATES_PER_BATCH,
+            "pairs_per_stock": MLP_PAIRWISE_PAIRS_PER_STOCK,
+            "adjacent_fraction": MLP_PAIRWISE_ADJACENT_FRACTION,
+            "broad_pairs_per_stock": broad_pairs,
+            "adjacent_pairs_per_stock": adjacent_pairs,
+            "pair_count": int(len(left)),
+            "pair_counts_by_date": pair_counts_by_date,
+            "reload_tolerance": MLP_RELOAD_TOLERANCE,
+        },
+    )
+
+
 MODEL_REGISTRY: dict[str, Trainer] = {
     "ridge_rank_regression": train_ridge_rank_regression,
     "xgboost_rank_regression": train_xgboost_rank_regression,
@@ -516,6 +699,7 @@ MODEL_REGISTRY: dict[str, Trainer] = {
     "mlp_rank_regression": train_mlp_rank_regression,
     "xgboost_pairwise_rank": train_xgboost_pairwise_rank,
     "lightgbm_lambdarank": train_lightgbm_lambdarank,
+    "mlp_pairwise_rank": train_mlp_pairwise_rank,
 }
 
 
@@ -641,9 +825,17 @@ def _load_persisted_model(temporary_run: Path) -> Any:
             output_bias = float(architecture["output_bias"])
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError("invalid PyTorch model architecture") from error
+        model_name = architecture.get("model_name", "mlp_rank_regression")
         if hidden_layers != MLP_HIDDEN_LAYERS:
             raise ValueError("unexpected PyTorch MLP architecture")
-        model = _build_mlp_rank_regression_model(input_dim, output_bias)
+        if model_name == "mlp_rank_regression":
+            model = _build_mlp_rank_regression_model(input_dim, output_bias)
+        elif model_name == "mlp_pairwise_rank":
+            if architecture.get("dropout") != MLP_DROPOUT or output_bias != 0.0:
+                raise ValueError("unexpected pairwise PyTorch MLP architecture")
+            model = _build_mlp_pairwise_rank_model(input_dim)
+        else:
+            raise ValueError("unexpected PyTorch MLP model name")
         model.load_state_dict(
             torch.load(
                 temporary_run / "model_state_dict.pt",
