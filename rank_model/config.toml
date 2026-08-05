@@ -22,3 +22,5 @@ forbidden_columns = [
   "split_10d",
   "entry_tradeable",
 ]
+forbidden_prefixes = ["target_", "split_", "exit_", "entry_", "future_", "next_"]
+forbidden_substrings = ["t+1", "t_plus_"]

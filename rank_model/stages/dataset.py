@@ -74,7 +74,9 @@ def _load_source_schema(source_schema: Path, source_dataset: Path) -> dict[str, 
     return schema
 
 
-def _source_columns(schema: dict[str, Any]) -> tuple[list[str], list[str]]:
+def _source_columns(
+    schema: dict[str, Any],
+) -> tuple[list[str], list[str], list[str], str]:
     key_columns = schema.get("key_columns")
     if key_columns != KEY_COLUMNS:
         raise ValueError("source schema key_columns must be ['date', 'stock_code']")
@@ -105,7 +107,7 @@ def _source_columns(schema: dict[str, Any]) -> tuple[list[str], list[str]]:
     )
     if forbidden:
         raise ValueError(f"source schema contains forbidden features: {forbidden}")
-    return key_columns, feature_columns
+    return key_columns, feature_columns, list(continuous_features), industry_column
 
 
 def _is_forbidden_feature(column: str) -> bool:
@@ -122,10 +124,12 @@ def _is_forbidden_feature(column: str) -> bool:
 def _read_source_dataset(
     source_dataset: Path,
     schema: dict[str, Any],
-) -> tuple[pd.DataFrame, list[str]]:
+) -> tuple[pd.DataFrame, list[str], list[str], str]:
     import pyarrow.parquet as pq
 
-    key_columns, feature_columns = _source_columns(schema)
+    key_columns, feature_columns, continuous_columns, industry_column = _source_columns(
+        schema
+    )
     target_columns = schema.get("target_columns")
     sample_columns = schema.get("sample_columns")
     if not isinstance(target_columns, list) or TARGET_COLUMN not in target_columns:
@@ -151,7 +155,7 @@ def _read_source_dataset(
     if missing:
         raise ValueError(f"{source_dataset} is missing required columns: {missing}")
     frame = pd.read_parquet(source_dataset, columns=required_columns)
-    return frame, feature_columns
+    return frame, feature_columns, continuous_columns, industry_column
 
 
 def _normalize_keys(frame: pd.DataFrame, path: Path) -> pd.DataFrame:
@@ -352,7 +356,12 @@ def build_rank_dataset(
     coverage_path = Path(coverage_path)
 
     source_contract = _load_source_schema(source_schema, source_dataset)
-    dataset, feature_columns = _read_source_dataset(source_dataset, source_contract)
+    (
+        dataset,
+        feature_columns,
+        continuous_columns,
+        industry_column,
+    ) = _read_source_dataset(source_dataset, source_contract)
     dataset = _normalize_keys(dataset, source_dataset)
     _validate_source_dates(dataset, source_dataset, development_end)
     _validate_date_sizes(dataset, source_dataset)
@@ -380,6 +389,8 @@ def build_rank_dataset(
         "source_schema_sha256": file_sha256(source_schema),
         "key_columns": KEY_COLUMNS,
         "feature_columns": feature_columns,
+        "continuous_feature_columns": continuous_columns,
+        "industry_column": industry_column,
         "target_column": TARGET_COLUMN,
         "rank_target_column": RANK_TARGET_COLUMN,
         "split_column": SPLIT_COLUMN,
