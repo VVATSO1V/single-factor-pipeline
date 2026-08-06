@@ -92,20 +92,20 @@ def load_config(config_path: Path) -> dict[str, Any]:
 
 def command_prepare(config: dict[str, Any], config_path: Path) -> dict[str, Any]:
     """Publish the 10-day percentile-label dataset."""
-    paths = config["paths"]
+    paths = _validate_configured_paths(config, config_path)
     return build_rank_dataset(
-        resolve_config_path(config_path, paths["source_dataset"]),
-        resolve_config_path(config_path, paths["source_schema"]),
-        resolve_config_path(config_path, paths["rank_dataset"]),
-        resolve_config_path(config_path, paths["rank_schema"]),
-        resolve_config_path(config_path, paths["rank_label_coverage"]),
+        paths["source_dataset"],
+        paths["source_schema"],
+        paths["rank_dataset"],
+        paths["rank_schema"],
+        paths["rank_label_coverage"],
         date.fromisoformat(config["project"]["development_end"]),
     )
 
 
 def _is_within(path: Path, directory: Path) -> bool:
     try:
-        path.resolve().relative_to(directory.resolve())
+        path.resolve(strict=False).relative_to(directory.resolve(strict=False))
     except ValueError:
         return False
     return True
@@ -115,6 +115,15 @@ def _is_model_data_path(path: Path) -> bool:
     """Accept a source only when it is directly beneath a model/data directory."""
     parent = path.resolve().parent
     return parent.name == "data" and parent.parent.name == "model"
+
+
+def _is_inside_model_data(path: Path) -> bool:
+    """Return whether a resolved path is a descendant of any model/data directory."""
+    parts = [part.lower() for part in path.resolve(strict=False).parts]
+    return any(
+        parts[index : index + 2] == ["model", "data"]
+        for index in range(len(parts) - 1)
+    )
 
 
 def _validate_configured_paths(config: dict[str, Any], config_path: Path) -> dict[str, Path]:
@@ -141,7 +150,43 @@ def _validate_configured_paths(config: dict[str, Any], config_path: Path) -> dic
     ):
         if not _is_within(resolved[name], PACKAGE_DIR):
             raise ValueError(f"paths.{name} must resolve under rank_model")
+        if _is_inside_model_data(resolved[name]):
+            raise ValueError(f"paths.{name} must not resolve inside model/data")
     return resolved
+
+
+def command_train(
+    config: dict[str, Any], config_path: Path, model_name: str, run_id: str
+) -> Path:
+    """Train only after validating every configured output target."""
+    _validate_configured_paths(config, config_path)
+    return train_registered_model(config, config_path, model_name, run_id)
+
+
+def command_evaluate(
+    config: dict[str, Any], config_path: Path, run_id: str, split: str
+) -> Path:
+    """Write one evaluation bundle under the validated immutable run directory."""
+    paths = _validate_configured_paths(config, config_path)
+    run_directory = paths["runs_dir"] / run_id
+    predictions = pd.read_parquet(run_directory / "predictions_10d.parquet")
+    if "split" not in predictions:
+        raise ValueError("prediction artifact is missing split")
+    bundle = evaluate_predictions(predictions.loc[predictions["split"].eq(split)].copy())
+    write_evaluation(bundle, run_directory)
+    return run_directory
+
+
+def command_compare(
+    config: dict[str, Any], config_path: Path, run_ids: list[str]
+) -> pd.DataFrame:
+    """Write a comparison table only beneath the validated run root."""
+    paths = _validate_configured_paths(config, config_path)
+    runs_directory = paths["runs_dir"]
+    return compare_runs(
+        [runs_directory / run_id for run_id in run_ids],
+        runs_directory / "rank_model_comparison.csv",
+    )
 
 
 def _validate_split_boundaries(frame: pd.DataFrame) -> None:
@@ -288,9 +333,7 @@ def main() -> None:
         return
     if args.command == "train":
         try:
-            run_directory = train_registered_model(
-                config, config_path, args.model, args.run_id
-            )
+            run_directory = command_train(config, config_path, args.model, args.run_id)
         except (NotImplementedError, ValueError, FileExistsError) as error:
             parser = make_parser()
             parser.error(str(error))
@@ -299,17 +342,9 @@ def main() -> None:
     if args.command == "evaluate":
         try:
             run_id = parse_run_id(args.run_id)
-            run_directory = (
-                resolve_config_path(config_path, config["paths"]["runs_dir"])
-                / run_id
+            run_directory = command_evaluate(
+                config, config_path, run_id, args.split
             )
-            predictions = pd.read_parquet(run_directory / "predictions_10d.parquet")
-            if "split" not in predictions:
-                raise ValueError("prediction artifact is missing split")
-            bundle = evaluate_predictions(
-                predictions.loc[predictions["split"].eq(args.split)].copy()
-            )
-            write_evaluation(bundle, run_directory)
         except (FileNotFoundError, ValueError, FileExistsError) as error:
             parser = make_parser()
             parser.error(str(error))
@@ -318,13 +353,7 @@ def main() -> None:
     if args.command == "compare":
         try:
             run_ids = parse_run_ids(args.run_ids)
-            runs_directory = resolve_config_path(
-                config_path, config["paths"]["runs_dir"]
-            )
-            comparison = compare_runs(
-                [runs_directory / run_id for run_id in run_ids],
-                runs_directory / "rank_model_comparison.csv",
-            )
+            comparison = command_compare(config, config_path, run_ids)
         except (FileNotFoundError, ValueError) as error:
             parser = make_parser()
             parser.error(str(error))
@@ -332,7 +361,11 @@ def main() -> None:
         return
     if args.command != "prepare":
         raise NotImplementedError(f"{args.command} is not wired in this task")
-    result = command_prepare(config, config_path)
+    try:
+        result = command_prepare(config, config_path)
+    except (FileNotFoundError, ValueError) as error:
+        parser = make_parser()
+        parser.error(str(error))
     print(
         "rank dataset written: "
         f"rows={result['row_count']} dates={result['date_count']} "
