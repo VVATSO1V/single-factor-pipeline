@@ -21,9 +21,13 @@ lambda = 1.0
 
 [models.lightgbm_rank_regression]
 
+[models.mlp_rank_regression]
+
 [models.xgboost_pairwise_rank]
 
 [models.lightgbm_lambdarank]
+
+[models.mlp_pairwise_rank]
 
 [features]
 forbidden_columns = [

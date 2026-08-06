@@ -155,11 +155,25 @@ def _validate_configured_paths(config: dict[str, Any], config_path: Path) -> dic
     return resolved
 
 
+def _validated_run_directory(runs_directory: Path, run_id: str) -> Path:
+    """Resolve a final run path and reject any run-ID link or junction escape."""
+    resolved_runs_directory = runs_directory.resolve(strict=False)
+    run_directory = (resolved_runs_directory / run_id).resolve(strict=False)
+    if (
+        not _is_within(run_directory, resolved_runs_directory)
+        or not _is_within(run_directory, PACKAGE_DIR)
+        or _is_inside_model_data(run_directory)
+    ):
+        raise ValueError("run directory must resolve under rank_model outside model/data")
+    return run_directory
+
+
 def command_train(
     config: dict[str, Any], config_path: Path, model_name: str, run_id: str
 ) -> Path:
     """Train only after validating every configured output target."""
-    _validate_configured_paths(config, config_path)
+    paths = _validate_configured_paths(config, config_path)
+    _validated_run_directory(paths["runs_dir"], run_id)
     return train_registered_model(config, config_path, model_name, run_id)
 
 
@@ -168,7 +182,7 @@ def command_evaluate(
 ) -> Path:
     """Write one evaluation bundle under the validated immutable run directory."""
     paths = _validate_configured_paths(config, config_path)
-    run_directory = paths["runs_dir"] / run_id
+    run_directory = _validated_run_directory(paths["runs_dir"], run_id)
     predictions = pd.read_parquet(run_directory / "predictions_10d.parquet")
     if "split" not in predictions:
         raise ValueError("prediction artifact is missing split")
