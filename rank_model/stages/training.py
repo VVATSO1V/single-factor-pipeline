@@ -1015,6 +1015,15 @@ def _prediction_frame(validation: pd.DataFrame, scores: np.ndarray) -> pd.DataFr
     return result
 
 
+def _write_lightgbm_model(model: lgb.Booster, path: Path) -> None:
+    """Persist through Python I/O because LightGBM paths are not Unicode-safe on Windows."""
+    path.write_text(model.model_to_string(), encoding="utf-8")
+
+
+def _load_lightgbm_model(path: Path) -> lgb.Booster:
+    return lgb.Booster(model_str=path.read_text(encoding="utf-8"))
+
+
 def _write_run_bundle(
     temporary_run: Path,
     config_path: Path,
@@ -1044,7 +1053,7 @@ def _write_run_bundle(
     if isinstance(model, xgb.Booster):
         model.save_model(temporary_run / "model.json")
     elif isinstance(model, lgb.Booster):
-        model.save_model(temporary_run / "model.txt")
+        _write_lightgbm_model(model, temporary_run / "model.txt")
     elif outcome.model_objects.get("model_type") == "pytorch_mlp":
         import torch
 
@@ -1070,7 +1079,7 @@ def _load_persisted_model(temporary_run: Path) -> Any:
         model.load_model(xgboost_path)
         return model
     if lightgbm_path.exists():
-        return lgb.Booster(model_file=str(lightgbm_path))
+        return _load_lightgbm_model(lightgbm_path)
     if architecture_path.exists():
         import torch
 
