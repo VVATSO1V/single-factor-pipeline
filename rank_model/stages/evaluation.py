@@ -6,8 +6,9 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import shutil
 import tempfile
-from typing import Any
+from typing import Any, BinaryIO
 
 import numpy as np
 import pandas as pd
@@ -25,6 +26,14 @@ _REQUIRED_COLUMNS = {
 }
 _DECILE_COUNT = 10
 _DECISION_FIELDS = {"accept", "reject", "champion"}
+_EVALUATION_OUTPUT_NAMES = (
+    "metrics_summary.json",
+    "daily_metrics.csv",
+    "monthly_metrics.csv",
+    "yearly_metrics.csv",
+    "decile_returns.csv",
+    "top100_detail.parquet",
+)
 
 
 @dataclass(frozen=True)
@@ -153,6 +162,29 @@ def _optional_hac(values: pd.Series, lag: int) -> dict[str, Any] | None:
     return hac_mean_test(finite_values, lag=lag)
 
 
+def _tie_pair_count(values: pd.Series) -> float:
+    counts = values.value_counts(dropna=False).to_numpy(dtype="float64")
+    return float(np.sum(counts * (counts - 1.0) / 2.0))
+
+
+def _tie_aware_pairwise_accuracy(scores: pd.Series, targets: pd.Series) -> float:
+    """Score ties in either variable as half-correct without expanding pairs."""
+    count = len(scores)
+    if count < 2:
+        return np.nan
+    pair_count = count * (count - 1.0) / 2.0
+    score_ties = _tie_pair_count(scores)
+    target_ties = _tie_pair_count(targets)
+    tau = kendalltau(scores, targets).statistic
+    if np.isfinite(tau):
+        signed_pairs = float(
+            tau * np.sqrt((pair_count - score_ties) * (pair_count - target_ties))
+        )
+    else:
+        signed_pairs = 0.0
+    return float(np.clip(0.5 + 0.5 * signed_pairs / pair_count, 0.0, 1.0))
+
+
 def _daily_metrics(group: pd.DataFrame, top_k: int) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame]:
     date = group["date"].iloc[0]
     score_finite = _finite(group["score_raw"])
@@ -162,9 +194,6 @@ def _daily_metrics(group: pd.DataFrame, top_k: int) -> tuple[dict[str, Any], pd.
     unique_score_count = int(score_data["score_raw"].nunique())
     rank_data = score_data.loc[_finite(score_data["rank_target_10d"])].copy()
     valid_target_count = len(rank_data)
-    rank_data["_metric_pred_rank_pct"] = _predicted_percentiles(
-        rank_data["score_raw"]
-    )
     metric: dict[str, Any] = {
         "date": date,
         "valid_target_count": valid_target_count,
@@ -184,15 +213,11 @@ def _daily_metrics(group: pd.DataFrame, top_k: int) -> tuple[dict[str, Any], pd.
     else:
         metric["rank_ic"] = np.nan
         metric["kendall_tau"] = np.nan
-    metric["pairwise_accuracy"] = (
-        float((metric["kendall_tau"] + 1.0) / 2.0)
-        if np.isfinite(metric["kendall_tau"])
-        else np.nan
+    metric["pairwise_accuracy"] = _tie_aware_pairwise_accuracy(
+        rank_data["score_raw"], rank_data["rank_target_10d"]
     )
     if valid_target_count:
-        rank_error = (
-            rank_data["_metric_pred_rank_pct"] - rank_data["rank_target_10d"]
-        )
+        rank_error = rank_data["_pred_rank_pct"] - rank_data["rank_target_10d"]
         metric["rank_mae"] = float(rank_error.abs().mean())
         metric["rank_rmse"] = float(np.sqrt(np.square(rank_error).mean()))
         selection_size = min(top_k, valid_target_count)
@@ -210,21 +235,25 @@ def _daily_metrics(group: pd.DataFrame, top_k: int) -> tuple[dict[str, Any], pd.
         for name in ("rank_mae", "rank_rmse", "ndcg_100", "precision_100", "recall_100", "jaccard_100"):
             metric[name] = np.nan
 
-    raw_data = score_data.loc[_finite(score_data["target_10d"])].copy()
-    raw_selection_size = min(top_k, len(raw_data))
-    if raw_selection_size:
-        raw_top = _ordered_top(raw_data, "score_raw", raw_selection_size)
-        raw_bottom = _ordered_bottom(raw_data, "score_raw", raw_selection_size)
+    cohort_size = min(top_k, score_count)
+    top_cohort = _ordered_top(score_data, "score_raw", cohort_size)
+    bottom_cohort = _ordered_bottom(score_data, "score_raw", cohort_size)
+    raw_top = top_cohort.loc[_finite(top_cohort["target_10d"])].copy()
+    raw_bottom = bottom_cohort.loc[_finite(bottom_cohort["target_10d"])].copy()
+    metric["top100_cohort_size"] = int(len(top_cohort))
+    metric["bottom100_cohort_size"] = int(len(bottom_cohort))
+    metric["top100_valid_return_count"] = int(len(raw_top))
+    metric["bottom100_valid_return_count"] = int(len(raw_bottom))
+    if len(raw_top):
         metric["top100_mean_return"] = float(raw_top["target_10d"].mean())
         metric["top100_median_return"] = float(raw_top["target_10d"].median())
-        metric["bottom100_mean_return"] = float(raw_bottom["target_10d"].mean())
-        metric["top100_valid_return_count"] = int(len(raw_top))
     else:
-        raw_top = raw_data.copy()
-        for name in ("top100_mean_return", "top100_median_return", "bottom100_mean_return"):
+        for name in ("top100_mean_return", "top100_median_return"):
             metric[name] = np.nan
-        metric["top100_valid_return_count"] = 0
-    universe_returns = group.loc[_finite(group["target_10d"]), "target_10d"]
+    metric["bottom100_mean_return"] = (
+        float(raw_bottom["target_10d"].mean()) if len(raw_bottom) else np.nan
+    )
+    universe_returns = score_data.loc[_finite(score_data["target_10d"]), "target_10d"]
     metric["universe_mean_return"] = (
         float(universe_returns.mean()) if len(universe_returns) else np.nan
     )
@@ -259,6 +288,14 @@ def _daily_metrics(group: pd.DataFrame, top_k: int) -> tuple[dict[str, Any], pd.
             {
                 "date": date,
                 "decile": decile,
+                "group_label": (
+                    "G01_strongest"
+                    if decile == 1
+                    else "G10_weakest"
+                    if decile == _DECILE_COUNT
+                    else f"G{decile:02d}"
+                ),
+                "predicted_strength": _DECILE_COUNT + 1 - decile,
                 "score_count": int(len(members)),
                 "valid_return_count": count,
                 "mean_return": float(returns.mean()) if count else np.nan,
@@ -268,10 +305,50 @@ def _daily_metrics(group: pd.DataFrame, top_k: int) -> tuple[dict[str, Any], pd.
         metric[f"decile_{decile}_valid_return_count"] = count
         metric[f"decile_{decile}_mean_return"] = decile_rows[-1]["mean_return"]
 
+    decile_frame = pd.DataFrame(decile_rows)
+    valid_deciles = decile_frame.loc[_finite(decile_frame["mean_return"])]
+    metric["decile_valid_group_count"] = int(len(valid_deciles))
+    metric["decile_top_valid_return_count"] = int(
+        decile_frame.loc[decile_frame["decile"].eq(1), "valid_return_count"].iloc[0]
+    )
+    metric["decile_bottom_valid_return_count"] = int(
+        decile_frame.loc[
+            decile_frame["decile"].eq(_DECILE_COUNT), "valid_return_count"
+        ].iloc[0]
+    )
+    top_group_return = decile_frame.loc[
+        decile_frame["decile"].eq(1), "mean_return"
+    ].iloc[0]
+    bottom_group_return = decile_frame.loc[
+        decile_frame["decile"].eq(_DECILE_COUNT), "mean_return"
+    ].iloc[0]
+    metric["decile_top_minus_bottom_return"] = (
+        float(top_group_return - bottom_group_return)
+        if np.isfinite(top_group_return) and np.isfinite(bottom_group_return)
+        else np.nan
+    )
+    if len(valid_deciles) >= 2:
+        monotonicity = spearmanr(
+            valid_deciles["predicted_strength"], valid_deciles["mean_return"]
+        ).statistic
+        metric["decile_return_monotonicity"] = (
+            float(monotonicity) if np.isfinite(monotonicity) else np.nan
+        )
+    else:
+        metric["decile_return_monotonicity"] = np.nan
+    decile_frame["daily_top_minus_bottom_return"] = metric[
+        "decile_top_minus_bottom_return"
+    ]
+    decile_frame["daily_return_monotonicity"] = metric[
+        "decile_return_monotonicity"
+    ]
+    decile_frame["daily_valid_group_count"] = metric["decile_valid_group_count"]
+
     detail_count = min(top_k, score_count)
     detail = _ordered_top(score_data, "score_raw", detail_count).copy()
     detail.insert(0, "top_k", detail_count)
-    return metric, pd.DataFrame(decile_rows), detail
+    detail.insert(1, "predicted_cohort_rank", np.arange(1, detail_count + 1))
+    return metric, decile_frame, detail
 
 
 def _period_metrics(daily: pd.DataFrame, period: str) -> pd.DataFrame:
@@ -286,6 +363,12 @@ def _period_metrics(daily: pd.DataFrame, period: str) -> pd.DataFrame:
     numeric = [column for column in numeric if column not in {"date", key}]
     result = work.groupby(key, sort=True)[numeric].mean().reset_index()
     result.insert(1, "valid_daily_observations", work.groupby(key, sort=True).size().to_numpy())
+    for column in (
+        "decile_top_minus_bottom_return",
+        "decile_return_monotonicity",
+    ):
+        valid_dates = work.groupby(key, sort=True)[column].count().to_numpy()
+        result[f"{column}_valid_dates"] = valid_dates
     return result
 
 
@@ -335,7 +418,15 @@ def _summary(daily: pd.DataFrame, hac_lag: int, top_k: int, rows: int) -> dict[s
         "top100_excess_return",
         "bottom100_mean_return",
         "top_bottom_spread",
+        "top100_cohort_size",
         "top100_valid_return_count",
+        "bottom100_cohort_size",
+        "bottom100_valid_return_count",
+        "decile_top_minus_bottom_return",
+        "decile_return_monotonicity",
+        "decile_valid_group_count",
+        "decile_top_valid_return_count",
+        "decile_bottom_valid_return_count",
         "unique_score_count",
         "tie_ratio",
         "valid_target_count",
@@ -346,6 +437,19 @@ def _summary(daily: pd.DataFrame, hac_lag: int, top_k: int, rows: int) -> dict[s
         daily["top100_excess_return"], hac_lag
     )
     summary["top_bottom_spread_hac"] = _optional_hac(daily["top_bottom_spread"], hac_lag)
+    summary["decile_top_minus_bottom_return_valid_dates"] = int(
+        pd.to_numeric(
+            daily["decile_top_minus_bottom_return"], errors="coerce"
+        ).notna().sum()
+    )
+    summary["decile_return_monotonicity_valid_dates"] = int(
+        pd.to_numeric(daily["decile_return_monotonicity"], errors="coerce")
+        .notna()
+        .sum()
+    )
+    summary["decile_top_minus_bottom_return_hac"] = _optional_hac(
+        daily["decile_top_minus_bottom_return"], hac_lag
+    )
     return summary
 
 
@@ -437,12 +541,127 @@ def _completed_manifest(run_dir: Path) -> dict[str, Any]:
     return manifest
 
 
-def write_evaluation(bundle: EvaluationBundle, run_dir: Path) -> None:
-    """Write an evaluation exactly once into an immutable completed run."""
-    destination = Path(run_dir)
-    if not destination.is_dir():
-        raise FileNotFoundError(destination)
+def _prediction_frames_match(left: pd.DataFrame, right: pd.DataFrame) -> bool:
+    try:
+        pd.testing.assert_frame_equal(
+            left.reset_index(drop=True),
+            right.reset_index(drop=True),
+            check_dtype=False,
+            check_exact=True,
+        )
+    except AssertionError:
+        return False
+    return True
+
+
+def _publish_staged_file(source: Path, destination: Path) -> None:
+    os.replace(source, destination)
+
+
+def _acquire_evaluation_lock(destination: Path) -> BinaryIO:
+    lock_path = destination.parent / ".evaluation.lock"
+    handle = lock_path.open("a+b")
+    if handle.seek(0, os.SEEK_END) == 0:
+        handle.write(b"0")
+        handle.flush()
+    handle.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        handle.close()
+        raise FileExistsError(
+            f"another evaluation is already running under: {destination.parent}"
+        ) from error
+    return handle
+
+
+def _release_evaluation_lock(handle: BinaryIO) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    handle.close()
+
+
+def _evaluation_manifest_bytes(
+    manifest: dict[str, Any],
+    destination: Path,
+    staged_outputs: dict[str, Path],
+    output_hashes: dict[str, str],
+    bundle: EvaluationBundle,
+) -> bytes:
+    updated = json.loads(json.dumps(manifest))
+    output_sizes = {
+        name: int(path.stat().st_size) for name, path in staged_outputs.items()
+    }
+    updated["evaluation"] = {
+        "status": "completed",
+        "rows": int(len(bundle.predictions)),
+        "dates": int(bundle.predictions["date"].nunique()),
+        "output_bytes": output_sizes,
+        "output_sha256": output_hashes,
+    }
+    manifest_path = destination / "manifest.json"
+    existing_payload_bytes = int(
+        sum(
+            path.stat().st_size
+            for path in destination.rglob("*")
+            if path.is_file() and path != manifest_path
+        )
+    )
+    payload_bytes = existing_payload_bytes + sum(output_sizes.values())
+    if "artifact_payload_bytes" in updated:
+        updated["artifact_payload_bytes"] = payload_bytes
+    metadata = updated.get("metadata")
+    if isinstance(metadata, dict) and "artifact_payload_bytes" in metadata:
+        metadata["artifact_payload_bytes"] = payload_bytes
+
+    for _ in range(10):
+        encoded = (
+            json.dumps(
+                updated,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+        total_bytes = payload_bytes + len(encoded)
+        changed = False
+        if "artifact_bytes" in updated and updated["artifact_bytes"] != total_bytes:
+            updated["artifact_bytes"] = total_bytes
+            changed = True
+        if (
+            isinstance(metadata, dict)
+            and "artifact_bytes" in metadata
+            and metadata["artifact_bytes"] != total_bytes
+        ):
+            metadata["artifact_bytes"] = total_bytes
+            changed = True
+        if not changed:
+            return encoded
+    raise RuntimeError("evaluation manifest artifact byte total did not stabilize")
+
+
+def _write_evaluation_locked(bundle: EvaluationBundle, destination: Path) -> None:
+    manifest_path = destination / "manifest.json"
+    original_manifest_bytes = manifest_path.read_bytes() if manifest_path.exists() else b""
     manifest = _completed_manifest(destination)
+    if manifest.get("evaluation") is not None:
+        raise FileExistsError("evaluation already completed for this run")
     predictions_path = destination / "predictions_10d.parquet"
     if not predictions_path.exists():
         raise FileNotFoundError(predictions_path)
@@ -452,7 +671,7 @@ def write_evaluation(bundle: EvaluationBundle, run_dir: Path) -> None:
     if file_sha256(predictions_path) != expected_hash:
         raise ValueError("prediction artifact hash does not match the completed manifest")
     existing = _normalize_predictions(pd.read_parquet(predictions_path))
-    if not existing.equals(bundle.predictions):
+    if not _prediction_frames_match(existing, bundle.predictions):
         raise ValueError("evaluation predictions do not match the immutable training artifact")
     outputs = {
         "metrics_summary.json": lambda path: _write_json(path, bundle.summary),
@@ -462,11 +681,101 @@ def write_evaluation(bundle: EvaluationBundle, run_dir: Path) -> None:
         "decile_returns.csv": lambda path: _write_csv(path, bundle.decile_returns),
         "top100_detail.parquet": lambda path: _write_parquet(path, bundle.top100_detail),
     }
+    if tuple(outputs) != _EVALUATION_OUTPUT_NAMES:
+        raise RuntimeError("evaluation output contract is inconsistent")
     existing_outputs = [name for name in outputs if (destination / name).exists()]
     if existing_outputs:
         raise FileExistsError(f"evaluation outputs already exist: {existing_outputs}")
-    for name, writer in outputs.items():
-        writer(destination / name)
+
+    staging = Path(
+        tempfile.mkdtemp(prefix=f".{destination.name}.evaluation.", dir=destination.parent)
+    )
+    published: list[Path] = []
+    try:
+        staged_outputs = {name: staging / name for name in outputs}
+        for name, writer in outputs.items():
+            writer(staged_outputs[name])
+        output_hashes = {
+            name: file_sha256(path) for name, path in staged_outputs.items()
+        }
+        if any(len(value) != 64 for value in output_hashes.values()):
+            raise ValueError("invalid staged evaluation output hash")
+        staged_manifest = staging / "manifest.json"
+        staged_manifest.write_bytes(
+            _evaluation_manifest_bytes(
+                manifest,
+                destination,
+                staged_outputs,
+                output_hashes,
+                bundle,
+            )
+        )
+        json.loads(staged_manifest.read_text(encoding="utf-8"))
+
+        for name, staged_path in staged_outputs.items():
+            final_path = destination / name
+            _publish_staged_file(staged_path, final_path)
+            published.append(final_path)
+            if file_sha256(final_path) != output_hashes[name]:
+                raise ValueError(f"published evaluation hash mismatch: {name}")
+        _publish_staged_file(staged_manifest, manifest_path)
+    except BaseException:
+        for path in reversed(published):
+            if path.exists():
+                path.unlink()
+        if original_manifest_bytes and (
+            not manifest_path.exists()
+            or manifest_path.read_bytes() != original_manifest_bytes
+        ):
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=".manifest.rollback.", dir=destination
+            )
+            os.close(descriptor)
+            rollback_path = Path(temporary_name)
+            try:
+                rollback_path.write_bytes(original_manifest_bytes)
+                os.replace(rollback_path, manifest_path)
+            finally:
+                if rollback_path.exists():
+                    rollback_path.unlink()
+        raise
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def write_evaluation(bundle: EvaluationBundle, run_dir: Path) -> None:
+    """Write an evaluation exactly once into an immutable completed run."""
+    destination = Path(run_dir)
+    if not destination.is_dir():
+        raise FileNotFoundError(destination)
+    lock_handle = _acquire_evaluation_lock(destination)
+    try:
+        _write_evaluation_locked(bundle, destination)
+    finally:
+        _release_evaluation_lock(lock_handle)
+
+
+def _validate_evaluation_outputs(
+    run_dir: Path, manifest: dict[str, Any]
+) -> dict[str, Any]:
+    evaluation = manifest.get("evaluation")
+    if not isinstance(evaluation, dict) or evaluation.get("status") != "completed":
+        raise ValueError(f"run evaluation is not completed: {run_dir}")
+    hashes = evaluation.get("output_sha256")
+    sizes = evaluation.get("output_bytes")
+    if not isinstance(hashes, dict) or set(hashes) != set(_EVALUATION_OUTPUT_NAMES):
+        raise ValueError(f"run evaluation hashes are incomplete: {run_dir}")
+    if not isinstance(sizes, dict) or set(sizes) != set(_EVALUATION_OUTPUT_NAMES):
+        raise ValueError(f"run evaluation sizes are incomplete: {run_dir}")
+    for name in _EVALUATION_OUTPUT_NAMES:
+        path = run_dir / name
+        if not path.exists():
+            raise FileNotFoundError(path)
+        if file_sha256(path) != hashes[name]:
+            raise ValueError(f"run evaluation hash mismatch for {name}: {run_dir}")
+        if path.stat().st_size != sizes[name]:
+            raise ValueError(f"run evaluation size mismatch for {name}: {run_dir}")
+    return evaluation
 
 
 def compare_runs(run_dirs: list[Path], output_path: Path) -> pd.DataFrame:
@@ -480,6 +789,7 @@ def compare_runs(run_dirs: list[Path], output_path: Path) -> pd.DataFrame:
         if not run_dir.is_dir():
             raise FileNotFoundError(run_dir)
         manifest = _completed_manifest(run_dir)
+        _validate_evaluation_outputs(run_dir, manifest)
         run_id = manifest.get("run_id")
         if not isinstance(run_id, str) or not run_id:
             raise ValueError(f"run manifest has no valid run_id: {run_dir}")
