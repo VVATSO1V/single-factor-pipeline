@@ -18,7 +18,9 @@ from rank_model.stages.dataset import (
     FORBIDDEN_FEATURE_COLUMNS,
     KEY_COLUMNS,
     MAXIMUM_DEVELOPMENT_END,
+    MAX_TARGET_EXIT_CALENDAR_DAYS,
     SPLIT_COLUMN,
+    TARGET_COLUMN,
     _is_forbidden_feature,
     _load_source_schema,
     _normalize_keys,
@@ -216,8 +218,34 @@ def _validate_split_boundaries(frame: pd.DataFrame) -> None:
         raise ValueError(f"source dataset contains invalid split values: {invalid}")
     if exits.loc[assigned].isna().any():
         raise ValueError("assigned development rows require exit dates")
+    known_exit = exits.notna()
+    exit_days = (exits - dates).dt.days
+    invalid_exit_direction = known_exit & (
+        exit_days.le(0) | exit_days.gt(MAX_TARGET_EXIT_CALENDAR_DAYS)
+    )
+    if invalid_exit_direction.any():
+        raise ValueError(
+            "exit_date_10d must be 1 through "
+            f"{MAX_TARGET_EXIT_CALENDAR_DAYS} calendar days after its signal date"
+        )
     training = split.eq("train").fillna(False)
     validation = split.eq("validation").fillna(False)
+    unassigned = split.isna()
+    target = pd.to_numeric(frame[TARGET_COLUMN], errors="coerce")
+    missing_target = ~np.isfinite(target.to_numpy(dtype="float64"))
+    boundary_purge = (
+        dates.between(TRAINING_START, TRAINING_END)
+        & exits.gt(TRAINING_END)
+    ) | (
+        dates.between(VALIDATION_START, VALIDATION_END)
+        & exits.gt(VALIDATION_END)
+    )
+    unexplained_unassigned = unassigned & ~missing_target & ~boundary_purge
+    if unexplained_unassigned.any():
+        raise ValueError(
+            "unassigned source row must have a missing target or an exit date "
+            "outside its train/validation boundary"
+        )
     if not dates.loc[training].between(TRAINING_START, TRAINING_END).all():
         raise ValueError("training dates must stay within 2019-01-01 through 2022-12-31")
     if not exits.loc[training].between(TRAINING_START, TRAINING_END).all():

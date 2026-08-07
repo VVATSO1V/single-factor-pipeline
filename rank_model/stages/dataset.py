@@ -34,6 +34,7 @@ FORBIDDEN_FEATURE_COLUMNS = {
     "entry_tradeable",
 }
 MAXIMUM_DEVELOPMENT_END = date(2023, 12, 31)
+MAX_TARGET_EXIT_CALENDAR_DAYS = 31
 FUTURE_STATUS_TIME_PATTERN = re.compile(
     r"t(?:_|\+|_?plus_?)?0*([1-9][0-9]*)"
 )

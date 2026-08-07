@@ -22,6 +22,7 @@ from sklearn.linear_model import Ridge
 from rank_model import __version__
 from rank_model.stages.dataset import (
     EXIT_DATE_COLUMN,
+    MAX_TARGET_EXIT_CALENDAR_DAYS,
     SPLIT_COLUMN,
     file_sha256,
     load_rank_dataset,
@@ -859,33 +860,60 @@ def validate_run_id(run_id: str) -> None:
 def _select_training_and_validation(
     frame: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    required = {"date", SPLIT_COLUMN, EXIT_DATE_COLUMN}
+    required = {"date", SPLIT_COLUMN, EXIT_DATE_COLUMN, RANK_TARGET_COLUMN}
     missing = sorted(required.difference(frame.columns))
     if missing:
         raise ValueError(f"rank dataset is missing split-contract columns: {missing}")
     dates = pd.to_datetime(frame["date"], errors="raise").dt.normalize()
-    exits = pd.to_datetime(frame[EXIT_DATE_COLUMN], errors="raise").dt.normalize()
-    splits = frame[SPLIT_COLUMN].astype("string")
+    exits = pd.to_datetime(frame[EXIT_DATE_COLUMN], errors="coerce").dt.normalize()
+    splits = frame[SPLIT_COLUMN].astype("string").str.strip().str.lower()
     allowed_start = pd.Timestamp("2019-01-01")
     validation_end = pd.Timestamp("2023-12-31")
     if dates.lt(allowed_start).any() or dates.gt(validation_end).any():
         raise ValueError(
             "rank dataset contains dates outside the 2019-2023 development window"
         )
-    if splits.isna().any() or splits.str.strip().eq("").any():
-        raise ValueError("development rows require non-blank assigned split values")
-    invalid_splits = ~splits.isin(("train", "validation"))
+    assigned = splits.notna()
+    if splits.loc[assigned].eq("").any():
+        raise ValueError("development rows contain blank assigned split values")
+    invalid_splits = assigned & ~splits.isin(("train", "validation"))
     if invalid_splits.any():
         values = sorted(splits.loc[invalid_splits].dropna().unique().tolist())
         raise ValueError(f"development rows contain invalid assigned split values: {values}")
-    if exits.isna().any():
-        raise ValueError("development rows require valid assigned exit dates")
+    if exits.loc[assigned].isna().any():
+        raise ValueError("assigned development rows require valid exit dates")
+    known_exit = exits.notna()
+    exit_days = (exits - dates).dt.days
+    invalid_exit_direction = known_exit & (
+        exit_days.le(0) | exit_days.gt(MAX_TARGET_EXIT_CALENDAR_DAYS)
+    )
+    if invalid_exit_direction.any():
+        raise ValueError(
+            "exit_date_10d must be 1 through "
+            f"{MAX_TARGET_EXIT_CALENDAR_DAYS} calendar days after its signal date"
+        )
 
     training_start = pd.Timestamp("2019-01-01")
     training_end = pd.Timestamp("2022-12-31")
     validation_start = pd.Timestamp("2023-01-01")
-    train_mask = splits.eq("train")
-    validation_mask = splits.eq("validation")
+    train_mask = splits.eq("train").fillna(False)
+    validation_mask = splits.eq("validation").fillna(False)
+    unassigned = splits.isna()
+    rank_values = pd.to_numeric(frame[RANK_TARGET_COLUMN], errors="coerce")
+    missing_rank = ~np.isfinite(rank_values.to_numpy(dtype="float64"))
+    boundary_purge = (
+        dates.between(training_start, training_end)
+        & exits.gt(training_end)
+    ) | (
+        dates.between(validation_start, validation_end)
+        & exits.gt(validation_end)
+    )
+    unexplained_unassigned = unassigned & ~missing_rank & ~boundary_purge
+    if unexplained_unassigned.any():
+        raise ValueError(
+            "unassigned development row must have a missing rank label or an exit "
+            "date outside its train/validation boundary"
+        )
     if not dates.loc[train_mask].between(training_start, training_end).all():
         raise ValueError("training split dates must stay within 2019-01-01 through 2022-12-31")
     if not exits.loc[train_mask].between(training_start, training_end).all():
