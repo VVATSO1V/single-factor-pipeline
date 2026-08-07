@@ -949,6 +949,19 @@ def _artifact_payload_bytes(directory: Path) -> int:
     )
 
 
+def _validated_source_hashes(schema: dict[str, Any]) -> dict[str, str]:
+    """Return the required source SHA-256 hashes in canonical lowercase form."""
+    values: dict[str, str] = {}
+    for field in ("source_dataset_sha256", "source_schema_sha256"):
+        value = schema.get(field)
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", value):
+            raise ValueError(
+                f"rank schema {field} must be a non-empty 64-character SHA-256 hex string"
+            )
+        values[field] = value.lower()
+    return values
+
+
 def _prediction_frame(validation: pd.DataFrame, scores: np.ndarray) -> pd.DataFrame:
     missing = sorted(set(KEY_COLUMNS).difference(validation.columns))
     if missing:
@@ -1205,6 +1218,7 @@ def train_registered_model(
     except (KeyError, TypeError) as error:
         raise ValueError(f"training config is missing inputs for {model_name}") from error
     dataset, schema = load_rank_dataset(dataset_path, schema_path)
+    schema.update(_validated_source_hashes(schema))
     train, validation = _select_training_and_validation(dataset)
     training_started = perf_counter()
     outcome = trainer(train, validation, schema, params)
