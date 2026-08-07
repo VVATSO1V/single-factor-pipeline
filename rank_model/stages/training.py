@@ -116,6 +116,7 @@ MLP_PAIRWISE_PAIRS_PER_STOCK = 8
 MLP_PAIRWISE_ADJACENT_FRACTION = 0.5
 MLP_PAIRWISE_DATES_PER_BATCH = 8
 MLP_RELOAD_TOLERANCE = 1e-6
+DEFAULT_RELOAD_TOLERANCE = 1e-12
 FIXED_SEED = 42
 
 
@@ -149,7 +150,12 @@ def _fixed_parameters(
     **parameters: Any,
 ) -> dict[str, Any]:
     """Return the JSON-safe immutable model contract recorded in every run."""
-    return {"model_name": model_name, "seed": FIXED_SEED, **parameters}
+    return {
+        "model_name": model_name,
+        "seed": FIXED_SEED,
+        "reload_tolerance": DEFAULT_RELOAD_TOLERANCE,
+        **parameters,
+    }
 
 
 def train_ridge_rank_regression(
@@ -425,6 +431,7 @@ def train_xgboost_pairwise_rank(
                 boosting_rounds=XGB_BOOSTING_ROUNDS,
                 grouping="date",
                 date_weighting="equal_total_per_date",
+                reload_tolerance=NATIVE_TREE_RELOAD_TOLERANCE,
             ),
         },
     )
@@ -482,6 +489,7 @@ def train_lightgbm_lambdarank(
                 grouping="date",
                 relevance_transform="floor(rank_target_10d * 100), clipped to [0, 99]",
                 date_weighting="equal_total_per_date",
+                reload_tolerance=NATIVE_TREE_RELOAD_TOLERANCE,
             ),
         },
     )
@@ -608,6 +616,7 @@ def train_mlp_rank_regression(
             "batch_size": MLP_BATCH_SIZE,
             "gradient_clip_norm": MLP_GRADIENT_CLIP_NORM,
             "seed": MLP_SEED,
+            "reload_tolerance": MLP_RELOAD_TOLERANCE,
             "validation_inference_seconds": validation_inference_seconds,
             "fixed_parameters": _fixed_parameters(
                 "mlp_rank_regression",
@@ -624,6 +633,7 @@ def train_mlp_rank_regression(
                 gradient_clip_norm=MLP_GRADIENT_CLIP_NORM,
                 deterministic_algorithms=True,
                 date_weighting="equal_total_per_date",
+                reload_tolerance=MLP_RELOAD_TOLERANCE,
             ),
         },
     )
@@ -822,6 +832,7 @@ def train_mlp_pairwise_rank(
                 deterministic_algorithms=True,
                 grouping="date",
                 date_weighting="equal_total_per_date",
+                reload_tolerance=MLP_RELOAD_TOLERANCE,
             ),
         },
     )
@@ -854,14 +865,14 @@ def _select_training_and_validation(
         raise ValueError(f"rank dataset is missing split-contract columns: {missing}")
     dates = pd.to_datetime(frame["date"], errors="raise").dt.normalize()
     exits = pd.to_datetime(frame[EXIT_DATE_COLUMN], errors="raise").dt.normalize()
-    splits = frame[SPLIT_COLUMN].astype("string").str.strip().str.lower()
+    splits = frame[SPLIT_COLUMN].astype("string")
     allowed_start = pd.Timestamp("2019-01-01")
     validation_end = pd.Timestamp("2023-12-31")
     if dates.lt(allowed_start).any() or dates.gt(validation_end).any():
         raise ValueError(
             "rank dataset contains dates outside the 2019-2023 development window"
         )
-    if splits.isna().any() or splits.eq("").any():
+    if splits.isna().any() or splits.str.strip().eq("").any():
         raise ValueError("development rows require non-blank assigned split values")
     invalid_splits = ~splits.isin(("train", "validation"))
     if invalid_splits.any():
@@ -924,6 +935,17 @@ def _missing_feature_rates(frame: pd.DataFrame, schema: dict[str, Any]) -> tuple
 def _artifact_bytes(directory: Path) -> int:
     return int(
         sum(path.stat().st_size for path in directory.rglob("*") if path.is_file())
+    )
+
+
+def _artifact_payload_bytes(directory: Path) -> int:
+    """Measure persisted run artifacts excluding the self-describing manifest."""
+    return int(
+        sum(
+            path.stat().st_size
+            for path in directory.rglob("*")
+            if path.is_file() and path.name != "manifest.json"
+        )
     )
 
 
@@ -1098,12 +1120,15 @@ def _write_manifest(
     outcome: TrainingOutcome,
     predictions: pd.DataFrame,
 ) -> None:
+    outcome.metadata["artifact_payload_bytes"] = _artifact_payload_bytes(temporary_run)
+    outcome.metadata["artifact_bytes"] = _artifact_bytes(temporary_run)
     fixed_parameters = outcome.metadata.get("fixed_parameters")
     if not isinstance(fixed_parameters, dict) or not fixed_parameters:
         raise ValueError("registered trainer did not record fixed parameters")
     required_provenance = (
         "training_seconds",
         "validation_inference_seconds",
+        "artifact_payload_bytes",
         "artifact_bytes",
         "source_dataset_sha256",
         "source_schema_sha256",
@@ -1121,26 +1146,33 @@ def _write_manifest(
     missing = [field for field in required_provenance if field not in outcome.metadata]
     if missing:
         raise ValueError(f"run provenance is missing fields: {missing}")
-    manifest = {
-        "status": "completed",
-        "run_id": run_id,
-        "model_name": model_name,
-        "training_rows": int(outcome.metadata["training_rows"]),
-        "validation_rows": int(len(predictions)),
-        "validation_dates": int(predictions["date"].nunique()),
-        "metadata": outcome.metadata,
-        "fixed_parameters": fixed_parameters,
-        "config_sha256": file_sha256(config_path),
-        "rank_dataset_sha256": schema.get("parquet_sha256"),
-        "predictions_10d_sha256": file_sha256(
-            temporary_run / "predictions_10d.parquet"
-        ),
-        **{field: outcome.metadata[field] for field in required_provenance},
-    }
-    (temporary_run / "manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    manifest_path = temporary_run / "manifest.json"
+    for _ in range(10):
+        manifest = {
+            "status": "completed",
+            "run_id": run_id,
+            "model_name": model_name,
+            "training_rows": int(outcome.metadata["training_rows"]),
+            "validation_rows": int(len(predictions)),
+            "validation_dates": int(predictions["date"].nunique()),
+            "metadata": outcome.metadata,
+            "fixed_parameters": fixed_parameters,
+            "config_sha256": file_sha256(config_path),
+            "rank_dataset_sha256": schema.get("parquet_sha256"),
+            "predictions_10d_sha256": file_sha256(
+                temporary_run / "predictions_10d.parquet"
+            ),
+            **{field: outcome.metadata[field] for field in required_provenance},
+        }
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        artifact_bytes = _artifact_bytes(temporary_run)
+        if outcome.metadata["artifact_bytes"] == artifact_bytes:
+            return
+        outcome.metadata["artifact_bytes"] = artifact_bytes
+    raise RuntimeError("manifest artifact byte total did not stabilize")
 
 
 def train_registered_model(
@@ -1209,6 +1241,17 @@ def train_registered_model(
             "validation_missing_feature_rates": validation_missing_feature_rates,
         }
     )
+    fixed_parameters = outcome.metadata.get("fixed_parameters")
+    if not isinstance(fixed_parameters, dict):
+        raise ValueError("registered trainer did not record fixed parameters")
+    reload_tolerance = fixed_parameters.get("reload_tolerance")
+    if (
+        not isinstance(reload_tolerance, (int, float))
+        or not np.isfinite(reload_tolerance)
+        or reload_tolerance < 0.0
+    ):
+        raise ValueError("registered trainer recorded an invalid reload tolerance")
+    outcome.metadata["reload_tolerance"] = float(reload_tolerance)
     predictions = _prediction_frame(validation, outcome.score_validation)
 
     runs_directory.mkdir(parents=True, exist_ok=True)
@@ -1221,12 +1264,11 @@ def train_registered_model(
             outcome,
             predictions,
         )
-        outcome.metadata["artifact_bytes"] = _artifact_bytes(temporary_run)
         _verify_reloaded_predictions(
             temporary_run,
             validation,
             outcome.score_validation,
-            tolerance=float(outcome.metadata.get("reload_tolerance", 1e-12)),
+            tolerance=float(fixed_parameters["reload_tolerance"]),
         )
         _write_manifest(
             temporary_run,
