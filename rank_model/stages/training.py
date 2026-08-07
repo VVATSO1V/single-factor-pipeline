@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 import shutil
 import tempfile
+from time import perf_counter
 from typing import Any, Callable
 import warnings
 
@@ -18,9 +19,17 @@ import pandas as pd
 import xgboost as xgb
 from sklearn.linear_model import Ridge
 
-from rank_model.stages.dataset import file_sha256, load_rank_dataset
+from rank_model import __version__
+from rank_model.stages.dataset import (
+    EXIT_DATE_COLUMN,
+    SPLIT_COLUMN,
+    file_sha256,
+    load_rank_dataset,
+)
 from rank_model.stages.preprocessing import (
     RankPreprocessor,
+    UNKNOWN_INDUSTRY,
+    _normalized_industries,
     equal_date_weights,
     predicted_percentiles,
 )
@@ -107,6 +116,7 @@ MLP_PAIRWISE_PAIRS_PER_STOCK = 8
 MLP_PAIRWISE_ADJACENT_FRACTION = 0.5
 MLP_PAIRWISE_DATES_PER_BATCH = 8
 MLP_RELOAD_TOLERANCE = 1e-6
+FIXED_SEED = 42
 
 
 @dataclass
@@ -126,6 +136,20 @@ def _finite_label_rows(frame: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"training data is missing {RANK_TARGET_COLUMN}")
     labels = pd.to_numeric(frame[RANK_TARGET_COLUMN], errors="coerce")
     return frame.loc[np.isfinite(labels.to_numpy())].copy()
+
+
+def _timed_prediction(predict: Callable[[], np.ndarray]) -> tuple[np.ndarray, float]:
+    started = perf_counter()
+    scores = np.asarray(predict(), dtype="float64")
+    return scores, float(perf_counter() - started)
+
+
+def _fixed_parameters(
+    model_name: str,
+    **parameters: Any,
+) -> dict[str, Any]:
+    """Return the JSON-safe immutable model contract recorded in every run."""
+    return {"model_name": model_name, "seed": FIXED_SEED, **parameters}
 
 
 def train_ridge_rank_regression(
@@ -161,13 +185,28 @@ def train_ridge_rank_regression(
     alpha = regularization * float(weights.sum())
     model = Ridge(alpha=alpha, fit_intercept=True, solver="cholesky")
     model.fit(x_train, y_train, sample_weight=weights)
-    score_validation = model.predict(x_validation)
+    score_validation, validation_inference_seconds = _timed_prediction(
+        lambda: model.predict(x_validation)
+    )
     if not np.isfinite(score_validation).all():
         raise ValueError("ridge produced non-finite validation scores")
     return TrainingOutcome(
         score_validation=np.asarray(score_validation, dtype="float64"),
         model_objects={"preprocessor": preprocessor, "model": model},
-        metadata={"lambda": regularization, "alpha": alpha, "solver": "cholesky"},
+        metadata={
+            "lambda": regularization,
+            "alpha": alpha,
+            "solver": "cholesky",
+            "validation_inference_seconds": validation_inference_seconds,
+            "fixed_parameters": _fixed_parameters(
+                "ridge_rank_regression",
+                objective="squared_error",
+                solver="cholesky",
+                fit_intercept=True,
+                date_weighting="equal_total_per_date",
+                **{"lambda": regularization},
+            ),
+        },
     )
 
 
@@ -216,7 +255,9 @@ def train_xgboost_rank_regression(
         xgb.DMatrix(x_train, label=y_train, weight=weights),
         num_boost_round=XGB_BOOSTING_ROUNDS,
     )
-    score_validation = model.predict(xgb.DMatrix(x_validation))
+    score_validation, validation_inference_seconds = _timed_prediction(
+        lambda: model.predict(xgb.DMatrix(x_validation))
+    )
     if not np.isfinite(score_validation).all():
         raise ValueError("xgboost produced non-finite validation scores")
     return TrainingOutcome(
@@ -225,6 +266,13 @@ def train_xgboost_rank_regression(
         metadata={
             "objective": XGB_PARAMS["objective"],
             "boosting_rounds": XGB_BOOSTING_ROUNDS,
+            "validation_inference_seconds": validation_inference_seconds,
+            "fixed_parameters": _fixed_parameters(
+                "xgboost_rank_regression",
+                **XGB_PARAMS,
+                boosting_rounds=XGB_BOOSTING_ROUNDS,
+                date_weighting="equal_total_per_date",
+            ),
         },
     )
 
@@ -245,7 +293,9 @@ def train_lightgbm_rank_regression(
         lgb.Dataset(x_train, label=y_train, weight=weights),
         num_boost_round=LGB_BOOSTING_ROUNDS,
     )
-    score_validation = model.predict(x_validation)
+    score_validation, validation_inference_seconds = _timed_prediction(
+        lambda: model.predict(x_validation)
+    )
     if not np.isfinite(score_validation).all():
         raise ValueError("lightgbm produced non-finite validation scores")
     return TrainingOutcome(
@@ -254,6 +304,13 @@ def train_lightgbm_rank_regression(
         metadata={
             "objective": LGB_PARAMS["objective"],
             "boosting_rounds": LGB_BOOSTING_ROUNDS,
+            "validation_inference_seconds": validation_inference_seconds,
+            "fixed_parameters": _fixed_parameters(
+                "lightgbm_rank_regression",
+                **LGB_PARAMS,
+                boosting_rounds=LGB_BOOSTING_ROUNDS,
+                date_weighting="equal_total_per_date",
+            ),
         },
     )
 
@@ -347,7 +404,9 @@ def train_xgboost_pairwise_rank(
         xgb.DMatrix(x_train, label=y_train, weight=group_weights, qid=query_ids),
         num_boost_round=XGB_BOOSTING_ROUNDS,
     )
-    sorted_scores = model.predict(xgb.DMatrix(x_validation))
+    sorted_scores, validation_inference_seconds = _timed_prediction(
+        lambda: model.predict(xgb.DMatrix(x_validation))
+    )
     score_validation = _restore_validation_order(sorted_scores, validation_positions)
     if not np.isfinite(score_validation).all():
         raise ValueError("xgboost pairwise ranking produced non-finite validation scores")
@@ -359,6 +418,14 @@ def train_xgboost_pairwise_rank(
             "boosting_rounds": XGB_BOOSTING_ROUNDS,
             "grouping": "date",
             "reload_tolerance": NATIVE_TREE_RELOAD_TOLERANCE,
+            "validation_inference_seconds": validation_inference_seconds,
+            "fixed_parameters": _fixed_parameters(
+                "xgboost_pairwise_rank",
+                **XGB_PAIRWISE_PARAMS,
+                boosting_rounds=XGB_BOOSTING_ROUNDS,
+                grouping="date",
+                date_weighting="equal_total_per_date",
+            ),
         },
     )
 
@@ -393,7 +460,9 @@ def train_lightgbm_lambdarank(
         ),
         num_boost_round=LGB_BOOSTING_ROUNDS,
     )
-    sorted_scores = model.predict(x_validation)
+    sorted_scores, validation_inference_seconds = _timed_prediction(
+        lambda: model.predict(x_validation)
+    )
     score_validation = _restore_validation_order(sorted_scores, validation_positions)
     if not np.isfinite(score_validation).all():
         raise ValueError("LightGBM LambdaRank produced non-finite validation scores")
@@ -405,6 +474,15 @@ def train_lightgbm_lambdarank(
             "boosting_rounds": LGB_BOOSTING_ROUNDS,
             "grouping": "date",
             "reload_tolerance": NATIVE_TREE_RELOAD_TOLERANCE,
+            "validation_inference_seconds": validation_inference_seconds,
+            "fixed_parameters": _fixed_parameters(
+                "lightgbm_lambdarank",
+                **LGB_LAMBDARANK_PARAMS,
+                boosting_rounds=LGB_BOOSTING_ROUNDS,
+                grouping="date",
+                relevance_transform="floor(rank_target_10d * 100), clipped to [0, 99]",
+                date_weighting="equal_total_per_date",
+            ),
         },
     )
 def _build_mlp_rank_regression_model(input_dim: int, output_bias: float) -> Any:
@@ -414,7 +492,13 @@ def _build_mlp_rank_regression_model(input_dim: int, output_bias: float) -> Any:
     layers: list[torch.nn.Module] = []
     previous_width = input_dim
     for width in MLP_HIDDEN_LAYERS:
-        layers.extend((torch.nn.Linear(previous_width, width), torch.nn.ReLU()))
+        layers.extend(
+            (
+                torch.nn.Linear(previous_width, width),
+                torch.nn.ReLU(),
+                torch.nn.Dropout(MLP_DROPOUT),
+            )
+        )
         previous_width = width
     output_layer = torch.nn.Linear(previous_width, 1)
     torch.nn.init.zeros_(output_layer.weight)
@@ -472,7 +556,9 @@ def train_mlp_rank_regression(
     model = _build_mlp_rank_regression_model(
         x_train.shape[1], float(np.mean(y_train))
     )
-    optimizer = torch.optim.AdamW(model.parameters())
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=MLP_LEARNING_RATE, weight_decay=MLP_WEIGHT_DECAY
+    )
     features = torch.from_numpy(np.ascontiguousarray(x_train, dtype=np.float32))
     targets = torch.from_numpy(np.ascontiguousarray(y_train, dtype=np.float32))
     weights = torch.from_numpy(np.ascontiguousarray(row_weights, dtype=np.float32))
@@ -492,7 +578,9 @@ def train_mlp_rank_regression(
             torch.nn.utils.clip_grad_norm_(model.parameters(), MLP_GRADIENT_CLIP_NORM)
             optimizer.step()
 
-    score_validation = _predict_mlp_rank_regression(model, x_validation)
+    score_validation, validation_inference_seconds = _timed_prediction(
+        lambda: _predict_mlp_rank_regression(model, x_validation)
+    )
     if not np.isfinite(score_validation).all():
         raise ValueError("MLP produced non-finite validation scores")
     return TrainingOutcome(
@@ -506,6 +594,7 @@ def train_mlp_rank_regression(
                 "input_dim": int(x_train.shape[1]),
                 "hidden_layers": MLP_HIDDEN_LAYERS,
                 "activation": "relu",
+                "dropout": MLP_DROPOUT,
                 "output_bias": float(np.mean(y_train)),
             },
         },
@@ -514,9 +603,28 @@ def train_mlp_rank_regression(
             "epochs": MLP_EPOCHS,
             "loss": "mse",
             "optimizer": "adamw",
+            "learning_rate": MLP_LEARNING_RATE,
+            "weight_decay": MLP_WEIGHT_DECAY,
             "batch_size": MLP_BATCH_SIZE,
             "gradient_clip_norm": MLP_GRADIENT_CLIP_NORM,
             "seed": MLP_SEED,
+            "validation_inference_seconds": validation_inference_seconds,
+            "fixed_parameters": _fixed_parameters(
+                "mlp_rank_regression",
+                objective="rank_regression",
+                hidden_layers=MLP_HIDDEN_LAYERS,
+                activation="relu",
+                dropout=MLP_DROPOUT,
+                loss="mse",
+                optimizer="adamw",
+                learning_rate=MLP_LEARNING_RATE,
+                weight_decay=MLP_WEIGHT_DECAY,
+                batch_size=MLP_BATCH_SIZE,
+                epochs=MLP_EPOCHS,
+                gradient_clip_norm=MLP_GRADIENT_CLIP_NORM,
+                deterministic_algorithms=True,
+                date_weighting="equal_total_per_date",
+            ),
         },
     )
 
@@ -649,7 +757,9 @@ def train_mlp_pairwise_rank(
         torch.nn.utils.clip_grad_norm_(model.parameters(), MLP_GRADIENT_CLIP_NORM)
         optimizer.step()
 
-    score_validation = _predict_mlp_rank_regression(model, x_validation)
+    score_validation, validation_inference_seconds = _timed_prediction(
+        lambda: _predict_mlp_rank_regression(model, x_validation)
+    )
     if not np.isfinite(score_validation).all():
         raise ValueError("pairwise MLP produced non-finite validation scores")
     broad_pairs = MLP_PAIRWISE_PAIRS_PER_STOCK - int(
@@ -691,6 +801,28 @@ def train_mlp_pairwise_rank(
             "pair_count": int(len(left)),
             "pair_counts_by_date": pair_counts_by_date,
             "reload_tolerance": MLP_RELOAD_TOLERANCE,
+            "validation_inference_seconds": validation_inference_seconds,
+            "fixed_parameters": _fixed_parameters(
+                "mlp_pairwise_rank",
+                objective="pairwise_ranking",
+                hidden_layers=MLP_HIDDEN_LAYERS,
+                activation="relu",
+                dropout=MLP_DROPOUT,
+                loss="pairwise_logistic",
+                optimizer="adamw",
+                learning_rate=MLP_LEARNING_RATE,
+                weight_decay=MLP_WEIGHT_DECAY,
+                epochs=MLP_EPOCHS,
+                gradient_clip_norm=MLP_GRADIENT_CLIP_NORM,
+                dates_per_batch=MLP_PAIRWISE_DATES_PER_BATCH,
+                pairs_per_stock=MLP_PAIRWISE_PAIRS_PER_STOCK,
+                adjacent_fraction=MLP_PAIRWISE_ADJACENT_FRACTION,
+                broad_pairs_per_stock=broad_pairs,
+                adjacent_pairs_per_stock=adjacent_pairs,
+                deterministic_algorithms=True,
+                grouping="date",
+                date_weighting="equal_total_per_date",
+            ),
         },
     )
 
@@ -716,25 +848,83 @@ def validate_run_id(run_id: str) -> None:
 def _select_training_and_validation(
     frame: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if "date" not in frame:
-        raise ValueError("rank dataset is missing date")
+    required = {"date", SPLIT_COLUMN, EXIT_DATE_COLUMN}
+    missing = sorted(required.difference(frame.columns))
+    if missing:
+        raise ValueError(f"rank dataset is missing split-contract columns: {missing}")
     dates = pd.to_datetime(frame["date"], errors="raise").dt.normalize()
+    exits = pd.to_datetime(frame[EXIT_DATE_COLUMN], errors="raise").dt.normalize()
+    splits = frame[SPLIT_COLUMN].astype("string").str.strip().str.lower()
     allowed_start = pd.Timestamp("2019-01-01")
     validation_end = pd.Timestamp("2023-12-31")
     if dates.lt(allowed_start).any() or dates.gt(validation_end).any():
         raise ValueError(
             "rank dataset contains dates outside the 2019-2023 development window"
         )
+    if splits.isna().any() or splits.eq("").any():
+        raise ValueError("development rows require non-blank assigned split values")
+    invalid_splits = ~splits.isin(("train", "validation"))
+    if invalid_splits.any():
+        values = sorted(splits.loc[invalid_splits].dropna().unique().tolist())
+        raise ValueError(f"development rows contain invalid assigned split values: {values}")
+    if exits.isna().any():
+        raise ValueError("development rows require valid assigned exit dates")
+
+    training_start = pd.Timestamp("2019-01-01")
+    training_end = pd.Timestamp("2022-12-31")
+    validation_start = pd.Timestamp("2023-01-01")
+    train_mask = splits.eq("train")
+    validation_mask = splits.eq("validation")
+    if not dates.loc[train_mask].between(training_start, training_end).all():
+        raise ValueError("training split dates must stay within 2019-01-01 through 2022-12-31")
+    if not exits.loc[train_mask].between(training_start, training_end).all():
+        raise ValueError("training exit dates must stay within 2019-01-01 through 2022-12-31")
+    if not dates.loc[validation_mask].between(validation_start, validation_end).all():
+        raise ValueError("validation split dates must stay within 2023-01-01 through 2023-12-31")
+    if not exits.loc[validation_mask].between(validation_start, validation_end).all():
+        raise ValueError("validation exit dates must stay within 2023-01-01 through 2023-12-31")
+
     normalized = frame.copy()
     normalized["date"] = dates
-    train = normalized.loc[dates.dt.year.between(2019, 2022)].copy()
-    validation = normalized.loc[dates.dt.year.eq(2023)].copy()
+    normalized[EXIT_DATE_COLUMN] = exits
+    normalized[SPLIT_COLUMN] = splits
+    train = normalized.loc[train_mask].copy()
+    validation = normalized.loc[validation_mask].copy()
     train = _finite_label_rows(train)
     if train.empty:
         raise ValueError("no finite 2019-2022 rank labels are available for training")
     if validation.empty:
         raise ValueError("no 2023 rows are available for validation prediction")
     return train, validation
+
+
+def _unknown_industry_rate(frame: pd.DataFrame, preprocessor: RankPreprocessor) -> float:
+    normalized = _normalized_industries(frame[preprocessor.industry_column])
+    known = set(preprocessor.industry_categories) - {UNKNOWN_INDUSTRY}
+    return float((~normalized.isin(known)).mean())
+
+
+def _missing_feature_rates(frame: pd.DataFrame, schema: dict[str, Any]) -> tuple[float, dict[str, float]]:
+    continuous = schema.get("continuous_feature_columns")
+    if not isinstance(continuous, list):
+        raise ValueError("rank schema is missing continuous feature columns")
+    indicators = [
+        column
+        for column in continuous
+        if isinstance(column, str) and "missing" in column.lower()
+    ]
+    rates = {
+        column: float(pd.to_numeric(frame[column], errors="raise").gt(0.0).mean())
+        for column in indicators
+    }
+    aggregate = float(np.mean(list(rates.values()))) if rates else 0.0
+    return aggregate, rates
+
+
+def _artifact_bytes(directory: Path) -> int:
+    return int(
+        sum(path.stat().st_size for path in directory.rglob("*") if path.is_file())
+    )
 
 
 def _prediction_frame(validation: pd.DataFrame, scores: np.ndarray) -> pd.DataFrame:
@@ -832,6 +1022,8 @@ def _load_persisted_model(temporary_run: Path) -> Any:
         if hidden_layers != MLP_HIDDEN_LAYERS:
             raise ValueError("unexpected PyTorch MLP architecture")
         if model_name == "mlp_rank_regression":
+            if architecture.get("dropout") != MLP_DROPOUT:
+                raise ValueError("unexpected rank-regression PyTorch MLP architecture")
             model = _build_mlp_rank_regression_model(input_dim, output_bias)
         elif model_name == "mlp_pairwise_rank":
             if architecture.get("dropout") != MLP_DROPOUT or output_bias != 0.0:
@@ -906,6 +1098,29 @@ def _write_manifest(
     outcome: TrainingOutcome,
     predictions: pd.DataFrame,
 ) -> None:
+    fixed_parameters = outcome.metadata.get("fixed_parameters")
+    if not isinstance(fixed_parameters, dict) or not fixed_parameters:
+        raise ValueError("registered trainer did not record fixed parameters")
+    required_provenance = (
+        "training_seconds",
+        "validation_inference_seconds",
+        "artifact_bytes",
+        "source_dataset_sha256",
+        "source_schema_sha256",
+        "code_version",
+        "seed",
+        "training_dates",
+        "feature_count",
+        "training_unknown_industry_rate",
+        "validation_unknown_industry_rate",
+        "training_missing_feature_rate",
+        "validation_missing_feature_rate",
+        "training_missing_feature_rates",
+        "validation_missing_feature_rates",
+    )
+    missing = [field for field in required_provenance if field not in outcome.metadata]
+    if missing:
+        raise ValueError(f"run provenance is missing fields: {missing}")
     manifest = {
         "status": "completed",
         "run_id": run_id,
@@ -914,11 +1129,13 @@ def _write_manifest(
         "validation_rows": int(len(predictions)),
         "validation_dates": int(predictions["date"].nunique()),
         "metadata": outcome.metadata,
+        "fixed_parameters": fixed_parameters,
         "config_sha256": file_sha256(config_path),
         "rank_dataset_sha256": schema.get("parquet_sha256"),
         "predictions_10d_sha256": file_sha256(
             temporary_run / "predictions_10d.parquet"
         ),
+        **{field: outcome.metadata[field] for field in required_provenance},
     }
     (temporary_run / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -957,8 +1174,41 @@ def train_registered_model(
         raise ValueError(f"training config is missing inputs for {model_name}") from error
     dataset, schema = load_rank_dataset(dataset_path, schema_path)
     train, validation = _select_training_and_validation(dataset)
+    training_started = perf_counter()
     outcome = trainer(train, validation, schema, params)
+    training_elapsed = float(perf_counter() - training_started)
     outcome.metadata["training_rows"] = int(len(train))
+    validation_inference_seconds = float(
+        outcome.metadata.get("validation_inference_seconds", 0.0)
+    )
+    if not np.isfinite(validation_inference_seconds) or validation_inference_seconds < 0.0:
+        raise ValueError("trainer recorded an invalid validation inference duration")
+    preprocessor = outcome.model_objects.get("preprocessor")
+    if not isinstance(preprocessor, RankPreprocessor):
+        raise ValueError("registered trainer did not provide a RankPreprocessor")
+    training_missing_feature_rate, training_missing_feature_rates = _missing_feature_rates(
+        train, schema
+    )
+    validation_missing_feature_rate, validation_missing_feature_rates = _missing_feature_rates(
+        validation, schema
+    )
+    outcome.metadata.update(
+        {
+            "training_seconds": max(training_elapsed - validation_inference_seconds, 0.0),
+            "source_dataset_sha256": schema.get("source_dataset_sha256"),
+            "source_schema_sha256": schema.get("source_schema_sha256"),
+            "code_version": __version__,
+            "seed": FIXED_SEED,
+            "training_dates": int(train["date"].nunique()),
+            "feature_count": int(len(preprocessor.feature_names)),
+            "training_unknown_industry_rate": _unknown_industry_rate(train, preprocessor),
+            "validation_unknown_industry_rate": _unknown_industry_rate(validation, preprocessor),
+            "training_missing_feature_rate": training_missing_feature_rate,
+            "validation_missing_feature_rate": validation_missing_feature_rate,
+            "training_missing_feature_rates": training_missing_feature_rates,
+            "validation_missing_feature_rates": validation_missing_feature_rates,
+        }
+    )
     predictions = _prediction_frame(validation, outcome.score_validation)
 
     runs_directory.mkdir(parents=True, exist_ok=True)
@@ -971,6 +1221,7 @@ def train_registered_model(
             outcome,
             predictions,
         )
+        outcome.metadata["artifact_bytes"] = _artifact_bytes(temporary_run)
         _verify_reloaded_predictions(
             temporary_run,
             validation,
