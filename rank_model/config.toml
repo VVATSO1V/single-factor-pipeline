@@ -13,6 +13,34 @@ rank_dataset = "data/rank_dataset_10d.parquet"
 rank_schema = "data/rank_dataset_10d_schema.json"
 rank_label_coverage = "data/rank_label_coverage.csv"
 runs_dir = "runs"
+frozen_spec = "frozen_models.json"
+final_runs_dir = "final_runs"
+
+[[finalization.candidates]]
+run_id = "real-2023-ridge"
+model_name = "ridge_rank_regression"
+role = "linear_benchmark"
+
+[[finalization.candidates]]
+run_id = "real-2023-xgb-reg"
+model_name = "xgboost_rank_regression"
+role = "stable_tree_ordering"
+
+[[finalization.candidates]]
+run_id = "real-2023-lgb-reg"
+model_name = "lightgbm_rank_regression"
+role = "all_universe_tree_ordering"
+
+[[finalization.candidates]]
+run_id = "real-2023-lgb-rank"
+model_name = "lightgbm_lambdarank"
+role = "top100_primary"
+
+[[finalization.candidates]]
+run_id = "real-2023-mlp-top100-hybrid"
+model_name = "mlp_top100_hybrid_rank"
+role = "neural_candidate"
+final_epochs = 12
 
 [models.ridge_rank_regression]
 lambda = 1.0

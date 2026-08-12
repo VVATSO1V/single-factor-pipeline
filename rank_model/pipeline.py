@@ -34,6 +34,15 @@ from rank_model.stages.dataset import (
     load_rank_dataset,
 )
 from rank_model.stages.evaluation import compare_runs, evaluate_predictions, write_evaluation
+from rank_model.stages.finalization import (
+    build_frozen_spec,
+    freeze_refit_dataset,
+    rank_dataset_logical_sha256,
+    refit_frozen_candidate,
+    validate_frozen_dataset,
+    validate_frozen_files_before_read,
+    write_frozen_spec,
+)
 from rank_model.stages.training import MODEL_NAMES, train_registered_model, validate_run_id
 
 
@@ -155,6 +164,124 @@ def _validate_configured_paths(config: dict[str, Any], config_path: Path) -> dic
         if _is_inside_model_data(resolved[name]):
             raise ValueError(f"paths.{name} must not resolve inside model/data")
     return resolved
+
+
+def _validate_finalization_paths(
+    config: dict[str, Any], config_path: Path
+) -> dict[str, Path]:
+    try:
+        raw_paths = config["paths"]
+        resolved = {
+            name: resolve_config_path(config_path, raw_paths[name])
+            for name in ("frozen_spec", "final_runs_dir")
+        }
+    except (KeyError, TypeError) as error:
+        raise ValueError(
+            "freeze/refit requires paths.frozen_spec and paths.final_runs_dir"
+        ) from error
+    for name, path in resolved.items():
+        if not _is_within(path, PACKAGE_DIR) or _is_inside_model_data(path):
+            raise ValueError(
+                f"paths.{name} must resolve under rank_model outside model/data"
+            )
+    return resolved
+
+
+def command_freeze(
+    config: dict[str, Any],
+    config_path: Path,
+    validation_runs_directory: Path | None = None,
+) -> Path:
+    """Freeze the selected, completed 2023 validation specifications."""
+    paths = _validate_configured_paths(config, config_path)
+    paths.update(_validate_finalization_paths(config, config_path))
+    candidates = config.get("finalization", {}).get("candidates")
+    if not isinstance(candidates, list):
+        raise ValueError("config requires [[finalization.candidates]]")
+    runs_directory = (
+        Path(validation_runs_directory).resolve()
+        if validation_runs_directory is not None
+        else paths["runs_dir"]
+    )
+    specification = build_frozen_spec(
+        candidates,
+        runs_directory,
+        date.fromisoformat(config["project"]["training_start"]),
+        date.fromisoformat(config["project"]["development_end"]),
+    )
+    dataset, schema = load_rank_dataset(paths["rank_dataset"], paths["rank_schema"])
+    if file_sha256(paths["source_dataset"]) != schema.get("source_dataset_sha256"):
+        raise ValueError("current source dataset hash does not match the rank schema")
+    if file_sha256(paths["source_schema"]) != schema.get("source_schema_sha256"):
+        raise ValueError("current source schema hash does not match the rank schema")
+    specification = freeze_refit_dataset(
+        specification,
+        dataset,
+        schema,
+        paths["rank_dataset"],
+        paths["rank_schema"],
+    )
+    return write_frozen_spec(specification, paths["frozen_spec"])
+
+
+def command_refit(
+    config: dict[str, Any], config_path: Path, model_name: str
+) -> Path:
+    """Refit one frozen candidate on all eligible 2019-2023 observations."""
+    paths = _validate_configured_paths(config, config_path)
+    paths.update(_validate_finalization_paths(config, config_path))
+    frozen_spec = json.loads(paths["frozen_spec"].read_text(encoding="utf-8"))
+    if frozen_spec.get("schema_version") != 1:
+        raise ValueError("unsupported frozen model specification")
+    matches = [
+        candidate
+        for candidate in frozen_spec.get("candidates", [])
+        if candidate.get("model_name") == model_name
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"frozen specification has no unique candidate: {model_name}")
+    data_hashes = frozen_spec.get("data_hashes")
+    if not isinstance(data_hashes, dict):
+        raise ValueError("frozen specification is missing data hashes")
+    refit_dataset_contract = frozen_spec.get("refit_dataset")
+    if not isinstance(refit_dataset_contract, dict):
+        raise ValueError("frozen specification is missing the exact refit dataset")
+    validate_frozen_files_before_read(
+        paths["rank_dataset"], paths["rank_schema"], refit_dataset_contract
+    )
+    candidate = matches[0]
+    dataset, schema = load_rank_dataset(paths["rank_dataset"], paths["rank_schema"])
+    validate_frozen_dataset(dataset, schema, data_hashes)
+    if rank_dataset_logical_sha256(dataset, schema) != refit_dataset_contract.get(
+        "logical_sha256"
+    ):
+        raise ValueError("loaded refit dataset does not match its frozen logical hash")
+    dates = pd.to_datetime(dataset["date"], errors="raise").dt.normalize()
+    if (
+        len(dataset) != refit_dataset_contract.get("row_count")
+        or dates.nunique() != refit_dataset_contract.get("date_count")
+        or dates.min().date().isoformat() != refit_dataset_contract.get("date_min")
+        or dates.max().date().isoformat() != refit_dataset_contract.get("date_max")
+    ):
+        raise ValueError("loaded refit dataset does not match its frozen dimensions")
+    window = frozen_spec.get("development_window")
+    if not isinstance(window, dict):
+        raise ValueError("frozen specification is missing its development window")
+    try:
+        params = config["models"][model_name]
+    except (KeyError, TypeError) as error:
+        raise ValueError(f"config is missing model parameters: {model_name}") from error
+    return refit_frozen_candidate(
+        dataset,
+        schema,
+        candidate,
+        config_path,
+        paths["frozen_spec"],
+        paths["final_runs_dir"],
+        model_params=params,
+        development_start=date.fromisoformat(window["signal_start"]),
+        development_end=date.fromisoformat(window["signal_end"]),
+    )
 
 
 def _validated_run_directory(runs_directory: Path, run_id: str) -> Path:
@@ -357,6 +484,24 @@ def make_parser() -> argparse.ArgumentParser:
     evaluate_parser.add_argument("--split", required=True, choices=("validation",))
     compare_parser = subparsers.add_parser("compare", help="Compare completed runs.")
     compare_parser.add_argument("--run-ids", required=True)
+    freeze_parser = subparsers.add_parser(
+        "freeze", help="Freeze selected completed validation specifications."
+    )
+    freeze_parser.add_argument("--validation-runs-dir", type=Path)
+    refit_parser = subparsers.add_parser(
+        "refit", help="Refit one frozen candidate on 2019-2023."
+    )
+    refit_parser.add_argument(
+        "--model",
+        required=True,
+        choices=(
+            "ridge_rank_regression",
+            "xgboost_rank_regression",
+            "lightgbm_rank_regression",
+            "lightgbm_lambdarank",
+            "mlp_top100_hybrid_rank",
+        ),
+    )
     return parser
 
 
@@ -400,6 +545,24 @@ def main() -> None:
             parser = make_parser()
             parser.error(str(error))
         print(f"rank model comparison written: rows={len(comparison)}")
+        return
+    if args.command == "freeze":
+        try:
+            frozen_path = command_freeze(
+                config, config_path, args.validation_runs_dir
+            )
+        except (FileNotFoundError, ValueError, FileExistsError) as error:
+            parser = make_parser()
+            parser.error(str(error))
+        print(f"frozen model specification written: {frozen_path}")
+        return
+    if args.command == "refit":
+        try:
+            run_directory = command_refit(config, config_path, args.model)
+        except (FileNotFoundError, ValueError, FileExistsError) as error:
+            parser = make_parser()
+            parser.error(str(error))
+        print(f"final model refit written: {run_directory}")
         return
     if args.command != "prepare":
         raise NotImplementedError(f"{args.command} is not wired in this task")

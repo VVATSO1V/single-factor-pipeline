@@ -91,6 +91,42 @@ scale and score differences must not be read as return forecasts. Evaluation
 converts scores to daily percentiles for ordering metrics while retaining raw
 `target_10d` for return, Top100, decile, and spread reporting.
 
+## Freeze And Final Refit
+
+After choosing specifications with the 2023 validation results, freeze the
+five selected candidates before using the locked 2024-2025 test period:
+
+```powershell
+& $python -m rank_model.pipeline --config rank_model\config.toml freeze
+```
+
+`frozen_models.json` records each source validation run, its manifest and
+feature-schema SHA-256, transformed feature order, fixed model parameters,
+source-data hashes, a logical audit of the 2023 labels, and the exact physical
+and full-table logical hashes of the sealed 2019-2023 rank dataset. It is immutable;
+deleting it is an explicit research decision, not part of a normal rerun.
+
+Refit each frozen specification on all eligible 2019-2023 labels:
+
+```powershell
+& $python -m rank_model.pipeline --config rank_model\config.toml refit --model ridge_rank_regression
+& $python -m rank_model.pipeline --config rank_model\config.toml refit --model xgboost_rank_regression
+& $python -m rank_model.pipeline --config rank_model\config.toml refit --model lightgbm_rank_regression
+& $python -m rank_model.pipeline --config rank_model\config.toml refit --model lightgbm_lambdarank
+& $python -m rank_model.pipeline --config rank_model\config.toml refit --model mlp_top100_hybrid_rank
+```
+
+Final refits include finite labels whose signal date is in 2019-2023 and whose
+10-day target exit is no later than 2023-12-31. This reclaims observations that
+were purged only at the old 2022/2023 train-validation boundary, while still
+excluding labels that need 2024 prices. No validation split, early stopping,
+test prediction, or strategy rule is used. The selected hybrid MLP runs a fixed
+12 epochs. Final artifacts are immutable under
+`rank_model/final_runs/<model-name>` and intentionally contain no prediction
+file; 2024-2025 prediction is a later, separate locked-test step. `refit`
+verifies the sealed rank file before opening it and does not read upstream
+source data.
+
 ## Artifacts
 
 `prepare` creates the following files under `rank_model/data`:
