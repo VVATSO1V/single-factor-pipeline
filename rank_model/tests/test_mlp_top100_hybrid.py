@@ -4,11 +4,16 @@ import unittest
 
 import numpy as np
 import pandas as pd
+import torch
 
 from rank_model.stages.ranking import (
     mean_daily_ndcg_at_k,
     mean_daily_spearman,
     sample_top100_pairs,
+)
+from rank_model.stages.training import (
+    _hybrid_date_loss,
+    train_mlp_top100_hybrid_rank,
 )
 
 
@@ -80,6 +85,91 @@ class ValidationMetricTests(unittest.TestCase):
             mean_daily_ndcg_at_k(
                 self.dates, self.stocks, bad_scores, self.targets, top_k=2
             )
+
+
+class HybridLossTests(unittest.TestCase):
+    def test_loss_averages_dates_instead_of_rows_or_pairs(self) -> None:
+        scores = torch.tensor([0.0, 2.0, 0.0, 0.0, 0.0])
+        targets = torch.zeros(5)
+        date_codes = torch.tensor([0, 0, 1, 1, 1])
+        left = torch.tensor([1, 2, 3])
+        right = torch.tensor([0, 4, 4])
+        direction = torch.ones(3)
+
+        total, mse, pairwise = _hybrid_date_loss(
+            scores,
+            targets,
+            date_codes,
+            left,
+            right,
+            direction,
+            pairwise_weight=0.1,
+        )
+
+        expected_mse = torch.tensor(1.0)
+        expected_pairwise = (
+            torch.nn.functional.softplus(torch.tensor(-2.0))
+            + torch.nn.functional.softplus(torch.tensor(0.0))
+        ) / 2.0
+        torch.testing.assert_close(mse, expected_mse)
+        torch.testing.assert_close(pairwise, expected_pairwise)
+        torch.testing.assert_close(total, expected_mse + 0.1 * expected_pairwise)
+
+
+class HybridTrainingTests(unittest.TestCase):
+    @staticmethod
+    def _frame(start: str, date_count: int) -> pd.DataFrame:
+        rows = []
+        for date_index, date in enumerate(pd.bdate_range(start, periods=date_count)):
+            for stock_index in range(20):
+                rank = stock_index / 19.0
+                rows.append(
+                    {
+                        "date": date,
+                        "stock_code": f"S{stock_index:02d}",
+                        "feature": rank + date_index * 0.01,
+                        "industry": "A" if stock_index % 2 == 0 else "B",
+                        "rank_target_10d": rank,
+                    }
+                )
+        return pd.DataFrame(rows)
+
+    def test_training_updates_per_batch_and_is_deterministic(self) -> None:
+        train = self._frame("2022-01-03", 4)
+        validation = self._frame("2023-01-03", 2)
+        schema = {
+            "continuous_feature_columns": ["feature"],
+            "industry_column": "industry",
+        }
+        params = {
+            "hidden_layers": [8, 4],
+            "dropout": 0.0,
+            "learning_rate": 0.001,
+            "weight_decay": 0.0,
+            "pairwise_weight": 0.1,
+            "boundary_pairs_per_positive": 1,
+            "broad_pairs_per_positive": 1,
+            "dates_per_batch": 2,
+            "max_epochs": 3,
+            "patience": 1,
+            "min_delta": 0.0,
+            "gradient_clip_norm": 1.0,
+            "top_k": 2,
+            "seed": 42,
+        }
+
+        first = train_mlp_top100_hybrid_rank(train, validation, schema, params)
+        second = train_mlp_top100_hybrid_rank(train, validation, schema, params)
+
+        np.testing.assert_array_equal(first.score_validation, second.score_validation)
+        metadata = first.metadata
+        self.assertTrue(np.isfinite(first.score_validation).all())
+        self.assertGreater(metadata["optimizer_step_count"], metadata["stopped_epoch"])
+        self.assertGreaterEqual(metadata["best_epoch"], 1)
+        self.assertLessEqual(metadata["best_epoch"], metadata["stopped_epoch"])
+        self.assertEqual(len(metadata["training_history"]), metadata["stopped_epoch"])
+        self.assertTrue(np.isfinite(metadata["best_validation_ndcg_100"]))
+        self.assertTrue(np.isfinite(metadata["best_validation_rank_ic"]))
 
 
 if __name__ == "__main__":

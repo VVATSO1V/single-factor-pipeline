@@ -36,8 +36,11 @@ from rank_model.stages.preprocessing import (
 )
 from rank_model.stages.ranking import (
     lightgbm_relevance,
+    mean_daily_ndcg_at_k,
+    mean_daily_spearman,
     pairwise_logistic_loss,
     sample_date_pairs,
+    sample_top100_pairs,
     sorted_group_layout,
 )
 
@@ -496,16 +499,31 @@ def train_lightgbm_lambdarank(
     )
 def _build_mlp_rank_regression_model(input_dim: int, output_bias: float) -> Any:
     """Build the fixed ReLU network used by the MLP rank regressor."""
+    return _build_mlp_model(
+        input_dim,
+        hidden_layers=MLP_HIDDEN_LAYERS,
+        dropout=MLP_DROPOUT,
+        output_bias=output_bias,
+    )
+
+
+def _build_mlp_model(
+    input_dim: int,
+    hidden_layers: list[int],
+    dropout: float,
+    output_bias: float,
+) -> Any:
+    """Build a ReLU MLP with explicit persisted architecture parameters."""
     import torch
 
     layers: list[torch.nn.Module] = []
     previous_width = input_dim
-    for width in MLP_HIDDEN_LAYERS:
+    for width in hidden_layers:
         layers.extend(
             (
                 torch.nn.Linear(previous_width, width),
                 torch.nn.ReLU(),
-                torch.nn.Dropout(MLP_DROPOUT),
+                torch.nn.Dropout(dropout),
             )
         )
         previous_width = width
@@ -642,24 +660,59 @@ def train_mlp_rank_regression(
 
 def _build_mlp_pairwise_rank_model(input_dim: int) -> Any:
     """Build the fixed dropout MLP used by pairwise ranking."""
+    return _build_mlp_model(
+        input_dim,
+        hidden_layers=MLP_HIDDEN_LAYERS,
+        dropout=MLP_DROPOUT,
+        output_bias=0.0,
+    )
+
+
+def _hybrid_date_loss(
+    scores: Any,
+    targets: Any,
+    date_codes: Any,
+    left: Any,
+    right: Any,
+    direction: Any,
+    pairwise_weight: float,
+) -> tuple[Any, Any, Any]:
+    """Combine equally weighted daily rank MSE and Top100 pairwise loss."""
     import torch
 
-    layers: list[torch.nn.Module] = []
-    previous_width = input_dim
-    for width in MLP_HIDDEN_LAYERS:
-        layers.extend(
-            (
-                torch.nn.Linear(previous_width, width),
-                torch.nn.ReLU(),
-                torch.nn.Dropout(MLP_DROPOUT),
+    if scores.ndim != 1 or targets.ndim != 1 or date_codes.ndim != 1:
+        raise ValueError("hybrid loss scores, targets, and date codes must be vectors")
+    if not (len(scores) == len(targets) == len(date_codes)) or len(scores) == 0:
+        raise ValueError("hybrid loss row tensors must have equal nonzero length")
+    if not (left.ndim == right.ndim == direction.ndim == 1):
+        raise ValueError("hybrid loss pair tensors must be vectors")
+    if not (len(left) == len(right) == len(direction)) or len(left) == 0:
+        raise ValueError("hybrid loss pair tensors must have equal nonzero length")
+    if not np.isfinite(pairwise_weight) or pairwise_weight < 0.0:
+        raise ValueError("hybrid pairwise weight must be finite and nonnegative")
+
+    mse_losses = []
+    pair_losses = []
+    for date_code in torch.unique(date_codes, sorted=True):
+        row_mask = date_codes == date_code
+        mse_losses.append(torch.square(scores[row_mask] - targets[row_mask]).mean())
+        pair_mask = row_mask[left]
+        if not bool(pair_mask.any()):
+            raise ValueError("hybrid loss requires Top100 pairs for every date")
+        pair_losses.append(
+            pairwise_logistic_loss(
+                scores,
+                left[pair_mask],
+                right[pair_mask],
+                direction[pair_mask],
             )
         )
-        previous_width = width
-    output_layer = torch.nn.Linear(previous_width, 1)
-    torch.nn.init.zeros_(output_layer.weight)
-    torch.nn.init.zeros_(output_layer.bias)
-    layers.append(output_layer)
-    return torch.nn.Sequential(*layers)
+    mse = torch.stack(mse_losses).mean()
+    pairwise = torch.stack(pair_losses).mean()
+    total = mse + float(pairwise_weight) * pairwise
+    if not bool(torch.isfinite(total)):
+        raise ValueError("hybrid loss is non-finite")
+    return total, mse.detach(), pairwise.detach()
 
 
 def _pairwise_date_batch_ranges(dates: pd.Series) -> list[tuple[int, int, np.ndarray]]:
@@ -679,6 +732,303 @@ def _pairwise_date_batch_ranges(dates: pd.Series) -> list[tuple[int, int, np.nda
             raise ValueError("pairwise date batches require contiguous date rows")
         ranges.append((int(positions[0]), int(positions[-1]) + 1, batch_codes))
     return ranges
+
+
+def _date_batch_ranges(
+    dates: pd.Series,
+    dates_per_batch: int,
+) -> list[tuple[int, int, np.ndarray]]:
+    """Return contiguous ranges containing a configurable number of dates."""
+    if not isinstance(dates_per_batch, int) or isinstance(dates_per_batch, bool):
+        raise ValueError("dates_per_batch must be an integer")
+    if dates_per_batch <= 0:
+        raise ValueError("dates_per_batch must be positive")
+    date_codes, unique_dates = pd.factorize(dates, sort=False)
+    ranges: list[tuple[int, int, np.ndarray]] = []
+    for start_code in range(0, len(unique_dates), dates_per_batch):
+        batch_codes = np.arange(
+            start_code,
+            min(start_code + dates_per_batch, len(unique_dates)),
+            dtype="int64",
+        )
+        positions = np.flatnonzero(np.isin(date_codes, batch_codes))
+        if positions.size == 0:
+            raise ValueError("date batching produced an empty batch")
+        if not np.array_equal(positions, np.arange(positions[0], positions[-1] + 1)):
+            raise ValueError("date batches require contiguous date rows")
+        ranges.append((int(positions[0]), int(positions[-1]) + 1, batch_codes))
+    if not ranges:
+        raise ValueError("date batching requires at least one date")
+    return ranges
+
+
+def _hybrid_mlp_parameters(params: dict[str, Any]) -> dict[str, Any]:
+    """Validate and normalize the explicit hybrid-MLP configuration."""
+    try:
+        hidden_layers = list(params["hidden_layers"])
+        values = {
+            "hidden_layers": hidden_layers,
+            "dropout": float(params["dropout"]),
+            "learning_rate": float(params["learning_rate"]),
+            "weight_decay": float(params["weight_decay"]),
+            "pairwise_weight": float(params["pairwise_weight"]),
+            "boundary_pairs_per_positive": params["boundary_pairs_per_positive"],
+            "broad_pairs_per_positive": params["broad_pairs_per_positive"],
+            "dates_per_batch": params["dates_per_batch"],
+            "max_epochs": params["max_epochs"],
+            "patience": params["patience"],
+            "min_delta": float(params["min_delta"]),
+            "gradient_clip_norm": float(params["gradient_clip_norm"]),
+            "top_k": params["top_k"],
+            "seed": params["seed"],
+        }
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("hybrid MLP configuration is incomplete or invalid") from error
+    if not hidden_layers or any(
+        not isinstance(width, int) or isinstance(width, bool) or width <= 0
+        for width in hidden_layers
+    ):
+        raise ValueError("hybrid MLP hidden_layers must contain positive integers")
+    for name in (
+        "boundary_pairs_per_positive",
+        "broad_pairs_per_positive",
+        "dates_per_batch",
+        "max_epochs",
+        "patience",
+        "top_k",
+        "seed",
+    ):
+        value = values[name]
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError(f"hybrid MLP {name} must be a positive integer")
+    if values["seed"] != FIXED_SEED:
+        raise ValueError(f"hybrid MLP seed must be {FIXED_SEED}")
+    if not 0.0 <= values["dropout"] < 1.0:
+        raise ValueError("hybrid MLP dropout must be in [0, 1)")
+    for name in ("learning_rate", "gradient_clip_norm"):
+        if not np.isfinite(values[name]) or values[name] <= 0.0:
+            raise ValueError(f"hybrid MLP {name} must be finite and positive")
+    for name in ("weight_decay", "pairwise_weight", "min_delta"):
+        if not np.isfinite(values[name]) or values[name] < 0.0:
+            raise ValueError(f"hybrid MLP {name} must be finite and nonnegative")
+    return values
+
+
+def train_mlp_top100_hybrid_rank(
+    train: pd.DataFrame,
+    validation: pd.DataFrame,
+    schema: dict[str, Any],
+    params: dict[str, Any],
+) -> TrainingOutcome:
+    """Fit a date-batched rank MLP selected by validation NDCG@100."""
+    import torch
+
+    settings = _hybrid_mlp_parameters(params)
+    train = _finite_label_rows(train)
+    if train.empty:
+        raise ValueError("hybrid MLP training requires finite rank labels")
+    if validation.empty:
+        raise ValueError("hybrid MLP validation frame is empty")
+    try:
+        continuous_columns = schema["continuous_feature_columns"]
+        industry_column = schema["industry_column"]
+    except (KeyError, TypeError) as error:
+        raise ValueError("hybrid MLP training requires schema features") from error
+
+    train, _ = sorted_group_layout(train)
+    validation_targets = pd.to_numeric(
+        validation[RANK_TARGET_COLUMN], errors="coerce"
+    ).to_numpy(dtype="float64")
+    if not np.isfinite(validation_targets).all():
+        raise ValueError("hybrid MLP validation rank labels must be finite")
+    preprocessor = RankPreprocessor.fit(
+        train,
+        continuous_columns=continuous_columns,
+        industry_column=industry_column,
+    )
+    x_train = preprocessor.transform(train, scale_continuous=True)
+    x_validation = preprocessor.transform(validation, scale_continuous=True)
+    y_train = train[RANK_TARGET_COLUMN].to_numpy(dtype="float64")
+    train_date_codes, unique_train_dates = pd.factorize(train["date"], sort=False)
+    batch_ranges = _date_batch_ranges(train["date"], settings["dates_per_batch"])
+
+    np.random.seed(settings["seed"])
+    torch.manual_seed(settings["seed"])
+    torch.use_deterministic_algorithms(True)
+    torch.set_num_threads(1)
+    model = _build_mlp_model(
+        x_train.shape[1],
+        hidden_layers=settings["hidden_layers"],
+        dropout=settings["dropout"],
+        output_bias=float(np.mean(y_train)),
+    )
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=settings["learning_rate"],
+        weight_decay=settings["weight_decay"],
+    )
+    features = torch.from_numpy(np.ascontiguousarray(x_train, dtype=np.float32))
+    targets = torch.from_numpy(np.ascontiguousarray(y_train, dtype=np.float32))
+    date_code_tensor = torch.from_numpy(
+        np.ascontiguousarray(train_date_codes, dtype=np.int64)
+    )
+
+    best_ndcg = -np.inf
+    best_rank_ic = np.nan
+    best_epoch = 0
+    best_state: dict[str, Any] | None = None
+    non_improving_epochs = 0
+    optimizer_step_count = 0
+    history: list[dict[str, Any]] = []
+
+    for epoch in range(1, settings["max_epochs"] + 1):
+        left, right, direction = sample_top100_pairs(
+            train["date"],
+            y_train,
+            settings["boundary_pairs_per_positive"],
+            settings["broad_pairs_per_positive"],
+            seed=settings["seed"] + epoch,
+        )
+        pair_date_codes = train_date_codes[left]
+        left_tensor = torch.from_numpy(np.ascontiguousarray(left, dtype=np.int64))
+        right_tensor = torch.from_numpy(np.ascontiguousarray(right, dtype=np.int64))
+        direction_tensor = torch.from_numpy(
+            np.ascontiguousarray(direction, dtype=np.float32)
+        )
+        epoch_loss = 0.0
+        epoch_mse = 0.0
+        epoch_pairwise = 0.0
+        epoch_date_count = 0
+        model.train()
+        for batch_start, batch_end, batch_codes in batch_ranges:
+            pair_mask = np.isin(pair_date_codes, batch_codes)
+            batch_left = left_tensor[pair_mask] - batch_start
+            batch_right = right_tensor[pair_mask] - batch_start
+            batch_direction = direction_tensor[pair_mask]
+            batch_scores = model(features[batch_start:batch_end]).squeeze(-1)
+            batch_loss, batch_mse, batch_pairwise = _hybrid_date_loss(
+                batch_scores,
+                targets[batch_start:batch_end],
+                date_code_tensor[batch_start:batch_end],
+                batch_left,
+                batch_right,
+                batch_direction,
+                pairwise_weight=settings["pairwise_weight"],
+            )
+            optimizer.zero_grad(set_to_none=True)
+            batch_loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), settings["gradient_clip_norm"]
+            )
+            optimizer.step()
+            optimizer_step_count += 1
+            date_count = len(batch_codes)
+            epoch_date_count += date_count
+            epoch_loss += float(batch_loss.detach()) * date_count
+            epoch_mse += float(batch_mse) * date_count
+            epoch_pairwise += float(batch_pairwise) * date_count
+        if epoch_date_count != len(unique_train_dates):
+            raise ValueError("hybrid MLP date batches did not cover every training date")
+
+        validation_scores = _predict_mlp_rank_regression(model, x_validation)
+        validation_ndcg = mean_daily_ndcg_at_k(
+            validation["date"],
+            validation["stock_code"],
+            validation_scores,
+            validation_targets,
+            top_k=settings["top_k"],
+        )
+        validation_rank_ic = mean_daily_spearman(
+            validation["date"], validation_scores, validation_targets
+        )
+        improved = validation_ndcg > best_ndcg + settings["min_delta"]
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss": epoch_loss / epoch_date_count,
+                "train_rank_mse": epoch_mse / epoch_date_count,
+                "train_top100_pairwise": epoch_pairwise / epoch_date_count,
+                "validation_ndcg_100": validation_ndcg,
+                "validation_rank_ic": validation_rank_ic,
+                "improved": bool(improved),
+            }
+        )
+        if improved:
+            best_ndcg = validation_ndcg
+            best_rank_ic = validation_rank_ic
+            best_epoch = epoch
+            best_state = {
+                name: value.detach().cpu().clone()
+                for name, value in model.state_dict().items()
+            }
+            non_improving_epochs = 0
+        else:
+            non_improving_epochs += 1
+            if non_improving_epochs >= settings["patience"]:
+                break
+
+    if best_state is None or best_epoch == 0:
+        raise ValueError("hybrid MLP did not produce a finite best validation state")
+    model.load_state_dict(best_state)
+    score_validation, validation_inference_seconds = _timed_prediction(
+        lambda: _predict_mlp_rank_regression(model, x_validation)
+    )
+    if not np.isfinite(score_validation).all():
+        raise ValueError("hybrid MLP produced non-finite validation scores")
+    stopped_epoch = len(history)
+    fixed_parameters = _fixed_parameters(
+        "mlp_top100_hybrid_rank",
+        objective="top100_hybrid_ranking",
+        hidden_layers=settings["hidden_layers"],
+        activation="relu",
+        dropout=settings["dropout"],
+        optimizer="adamw",
+        learning_rate=settings["learning_rate"],
+        weight_decay=settings["weight_decay"],
+        rank_loss="equal_date_mse",
+        pairwise_loss="equal_date_top100_logistic",
+        pairwise_weight=settings["pairwise_weight"],
+        boundary_pairs_per_positive=settings["boundary_pairs_per_positive"],
+        broad_pairs_per_positive=settings["broad_pairs_per_positive"],
+        dates_per_batch=settings["dates_per_batch"],
+        max_epochs=settings["max_epochs"],
+        patience=settings["patience"],
+        min_delta=settings["min_delta"],
+        gradient_clip_norm=settings["gradient_clip_norm"],
+        validation_selection="mean_daily_ndcg_at_100",
+        top_k=settings["top_k"],
+        deterministic_algorithms=True,
+        date_weighting="equal_total_per_date",
+        reload_tolerance=MLP_RELOAD_TOLERANCE,
+    )
+    return TrainingOutcome(
+        score_validation=score_validation,
+        model_objects={
+            "preprocessor": preprocessor,
+            "model": model,
+            "model_type": "pytorch_mlp",
+            "architecture": {
+                "model_name": "mlp_top100_hybrid_rank",
+                "input_dim": int(x_train.shape[1]),
+                "hidden_layers": settings["hidden_layers"],
+                "activation": "relu",
+                "dropout": settings["dropout"],
+                "output_bias": float(np.mean(y_train)),
+            },
+        },
+        metadata={
+            "hidden_layers": settings["hidden_layers"],
+            "dropout": settings["dropout"],
+            "best_epoch": best_epoch,
+            "stopped_epoch": stopped_epoch,
+            "best_validation_ndcg_100": best_ndcg,
+            "best_validation_rank_ic": best_rank_ic,
+            "optimizer_step_count": optimizer_step_count,
+            "training_history": history,
+            "validation_inference_seconds": validation_inference_seconds,
+            "fixed_parameters": fixed_parameters,
+        },
+    )
 
 
 def train_mlp_pairwise_rank(
