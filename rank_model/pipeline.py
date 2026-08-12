@@ -44,6 +44,16 @@ from rank_model.stages.finalization import (
     write_frozen_spec,
 )
 from rank_model.stages.training import MODEL_NAMES, train_registered_model, validate_run_id
+from rank_model.stages.locked_test import (
+    LOCKED_CAP_COVERAGE_THRESHOLD,
+    LOCKED_MAD_WIDTH,
+    LOCKED_MODEL_NAMES,
+    LOCKED_WINDOWS,
+    compare_locked_test_models,
+    evaluate_locked_test_model,
+    predict_locked_test_model,
+    prepare_locked_test_dataset,
+)
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -98,6 +108,34 @@ def load_config(config_path: Path) -> dict[str, Any]:
     ):
         if not isinstance(config["paths"].get(name), str):
             raise ValueError(f"{path} requires paths.{name}")
+    locked_test = config.get("locked_test")
+    if not isinstance(locked_test, dict):
+        raise ValueError(f"{path} is missing [locked_test]")
+    if locked_test.get("start") != "2024-01-01" or locked_test.get("end") != "2025-12-31":
+        raise ValueError(
+            f"{path}: locked_test must span 2024-01-01 through 2025-12-31"
+        )
+    if locked_test.get("expected_cross_section_size") != 1000:
+        raise ValueError(f"{path}: locked_test expected_cross_section_size must be 1000")
+    windows = locked_test.get("windows")
+    try:
+        mad_width = float(locked_test["mad_width"])
+        date_chunk_size = int(locked_test["date_chunk_size"])
+        cap_coverage_threshold = float(locked_test["cap_coverage_threshold"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"{path}: locked_test numeric settings are invalid") from error
+    if mad_width <= 0 or date_chunk_size <= 0 or not 0 < cap_coverage_threshold <= 1:
+        raise ValueError(f"{path}: locked_test numeric settings are out of range")
+    if (
+        mad_width != LOCKED_MAD_WIDTH
+        or windows != list(LOCKED_WINDOWS)
+        or cap_coverage_threshold != LOCKED_CAP_COVERAGE_THRESHOLD
+    ):
+        raise ValueError(
+            f"{path}: locked_test feature semantics must remain "
+            f"mad_width={LOCKED_MAD_WIDTH}, windows={list(LOCKED_WINDOWS)}, "
+            f"cap_coverage_threshold={LOCKED_CAP_COVERAGE_THRESHOLD}"
+        )
     return config
 
 
@@ -185,6 +223,130 @@ def _validate_finalization_paths(
                 f"paths.{name} must resolve under rank_model outside model/data"
             )
     return resolved
+
+
+def _validate_locked_test_paths(
+    config: dict[str, Any], config_path: Path
+) -> dict[str, Path]:
+    source_names = (
+        "full_model_dataset",
+        "full_model_schema",
+        "full_sample_index",
+        "full_split_summary",
+        "market_panel",
+        "trading_calendar",
+    )
+    output_names = (
+        "locked_test_dataset",
+        "locked_test_schema",
+        "locked_test_label_coverage",
+        "locked_test_runs_dir",
+        "locked_test_comparison",
+    )
+    required = (*source_names, *output_names)
+    try:
+        resolved = {
+            name: resolve_config_path(config_path, config["paths"][name])
+            for name in required
+        }
+    except (KeyError, TypeError) as error:
+        raise ValueError("locked-test paths are incomplete") from error
+    for name in source_names:
+        if not _is_model_data_path(resolved[name]):
+            raise ValueError(f"paths.{name} must resolve directly under model/data")
+    for name in output_names:
+        if not _is_within(resolved[name], PACKAGE_DIR) or _is_inside_model_data(
+            resolved[name]
+        ):
+            raise ValueError(
+                f"paths.{name} must resolve under rank_model outside model/data"
+            )
+    return resolved
+
+
+def command_prepare_test(config: dict[str, Any], config_path: Path) -> dict[str, Any]:
+    """Publish the sealed local 2024-2025 rank-model dataset."""
+    paths = _validate_configured_paths(config, config_path)
+    paths.update(_validate_finalization_paths(config, config_path))
+    paths.update(_validate_locked_test_paths(config, config_path))
+    existing = [
+        str(paths[name])
+        for name in (
+            "locked_test_dataset",
+            "locked_test_schema",
+            "locked_test_label_coverage",
+        )
+        if paths[name].exists()
+    ]
+    if existing:
+        raise FileExistsError(f"locked-test dataset is immutable: {existing}")
+    settings = config["locked_test"]
+    return prepare_locked_test_dataset(
+        model_dataset_path=paths["full_model_dataset"],
+        model_schema_path=paths["full_model_schema"],
+        sample_index_path=paths["full_sample_index"],
+        split_summary_path=paths["full_split_summary"],
+        market_panel_path=paths["market_panel"],
+        trading_calendar_path=paths["trading_calendar"],
+        development_schema_path=paths["rank_schema"],
+        output_dataset_path=paths["locked_test_dataset"],
+        output_schema_path=paths["locked_test_schema"],
+        output_coverage_path=paths["locked_test_label_coverage"],
+        test_start=pd.Timestamp(settings["start"]),
+        test_end=pd.Timestamp(settings["end"]),
+        mad_width=float(settings["mad_width"]),
+        expected_cross_section_size=int(settings["expected_cross_section_size"]),
+        date_chunk_size=int(settings["date_chunk_size"]),
+        windows=tuple(int(value) for value in settings["windows"]),
+        cap_coverage_threshold=float(settings["cap_coverage_threshold"]),
+    )
+
+
+def command_predict_test(
+    config: dict[str, Any], config_path: Path, model_name: str
+) -> Path:
+    """Generate static 2024-2025 predictions from one final frozen model."""
+    paths = _validate_configured_paths(config, config_path)
+    paths.update(_validate_finalization_paths(config, config_path))
+    paths.update(_validate_locked_test_paths(config, config_path))
+    return predict_locked_test_model(
+        model_name,
+        test_dataset_path=paths["locked_test_dataset"],
+        test_schema_path=paths["locked_test_schema"],
+        development_schema_path=paths["rank_schema"],
+        trading_calendar_path=paths["trading_calendar"],
+        frozen_spec_path=paths["frozen_spec"],
+        final_runs_directory=paths["final_runs_dir"],
+        output_runs_directory=paths["locked_test_runs_dir"],
+        expected_cross_section_size=int(
+            config["locked_test"]["expected_cross_section_size"]
+        ),
+    )
+
+
+def command_evaluate_test(
+    config: dict[str, Any], config_path: Path, model_name: str
+) -> Path:
+    """Evaluate one completed locked-test prediction run."""
+    paths = _validate_locked_test_paths(config, config_path)
+    return evaluate_locked_test_model(
+        model_name,
+        output_runs_directory=paths["locked_test_runs_dir"],
+        hac_lag=10,
+        top_k=100,
+    )
+
+
+def command_compare_test(
+    config: dict[str, Any], config_path: Path
+) -> pd.DataFrame:
+    """Write one metric-only comparison for every frozen model."""
+    paths = _validate_locked_test_paths(config, config_path)
+    return compare_locked_test_models(
+        output_runs_directory=paths["locked_test_runs_dir"],
+        output_path=paths["locked_test_comparison"],
+        model_names=LOCKED_MODEL_NAMES,
+    )
 
 
 def command_freeze(
@@ -502,6 +664,24 @@ def make_parser() -> argparse.ArgumentParser:
             "mlp_top100_hybrid_rank",
         ),
     )
+    subparsers.add_parser(
+        "prepare-test", help="Build the sealed 2024-2025 locked-test dataset."
+    )
+    predict_test_parser = subparsers.add_parser(
+        "predict-test", help="Run one frozen final model on 2024-2025."
+    )
+    predict_test_parser.add_argument(
+        "--model", required=True, choices=LOCKED_MODEL_NAMES
+    )
+    evaluate_test_parser = subparsers.add_parser(
+        "evaluate-test", help="Evaluate one completed locked-test prediction."
+    )
+    evaluate_test_parser.add_argument(
+        "--model", required=True, choices=LOCKED_MODEL_NAMES
+    )
+    subparsers.add_parser(
+        "compare-test", help="Compare all completed locked-test model reports."
+    )
     return parser
 
 
@@ -563,6 +743,41 @@ def main() -> None:
             parser = make_parser()
             parser.error(str(error))
         print(f"final model refit written: {run_directory}")
+        return
+    if args.command == "prepare-test":
+        try:
+            result = command_prepare_test(config, config_path)
+        except (FileNotFoundError, ValueError, FileExistsError) as error:
+            parser = make_parser()
+            parser.error(str(error))
+        print(
+            "locked-test rank dataset written: "
+            f"rows={result['row_count']} dates={result['date_count']}"
+        )
+        return
+    if args.command == "predict-test":
+        try:
+            directory = command_predict_test(config, config_path, args.model)
+        except (FileNotFoundError, ValueError, FileExistsError) as error:
+            parser = make_parser()
+            parser.error(str(error))
+        print(f"locked-test predictions written: {directory}")
+        return
+    if args.command == "evaluate-test":
+        try:
+            directory = command_evaluate_test(config, config_path, args.model)
+        except (FileNotFoundError, ValueError, FileExistsError) as error:
+            parser = make_parser()
+            parser.error(str(error))
+        print(f"locked-test evaluation written: {directory}")
+        return
+    if args.command == "compare-test":
+        try:
+            comparison = command_compare_test(config, config_path)
+        except (FileNotFoundError, ValueError, FileExistsError) as error:
+            parser = make_parser()
+            parser.error(str(error))
+        print(f"locked-test comparison written: rows={len(comparison)}")
         return
     if args.command != "prepare":
         raise NotImplementedError(f"{args.command} is not wired in this task")

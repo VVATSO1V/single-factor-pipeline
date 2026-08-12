@@ -46,8 +46,11 @@ The locked-test schema must match the sealed development rank schema exactly:
 - no forbidden future or execution feature.
 
 Every source file, development contract, and published locked-test artifact is
-recorded by SHA-256. Preparation uses temporary files and atomic publication.
-An existing locked-test dataset is not silently overwritten.
+recorded by SHA-256. The schema also seals the feature-engineering source-code
+fingerprint and the development parameters (`mad_width = 3.0`, rolling windows
+`[1, 5, 20]`, and cap coverage threshold `0.95`). Preparation uses temporary
+files, an exclusive writer lock, and atomic publication. An existing locked-test
+dataset is not silently overwritten.
 
 ## Static Inference
 
@@ -64,7 +67,7 @@ The five frozen candidates are:
 - `lightgbm_lambdarank`
 - `mlp_top100_hybrid_rank`
 
-Each immutable output directory under `rank_model/locked_test_runs` contains a
+Each output directory under `rank_model/locked_test_runs` contains a
 prediction Parquet and an inference manifest. Predictions retain all 1000 keys
 per date and use the existing contract:
 
@@ -98,7 +101,8 @@ parameters or final-model artifacts.
 
 `predict-test`, `evaluate-test`, and `compare-test` fail if a required prior
 artifact is missing or its hash no longer matches. Existing output directories
-are immutable and are never silently replaced.
+are never silently replaced. The prediction is immutable after publication;
+one lock-protected evaluation append is allowed, after which the run is sealed.
 
 ## Verification
 

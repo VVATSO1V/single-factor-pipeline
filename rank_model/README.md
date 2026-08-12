@@ -127,6 +127,57 @@ file; 2024-2025 prediction is a later, separate locked-test step. `refit`
 verifies the sealed rank file before opening it and does not read upstream
 source data.
 
+## 2024-2025 Locked Test
+
+After all five final refits exist, build test features and labels from the
+already prepared local `model/data` files. This does not access Ricequant:
+
+```powershell
+& $python -m rank_model.pipeline --config rank_model\config.toml prepare-test
+```
+
+The result retains all 485 CSI1000 signal dates from 2024-01-02 through
+2025-12-31 and exactly 1000 keys per date. Signals after 2025-12-16 do not have
+a complete 10-day exit inside 2025, so their keys and predictions remain while
+their target and rank label are missing. The builder reads 20 prior trading
+days only to warm up point-in-time market and industry features.
+
+Run static inference and evaluation for each frozen model:
+
+```powershell
+$models = @(
+  "ridge_rank_regression",
+  "xgboost_rank_regression",
+  "lightgbm_rank_regression",
+  "lightgbm_lambdarank",
+  "mlp_top100_hybrid_rank"
+)
+
+foreach ($model in $models) {
+  & $python -m rank_model.pipeline --config rank_model\config.toml predict-test `
+    --model $model
+  & $python -m rank_model.pipeline --config rank_model\config.toml evaluate-test `
+    --model $model
+}
+
+& $python -m rank_model.pipeline --config rank_model\config.toml compare-test
+```
+
+`predict-test` loads the fitted 2019-2023 preprocessor and model without
+refitting either one. It verifies final-model, frozen-spec, source-data, schema,
+feature-order, feature-code, and feature-parameter contracts before inference.
+`evaluate-test` reuses the same
+metric definitions and evaluation code as the 2023 validation stage, then
+writes combined, daily, monthly, yearly, decile, and Top100 outputs.
+`compare-test` writes one five-row metric table without choosing a winner.
+
+The dataset, prediction file, and comparison are immutable. A run directory
+allows one lock-protected evaluation append after prediction, then becomes
+sealed; a normal rerun fails instead of overwriting it. Dataset creation,
+per-model inference, evaluation, and comparison all exclude concurrent writers.
+`entry_tradeable` and all T+1 status filters remain excluded here and enter only
+the later strategy backtest.
+
 ## Artifacts
 
 `prepare` creates the following files under `rank_model/data`:
@@ -164,3 +215,20 @@ date,stock_code,split,horizon,target_10d,rank_target_10d,score_raw,pred_rank_pct
 The comparison output has one row per completed run and metric columns only.
 It intentionally contains no automatic `accept`, `reject`, or `champion`
 field: specification choice remains a human decision.
+
+Locked-test artifacts use the parallel structure:
+
+```text
+data/locked_test_rank_dataset_10d.parquet
+data/locked_test_rank_dataset_10d_schema.json
+data/locked_test_rank_label_coverage.csv
+locked_test_runs/<model-name>/predictions_10d.parquet
+locked_test_runs/<model-name>/metrics_summary.json
+locked_test_runs/<model-name>/daily_metrics.csv
+locked_test_runs/<model-name>/monthly_metrics.csv
+locked_test_runs/<model-name>/yearly_metrics.csv
+locked_test_runs/<model-name>/decile_returns.csv
+locked_test_runs/<model-name>/top100_detail.parquet
+locked_test_runs/<model-name>/manifest.json
+locked_test_runs/locked_test_comparison.csv
+```

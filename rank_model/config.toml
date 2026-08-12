@@ -15,6 +15,26 @@ rank_label_coverage = "data/rank_label_coverage.csv"
 runs_dir = "runs"
 frozen_spec = "frozen_models.json"
 final_runs_dir = "final_runs"
+full_model_dataset = "../model/data/model_dataset.parquet"
+full_model_schema = "../model/data/model_dataset_schema.json"
+full_sample_index = "../model/data/model_sample_index.parquet"
+full_split_summary = "../model/data/model_split_summary.json"
+market_panel = "../model/data/market_panel.csv"
+trading_calendar = "../model/data/trading_calendar.csv"
+locked_test_dataset = "data/locked_test_rank_dataset_10d.parquet"
+locked_test_schema = "data/locked_test_rank_dataset_10d_schema.json"
+locked_test_label_coverage = "data/locked_test_rank_label_coverage.csv"
+locked_test_runs_dir = "locked_test_runs"
+locked_test_comparison = "locked_test_runs/locked_test_comparison.csv"
+
+[locked_test]
+start = "2024-01-01"
+end = "2025-12-31"
+mad_width = 3.0
+date_chunk_size = 60
+expected_cross_section_size = 1000
+windows = [1, 5, 20]
+cap_coverage_threshold = 0.95
 
 [[finalization.candidates]]
 run_id = "real-2023-ridge"
