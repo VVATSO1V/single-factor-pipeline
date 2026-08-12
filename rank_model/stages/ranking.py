@@ -5,6 +5,163 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import torch
+from scipy.stats import spearmanr
+
+
+def _validated_ranking_arrays(
+    dates: pd.Series,
+    scores: np.ndarray,
+    targets: np.ndarray,
+) -> tuple[pd.Series, np.ndarray, np.ndarray]:
+    normalized_dates = pd.to_datetime(dates, errors="raise").dt.normalize()
+    score_values = np.asarray(scores, dtype="float64")
+    target_values = np.asarray(targets, dtype="float64")
+    if not (
+        len(normalized_dates) == len(score_values) == len(target_values)
+    ):
+        raise ValueError("ranking dates, scores, and targets must have equal length")
+    if normalized_dates.isna().any():
+        raise ValueError("ranking dates must be non-null")
+    if not np.isfinite(score_values).all() or not np.isfinite(target_values).all():
+        raise ValueError("ranking scores and targets must be finite")
+    return normalized_dates, score_values, target_values
+
+
+def sample_top100_pairs(
+    dates: pd.Series,
+    targets: np.ndarray,
+    boundary_pairs_per_positive: int,
+    broad_pairs_per_positive: int,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Sample deterministic lower-ranked opponents for each daily Top100 stock."""
+    normalized_dates = pd.to_datetime(dates, errors="raise").dt.normalize()
+    target_values = np.asarray(targets, dtype="float64")
+    if len(normalized_dates) != len(target_values):
+        raise ValueError("Top100 pair dates and targets must have equal length")
+    if normalized_dates.isna().any():
+        raise ValueError("Top100 pair dates must be non-null")
+    if not np.isfinite(target_values).all():
+        raise ValueError("Top100 pair targets must be finite")
+    for name, count in (
+        ("boundary_pairs_per_positive", boundary_pairs_per_positive),
+        ("broad_pairs_per_positive", broad_pairs_per_positive),
+    ):
+        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+
+    rng = np.random.default_rng(seed)
+    left_parts: list[np.ndarray] = []
+    right_parts: list[np.ndarray] = []
+    date_codes, unique_dates = pd.factorize(normalized_dates, sort=False)
+    for date_code, date in enumerate(unique_dates):
+        positions = np.flatnonzero(date_codes == date_code)
+        date_targets = target_values[positions]
+        positives = positions[date_targets >= 0.9]
+        boundary = positions[(date_targets >= 0.7) & (date_targets < 0.9)]
+        broad = positions[date_targets < 0.9]
+        if positives.size == 0:
+            raise ValueError(f"Top100 pair date {date.date()} has no positive stocks")
+        if boundary.size == 0:
+            raise ValueError(f"Top100 pair date {date.date()} has no boundary opponents")
+        if broad.size == 0:
+            raise ValueError(f"Top100 pair date {date.date()} has no broad opponents")
+        for anchor in positives:
+            opponents = np.concatenate(
+                (
+                    rng.choice(
+                        boundary, size=boundary_pairs_per_positive, replace=True
+                    ),
+                    rng.choice(broad, size=broad_pairs_per_positive, replace=True),
+                )
+            ).astype("int64", copy=False)
+            left_parts.append(
+                np.full(len(opponents), anchor, dtype="int64")
+            )
+            right_parts.append(opponents)
+
+    left = np.concatenate(left_parts) if left_parts else np.empty(0, dtype="int64")
+    right = (
+        np.concatenate(right_parts) if right_parts else np.empty(0, dtype="int64")
+    )
+    direction = np.sign(target_values[left] - target_values[right]).astype("int8")
+    if np.any(left == right) or np.any(direction != 1):
+        raise ValueError("Top100 pair sampling produced an invalid directed pair")
+    return left, right, direction
+
+
+def mean_daily_ndcg_at_k(
+    dates: pd.Series,
+    stock_codes: pd.Series,
+    scores: np.ndarray,
+    targets: np.ndarray,
+    top_k: int,
+) -> float:
+    """Return equal-date mean NDCG using the evaluator's continuous gain."""
+    normalized_dates, score_values, target_values = _validated_ranking_arrays(
+        dates, scores, targets
+    )
+    stock_values = pd.Series(stock_codes, dtype="string")
+    if len(stock_values) != len(score_values):
+        raise ValueError("ranking stock codes must have equal length")
+    if stock_values.isna().any():
+        raise ValueError("ranking stock codes must be non-null")
+    if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k <= 0:
+        raise ValueError("top_k must be a positive integer")
+
+    frame = pd.DataFrame(
+        {
+            "date": normalized_dates,
+            "stock_code": stock_values,
+            "score": score_values,
+            "target": target_values,
+        }
+    )
+    values: list[float] = []
+    for _, group in frame.groupby("date", sort=False, observed=True):
+        count = min(top_k, len(group))
+        discounts = np.log2(np.arange(2, count + 2, dtype="float64"))
+        predicted = group.sort_values(
+            ["score", "stock_code"],
+            ascending=[False, True],
+            kind="mergesort",
+        ).head(count)
+        ideal = group.sort_values(
+            ["target", "stock_code"],
+            ascending=[False, True],
+            kind="mergesort",
+        ).head(count)
+        predicted_gain = np.exp2(predicted["target"].to_numpy()) - 1.0
+        ideal_gain = np.exp2(ideal["target"].to_numpy()) - 1.0
+        ideal_dcg = float(np.sum(ideal_gain / discounts))
+        if ideal_dcg <= 0.0:
+            raise ValueError("daily NDCG ideal gain must be positive")
+        values.append(float(np.sum(predicted_gain / discounts) / ideal_dcg))
+    if not values:
+        raise ValueError("daily NDCG requires at least one date")
+    return float(np.mean(values))
+
+
+def mean_daily_spearman(
+    dates: pd.Series,
+    scores: np.ndarray,
+    targets: np.ndarray,
+) -> float:
+    """Return equal-date mean Spearman rank correlation."""
+    normalized_dates, score_values, target_values = _validated_ranking_arrays(
+        dates, scores, targets
+    )
+    values: list[float] = []
+    date_codes, unique_dates = pd.factorize(normalized_dates, sort=False)
+    for date_code, date in enumerate(unique_dates):
+        mask = date_codes == date_code
+        correlation = float(spearmanr(score_values[mask], target_values[mask]).statistic)
+        if not np.isfinite(correlation):
+            raise ValueError(f"daily Spearman is non-finite for {date.date()}")
+        values.append(correlation)
+    if not values:
+        raise ValueError("daily Spearman requires at least one date")
+    return float(np.mean(values))
 
 
 def sorted_group_layout(frame: pd.DataFrame) -> tuple[pd.DataFrame, np.ndarray]:
