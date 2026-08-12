@@ -67,13 +67,22 @@ def sample_top100_pairs(
         if broad.size == 0:
             raise ValueError(f"Top100 pair date {date.date()} has no broad opponents")
         for anchor in positives:
+            boundary_opponents = rng.choice(
+                boundary,
+                size=boundary_pairs_per_positive,
+                replace=boundary.size < boundary_pairs_per_positive,
+            )
+            unused_broad = np.setdiff1d(
+                broad, np.unique(boundary_opponents), assume_unique=False
+            )
+            broad_pool = unused_broad if unused_broad.size else broad
+            broad_opponents = rng.choice(
+                broad_pool,
+                size=broad_pairs_per_positive,
+                replace=broad_pool.size < broad_pairs_per_positive,
+            ).astype("int64", copy=False)
             opponents = np.concatenate(
-                (
-                    rng.choice(
-                        boundary, size=boundary_pairs_per_positive, replace=True
-                    ),
-                    rng.choice(broad, size=broad_pairs_per_positive, replace=True),
-                )
+                (boundary_opponents, broad_opponents)
             ).astype("int64", copy=False)
             left_parts.append(
                 np.full(len(opponents), anchor, dtype="int64")

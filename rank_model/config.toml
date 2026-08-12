@@ -29,6 +29,22 @@ lambda = 1.0
 
 [models.mlp_pairwise_rank]
 
+[models.mlp_top100_hybrid_rank]
+hidden_layers = [128, 64, 32]
+dropout = 0.1
+learning_rate = 0.0003
+weight_decay = 0.0001
+pairwise_weight = 0.1
+boundary_pairs_per_positive = 4
+broad_pairs_per_positive = 4
+dates_per_batch = 8
+max_epochs = 30
+patience = 4
+min_delta = 0.0001
+gradient_clip_norm = 1.0
+top_k = 100
+seed = 42
+
 [features]
 forbidden_columns = [
   "date",

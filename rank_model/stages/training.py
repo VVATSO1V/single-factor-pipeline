@@ -55,6 +55,7 @@ MODEL_NAMES = (
     "xgboost_pairwise_rank",
     "lightgbm_lambdarank",
     "mlp_pairwise_rank",
+    "mlp_top100_hybrid_rank",
 )
 _RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 _JOBLIB_NUMPY_SHAPE_WARNING = (
@@ -129,6 +130,59 @@ class TrainingOutcome:
     score_validation: np.ndarray
     model_objects: dict[str, Any]
     metadata: dict[str, Any]
+
+
+@dataclass
+class HybridEarlyStopping:
+    """Track and restore the best validation-NDCG PyTorch state."""
+
+    patience: int
+    min_delta: float
+    best_ndcg: float = -np.inf
+    best_rank_ic: float = np.nan
+    best_epoch: int = 0
+    non_improving_epochs: int = 0
+    best_state: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.patience, int)
+            or isinstance(self.patience, bool)
+            or self.patience <= 0
+        ):
+            raise ValueError("early-stopping patience must be a positive integer")
+        if not np.isfinite(self.min_delta) or self.min_delta < 0.0:
+            raise ValueError("early-stopping min_delta must be finite and nonnegative")
+
+    def is_improvement(self, ndcg: float) -> bool:
+        return bool(ndcg > self.best_ndcg + self.min_delta)
+
+    def consider(
+        self,
+        model: Any,
+        epoch: int,
+        ndcg: float,
+        rank_ic: float,
+    ) -> bool:
+        if not np.isfinite(ndcg) or not np.isfinite(rank_ic):
+            raise ValueError("early-stopping validation metrics must be finite")
+        if self.is_improvement(ndcg):
+            self.best_ndcg = float(ndcg)
+            self.best_rank_ic = float(rank_ic)
+            self.best_epoch = int(epoch)
+            self.best_state = {
+                name: value.detach().cpu().clone()
+                for name, value in model.state_dict().items()
+            }
+            self.non_improving_epochs = 0
+            return False
+        self.non_improving_epochs += 1
+        return self.non_improving_epochs >= self.patience
+
+    def restore(self, model: Any) -> None:
+        if self.best_state is None or self.best_epoch <= 0:
+            raise ValueError("early stopping has no best model state")
+        model.load_state_dict(self.best_state)
 
 
 Trainer = Callable[
@@ -688,6 +742,15 @@ def _hybrid_date_loss(
         raise ValueError("hybrid loss pair tensors must be vectors")
     if not (len(left) == len(right) == len(direction)) or len(left) == 0:
         raise ValueError("hybrid loss pair tensors must have equal nonzero length")
+    if (
+        bool((left < 0).any())
+        or bool((right < 0).any())
+        or bool((left >= len(scores)).any())
+        or bool((right >= len(scores)).any())
+    ):
+        raise ValueError("hybrid loss pair indices are outside the batch")
+    if not bool(torch.equal(date_codes[left], date_codes[right])):
+        raise ValueError("hybrid loss pairs must not cross dates")
     if not np.isfinite(pairwise_weight) or pairwise_weight < 0.0:
         raise ValueError("hybrid pairwise weight must be finite and nonnegative")
 
@@ -762,6 +825,21 @@ def _date_batch_ranges(
     return ranges
 
 
+def _date_batch_loss_scale(date_count: int, dates_per_batch: int) -> float:
+    """Keep a final partial batch proportional to its number of dates."""
+    if (
+        not isinstance(date_count, int)
+        or isinstance(date_count, bool)
+        or not isinstance(dates_per_batch, int)
+        or isinstance(dates_per_batch, bool)
+        or date_count <= 0
+        or dates_per_batch <= 0
+        or date_count > dates_per_batch
+    ):
+        raise ValueError("date batch loss scale requires valid positive date counts")
+    return float(date_count / dates_per_batch)
+
+
 def _hybrid_mlp_parameters(params: dict[str, Any]) -> dict[str, Any]:
     """Validate and normalize the explicit hybrid-MLP configuration."""
     try:
@@ -803,6 +881,8 @@ def _hybrid_mlp_parameters(params: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"hybrid MLP {name} must be a positive integer")
     if values["seed"] != FIXED_SEED:
         raise ValueError(f"hybrid MLP seed must be {FIXED_SEED}")
+    if values["top_k"] != 100:
+        raise ValueError("hybrid MLP top_k must be 100")
     if not 0.0 <= values["dropout"] < 1.0:
         raise ValueError("hybrid MLP dropout must be in [0, 1)")
     for name in ("learning_rate", "gradient_clip_norm"):
@@ -873,11 +953,9 @@ def train_mlp_top100_hybrid_rank(
         np.ascontiguousarray(train_date_codes, dtype=np.int64)
     )
 
-    best_ndcg = -np.inf
-    best_rank_ic = np.nan
-    best_epoch = 0
-    best_state: dict[str, Any] | None = None
-    non_improving_epochs = 0
+    stopping = HybridEarlyStopping(
+        patience=settings["patience"], min_delta=settings["min_delta"]
+    )
     optimizer_step_count = 0
     history: list[dict[str, Any]] = []
 
@@ -915,14 +993,17 @@ def train_mlp_top100_hybrid_rank(
                 batch_direction,
                 pairwise_weight=settings["pairwise_weight"],
             )
+            date_count = len(batch_codes)
+            scaled_batch_loss = batch_loss * _date_batch_loss_scale(
+                date_count, settings["dates_per_batch"]
+            )
             optimizer.zero_grad(set_to_none=True)
-            batch_loss.backward()
+            scaled_batch_loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(), settings["gradient_clip_norm"]
             )
             optimizer.step()
             optimizer_step_count += 1
-            date_count = len(batch_codes)
             epoch_date_count += date_count
             epoch_loss += float(batch_loss.detach()) * date_count
             epoch_mse += float(batch_mse) * date_count
@@ -941,7 +1022,7 @@ def train_mlp_top100_hybrid_rank(
         validation_rank_ic = mean_daily_spearman(
             validation["date"], validation_scores, validation_targets
         )
-        improved = validation_ndcg > best_ndcg + settings["min_delta"]
+        improved = stopping.is_improvement(validation_ndcg)
         history.append(
             {
                 "epoch": epoch,
@@ -953,23 +1034,12 @@ def train_mlp_top100_hybrid_rank(
                 "improved": bool(improved),
             }
         )
-        if improved:
-            best_ndcg = validation_ndcg
-            best_rank_ic = validation_rank_ic
-            best_epoch = epoch
-            best_state = {
-                name: value.detach().cpu().clone()
-                for name, value in model.state_dict().items()
-            }
-            non_improving_epochs = 0
-        else:
-            non_improving_epochs += 1
-            if non_improving_epochs >= settings["patience"]:
-                break
+        if stopping.consider(
+            model, epoch, validation_ndcg, validation_rank_ic
+        ):
+            break
 
-    if best_state is None or best_epoch == 0:
-        raise ValueError("hybrid MLP did not produce a finite best validation state")
-    model.load_state_dict(best_state)
+    stopping.restore(model)
     score_validation, validation_inference_seconds = _timed_prediction(
         lambda: _predict_mlp_rank_regression(model, x_validation)
     )
@@ -1019,10 +1089,10 @@ def train_mlp_top100_hybrid_rank(
         metadata={
             "hidden_layers": settings["hidden_layers"],
             "dropout": settings["dropout"],
-            "best_epoch": best_epoch,
+            "best_epoch": stopping.best_epoch,
             "stopped_epoch": stopped_epoch,
-            "best_validation_ndcg_100": best_ndcg,
-            "best_validation_rank_ic": best_rank_ic,
+            "best_validation_ndcg_100": stopping.best_ndcg,
+            "best_validation_rank_ic": stopping.best_rank_ic,
             "optimizer_step_count": optimizer_step_count,
             "training_history": history,
             "validation_inference_seconds": validation_inference_seconds,
@@ -1197,6 +1267,7 @@ MODEL_REGISTRY: dict[str, Trainer] = {
     "xgboost_pairwise_rank": train_xgboost_pairwise_rank,
     "lightgbm_lambdarank": train_lightgbm_lambdarank,
     "mlp_pairwise_rank": train_mlp_pairwise_rank,
+    "mlp_top100_hybrid_rank": train_mlp_top100_hybrid_rank,
 }
 
 
@@ -1441,16 +1512,44 @@ def _load_persisted_model(temporary_run: Path) -> Any:
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError("invalid PyTorch model architecture") from error
         model_name = architecture.get("model_name", "mlp_rank_regression")
-        if hidden_layers != MLP_HIDDEN_LAYERS:
-            raise ValueError("unexpected PyTorch MLP architecture")
         if model_name == "mlp_rank_regression":
-            if architecture.get("dropout") != MLP_DROPOUT:
+            if (
+                hidden_layers != MLP_HIDDEN_LAYERS
+                or architecture.get("dropout") != MLP_DROPOUT
+            ):
                 raise ValueError("unexpected rank-regression PyTorch MLP architecture")
             model = _build_mlp_rank_regression_model(input_dim, output_bias)
         elif model_name == "mlp_pairwise_rank":
-            if architecture.get("dropout") != MLP_DROPOUT or output_bias != 0.0:
+            if (
+                hidden_layers != MLP_HIDDEN_LAYERS
+                or architecture.get("dropout") != MLP_DROPOUT
+                or output_bias != 0.0
+            ):
                 raise ValueError("unexpected pairwise PyTorch MLP architecture")
             model = _build_mlp_pairwise_rank_model(input_dim)
+        elif model_name == "mlp_top100_hybrid_rank":
+            try:
+                dropout = float(architecture["dropout"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError("invalid hybrid PyTorch MLP architecture") from error
+            if (
+                not isinstance(hidden_layers, list)
+                or not hidden_layers
+                or any(
+                    not isinstance(width, int)
+                    or isinstance(width, bool)
+                    or width <= 0
+                    for width in hidden_layers
+                )
+                or not 0.0 <= dropout < 1.0
+            ):
+                raise ValueError("unexpected hybrid PyTorch MLP architecture")
+            model = _build_mlp_model(
+                input_dim,
+                hidden_layers=hidden_layers,
+                dropout=dropout,
+                output_bias=output_bias,
+            )
         else:
             raise ValueError("unexpected PyTorch MLP model name")
         model.load_state_dict(

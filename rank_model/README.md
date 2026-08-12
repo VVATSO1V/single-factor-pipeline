@@ -37,12 +37,35 @@ completed runs without selecting a winner, use:
 - `xgboost_pairwise_rank`
 - `lightgbm_lambdarank`
 - `mlp_pairwise_rank`
+- `mlp_top100_hybrid_rank`
 
 The four regression models fit the continuous percentile label. The three
-native rankers group observations strictly by trading date; no training pair or
-ranking query crosses dates. Training rows from 2019-2022 and their exit dates
-remain in that period. Validation rows and exits remain in 2023. All training
-dates receive equal total loss weight.
+native rankers and the hybrid MLP group observations strictly by trading date;
+no training pair or ranking query crosses dates. Training rows from 2019-2022
+and their exit dates remain in that period. Validation rows and exits remain in
+2023. All training dates receive equal total loss weight.
+
+`mlp_top100_hybrid_rank` combines equal-date rank MSE with a weighted pairwise
+loss between each realized training Top100 stock and lower-ranked opponents.
+It updates once per complete-date batch and restores the epoch with the highest
+2023 mean daily NDCG@100, subject to the configured patience and minimum delta.
+Rank IC is recorded at the selected epoch as a broad-ordering diagnostic. This
+is model selection on validation data, not a 2024-2025 test result.
+
+Run the hybrid candidate and compare it with the immutable baselines:
+
+```powershell
+& $python -m rank_model.pipeline --config rank_model\config.toml train `
+  --model mlp_top100_hybrid_rank `
+  --run-id real-2023-mlp-top100-hybrid
+
+& $python -m rank_model.pipeline --config rank_model\config.toml evaluate `
+  --run-id real-2023-mlp-top100-hybrid `
+  --split validation
+
+& $python -m rank_model.pipeline --config rank_model\config.toml compare `
+  --run-ids real-2023-ridge,real-2023-xgb-reg,real-2023-lgb-reg,real-2023-xgb-rank,real-2023-lgb-rank,real-2023-mlp-reg,real-2023-mlp-rank,real-2023-mlp-top100-hybrid
+```
 
 ## Data Contracts
 
