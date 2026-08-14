@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+import numpy as np
 import pandas as pd
 
 from rank_model.stages.dataset import file_sha256
@@ -31,6 +32,7 @@ STRATEGY_SLIPPAGE_BPS = 5.0
 STRATEGY_SELL_STAMP_DUTY_BPS = 5.0
 STRATEGY_LIMIT_TOLERANCE = 1e-8
 STRATEGY_ANNUALIZATION_DAYS = 252
+PREDICTION_COLUMNS = ("date", "stock_code", "score_raw", "split", "horizon")
 
 
 @dataclass(frozen=True)
@@ -113,6 +115,202 @@ def load_strategy_settings(config: Mapping[str, Any]) -> StrategySettings:
             settings, "annualization_days", STRATEGY_ANNUALIZATION_DAYS
         ),
     )
+
+
+def _calendar_dates(calendar: Any) -> pd.DatetimeIndex:
+    if isinstance(calendar, pd.DataFrame):
+        if "date" not in calendar:
+            raise ValueError("trading calendar is missing date")
+        values = calendar["date"]
+    else:
+        values = calendar
+    try:
+        dates = pd.DatetimeIndex(pd.to_datetime(values, errors="raise")).normalize()
+    except (TypeError, ValueError) as error:
+        raise ValueError("trading calendar dates are invalid") from error
+    if dates.has_duplicates:
+        raise ValueError("trading calendar contains duplicate dates")
+    return dates.sort_values()
+
+
+def _validate_predictions(
+    predictions: pd.DataFrame,
+    settings: StrategySettings,
+    calendar: Any = None,
+) -> pd.DataFrame:
+    if not isinstance(predictions, pd.DataFrame):
+        raise ValueError("predictions must be a DataFrame")
+    missing = sorted(set(PREDICTION_COLUMNS).difference(predictions.columns))
+    if missing:
+        raise ValueError(f"predictions are missing required columns: {missing}")
+
+    result = predictions.loc[:, list(PREDICTION_COLUMNS)].copy()
+    try:
+        result["date"] = pd.to_datetime(result["date"], errors="raise").dt.normalize()
+    except (TypeError, ValueError) as error:
+        raise ValueError("prediction dates are invalid") from error
+    result["stock_code"] = result["stock_code"].astype("string").str.strip()
+    if result.empty or result[["date", "stock_code"]].isna().any().any():
+        raise ValueError("prediction keys must be present")
+    if result["stock_code"].eq("").any():
+        raise ValueError("prediction stock codes must be present")
+    if result.duplicated(["date", "stock_code"]).any():
+        raise ValueError("predictions contain duplicate date,stock_code keys")
+
+    result["score_raw"] = pd.to_numeric(result["score_raw"], errors="coerce")
+    if not np.isfinite(result["score_raw"].to_numpy(dtype="float64")).all():
+        raise ValueError("prediction scores must be finite")
+    if not result["split"].astype("string").eq("test").all():
+        raise ValueError("predictions must contain only the test split")
+    horizons = pd.to_numeric(result["horizon"], errors="coerce")
+    if not horizons.eq(10).all():
+        raise ValueError("predictions must contain exact horizon metadata 10")
+    if result["date"].lt(settings.start).any() or result["date"].gt(settings.end).any():
+        raise ValueError("prediction dates are outside the strategy period")
+
+    counts = result.groupby("date", sort=False).size()
+    if not counts.eq(settings.expected_cross_section_size).all():
+        raise ValueError("prediction cross-section size is not exactly 1000")
+
+    if calendar is not None:
+        official = _calendar_dates(calendar)
+        if not result["date"].isin(official).all():
+            raise ValueError("prediction dates do not match the trading calendar")
+    return result
+
+
+def validate_prediction_calendar(
+    predictions: pd.DataFrame,
+    calendar: Any,
+    settings: StrategySettings,
+) -> None:
+    """Validate prediction keys, metadata, daily size, and official dates."""
+    _validate_predictions(predictions, settings, calendar)
+
+
+def select_daily_top(
+    predictions: pd.DataFrame,
+    settings: StrategySettings,
+    calendar: Any = None,
+) -> dict[pd.Timestamp, tuple[str, ...]]:
+    """Select each date's deterministic highest-scoring stock codes."""
+    normalized = _validate_predictions(predictions, settings, calendar)
+    selected: dict[pd.Timestamp, tuple[str, ...]] = {}
+    for date, group in normalized.groupby("date", sort=True):
+        ordered = group.sort_values(
+            ["score_raw", "stock_code"],
+            ascending=[False, True],
+            kind="mergesort",
+        )
+        selected[pd.Timestamp(date)] = tuple(
+            ordered.head(settings.top_k)["stock_code"].astype(str)
+        )
+    return selected
+
+
+def _row_value(row: Any, field: str) -> Any:
+    if isinstance(row, Mapping):
+        return row.get(field)
+    try:
+        return row[field]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+def _missing(value: Any) -> bool:
+    if value is None:
+        return True
+    try:
+        result = pd.isna(value)
+    except (TypeError, ValueError):
+        return False
+    return bool(result) if isinstance(result, (bool, np.bool_)) else False
+
+
+def _boolean_field(row: Any, field: str, missing_reason: str) -> tuple[bool, str] | None:
+    value = _row_value(row, field)
+    if _missing(value):
+        return False, missing_reason
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value), ""
+    if isinstance(value, (int, float, np.integer, np.floating)) and value in (0, 1):
+        return bool(value), ""
+    return False, missing_reason
+
+
+def _positive_number(row: Any, field: str) -> tuple[float | None, str | None]:
+    value = _row_value(row, field)
+    if _missing(value):
+        return None, field
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None, field
+    if not np.isfinite(number) or number <= 0:
+        return None, field
+    return number, None
+
+
+def _common_execution_data(row: Any) -> tuple[dict[str, float], tuple[bool, str] | None]:
+    price_record = _boolean_field(row, "has_price_record", "price_record")
+    if price_record is None or not price_record[0]:
+        return {}, (False, "price_record")
+    suspended = _boolean_field(row, "is_suspended", "suspension_status")
+    if suspended is None:
+        return {}, (False, "suspension_status")
+    if suspended[0]:
+        return {}, (False, "suspended")
+
+    values: dict[str, float] = {}
+    for field in ("raw_open", "post_open", "limit_down"):
+        number, reason = _positive_number(row, field)
+        if reason is not None:
+            return {}, (False, reason)
+        values[field] = number  # type: ignore[assignment]
+    return values, None
+
+
+def sell_decision(row: Any, settings: StrategySettings) -> tuple[bool, str]:
+    """Return whether an existing position may be sold at this open."""
+    values, blocked = _common_execution_data(row)
+    if blocked is not None:
+        return blocked
+    if values["raw_open"] <= values["limit_down"] + settings.limit_tolerance:
+        return False, "limit_down"
+    return True, "eligible"
+
+
+def buy_decision(row: Any, settings: StrategySettings) -> tuple[bool, str]:
+    """Return whether a new position may be bought at this open."""
+    values, blocked = _common_execution_data(row)
+    if blocked is not None:
+        return blocked
+
+    st = _boolean_field(row, "is_st", "st_status")
+    if st is None:
+        return False, "st_status"
+    if st[0]:
+        return False, "st"
+    listing_days = _row_value(row, "listing_days")
+    if _missing(listing_days):
+        return False, "listing_age"
+    try:
+        listing_days_value = float(listing_days)
+    except (TypeError, ValueError):
+        return False, "listing_age"
+    if not np.isfinite(listing_days_value) or listing_days_value < settings.min_listing_days:
+        return False, "listing_age"
+
+    limit_up, reason = _positive_number(row, "limit_up")
+    if reason is not None:
+        return False, reason
+    if limit_up <= values["limit_down"]:
+        return False, "limit_data"
+    if values["raw_open"] >= limit_up - settings.limit_tolerance:
+        return False, "limit_up"
+    if values["raw_open"] <= values["limit_down"] + settings.limit_tolerance:
+        return False, "limit_down"
+    return True, "eligible"
 
 
 def _require_sha256(value: Any, label: str) -> str:
