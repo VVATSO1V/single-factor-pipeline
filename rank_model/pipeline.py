@@ -306,6 +306,12 @@ def _validate_strategy_paths(
         raise ValueError(
             "paths.strategy_runs_dir must resolve to rank_model/strategy_runs"
         )
+    expected_comparison = (PACKAGE_DIR / "strategy_comparison.csv").resolve()
+    if resolved["strategy_comparison"] != expected_comparison:
+        raise ValueError(
+            "paths.strategy_comparison must resolve to "
+            "rank_model/strategy_comparison.csv"
+        )
     return resolved
 
 

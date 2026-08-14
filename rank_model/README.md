@@ -198,10 +198,13 @@ foreach ($model in $models) {
 & $python -m rank_model.pipeline --config rank_model\config.toml compare-strategy
 ```
 
-Both commands are immutable publishers. `backtest-strategy` fails when its
-model directory already exists, and `compare-strategy` fails when
-`strategy_comparison.csv` already exists. Delete neither output as part of a
-normal rerun.
+Both commands preserve immutable outputs. `backtest-strategy` fails when its
+model directory already exists. `compare-strategy` validates an existing CSV
+and sidecar against all five current run manifests and returns without rewriting
+either file when the pair is valid. A legacy CSV without a sidecar gains one
+only after its exact schema and values are proven equal to freshly derived run
+summaries. Tampered output, changed provenance, or any other incomplete pair
+fails without overwrite. Delete neither output as part of a normal rerun.
 
 The strategy period is the 485 official dates from 2024-01-02 through
 2025-12-31. A Top100 signal observed after the close on date T executes only at
@@ -274,6 +277,13 @@ counts, and SHA-256 hashes for all eight sealed inputs and six report outputs.
 forward simulation. `rank_model/strategy_comparison.csv` contains exactly five
 rows with `model_name` plus the exact strategy metric schema; it intentionally
 has no winner, decision, acceptance, rejection, or parameter-update field.
+The adjacent `rank_model/strategy_comparison.manifest.json` is the comparison
+commit marker. It binds the CSV's physical and canonical logical SHA-256 hashes,
+ordered column/type schema and row count, the relative paths and SHA-256 hashes
+of all five source strategy manifests, and a sealed contract hash over common
+settings, formulas, observation conventions, and source-input provenance. A
+first publication stages both files and rolls the CSV back if the sidecar cannot
+be committed, so readers never accept a CSV without its provenance seal.
 
 ## Artifacts
 

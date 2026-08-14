@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -838,6 +839,30 @@ _COMMON_STRATEGY_SOURCE_NAMES = tuple(
     for name in _STRATEGY_SOURCE_NAMES
     if name not in {"prediction", "prediction_manifest"}
 )
+_STRATEGY_COMPARISON_COLUMNS = ("model_name", *_SUMMARY_FORMULAS)
+_STRATEGY_COMPARISON_COLUMN_SCHEMA = (
+    ("model_name", "string"),
+    *(
+        (name, "integer" if name in _STRATEGY_INTEGER_METRICS else "number")
+        for name in _SUMMARY_FORMULAS
+    ),
+)
+_STRATEGY_COMPARISON_MANIFEST_NAMES = {
+    "schema_version",
+    "status",
+    "purpose",
+    "comparison",
+    "source_strategy_manifests",
+    "sealed_strategy_contract",
+}
+_STRATEGY_COMPARISON_FIELDS = {
+    "path",
+    "physical_sha256",
+    "logical_sha256",
+    "row_count",
+    "columns",
+    "column_schema",
+}
 
 
 def _load_strategy_market_panel(
@@ -1583,6 +1608,152 @@ def _strategy_artifact_row_counts(run_directory: Path) -> dict[str, int]:
         ) from error
 
 
+def _canonical_json_sha256(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _comparison_logical_sha256(frame: pd.DataFrame) -> str:
+    rows: list[list[str | int | float]] = []
+    for row in frame.itertuples(index=False, name=None):
+        normalized: list[str | int | float] = []
+        for (name, logical_type), value in zip(
+            _STRATEGY_COMPARISON_COLUMN_SCHEMA, row, strict=True
+        ):
+            if logical_type == "string":
+                normalized.append(str(value))
+            elif logical_type == "integer":
+                normalized.append(int(value))
+            else:
+                number = float(value)
+                if not np.isfinite(number):
+                    raise ValueError(f"strategy comparison value is not finite: {name}")
+                normalized.append(number)
+        rows.append(normalized)
+    return _canonical_json_sha256(
+        {"columns": list(_STRATEGY_COMPARISON_COLUMNS), "rows": rows}
+    )
+
+
+def _validated_comparison_csv(path: Path, expected: pd.DataFrame) -> pd.DataFrame:
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    try:
+        actual = pd.read_csv(path, float_precision="round_trip")
+    except Exception as error:
+        raise ValueError(f"strategy comparison CSV is unreadable: {path}") from error
+    if tuple(actual.columns) != _STRATEGY_COMPARISON_COLUMNS or len(actual) != len(
+        expected
+    ):
+        raise ValueError(f"strategy comparison CSV schema does not match: {path}")
+    try:
+        pd.testing.assert_frame_equal(actual, expected, check_exact=True)
+    except AssertionError as error:
+        raise ValueError(
+            f"strategy comparison CSV does not match sealed strategy summaries: {path}"
+        ) from error
+    return actual
+
+
+def _sealed_strategy_contract(
+    common_input_hashes: Mapping[str, str],
+) -> dict[str, Any]:
+    payload = {
+        "settings": _STRATEGY_SETTINGS_CONTRACT,
+        "formulas": _SUMMARY_FORMULAS,
+        "observation_conventions": _STRATEGY_OBSERVATION_CONVENTIONS,
+        "common_input_sha256": dict(common_input_hashes),
+    }
+    return {
+        "sha256": _canonical_json_sha256(payload),
+        "settings_sha256": _canonical_json_sha256(_STRATEGY_SETTINGS_CONTRACT),
+        "formulas_sha256": _canonical_json_sha256(_SUMMARY_FORMULAS),
+        "observation_conventions_sha256": _canonical_json_sha256(
+            _STRATEGY_OBSERVATION_CONVENTIONS
+        ),
+        "common_input_sha256": dict(common_input_hashes),
+    }
+
+
+def _strategy_comparison_manifest(
+    comparison_path: Path,
+    frame: pd.DataFrame,
+    source_manifests: Sequence[Mapping[str, str]],
+    sealed_contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "status": "completed",
+        "purpose": "frozen_rank_model_static_strategy_comparison_2024_2025",
+        "comparison": {
+            "path": comparison_path.name,
+            "physical_sha256": file_sha256(comparison_path),
+            "logical_sha256": _comparison_logical_sha256(frame),
+            "row_count": len(frame),
+            "columns": list(_STRATEGY_COMPARISON_COLUMNS),
+            "column_schema": [list(item) for item in _STRATEGY_COMPARISON_COLUMN_SCHEMA],
+        },
+        "source_strategy_manifests": [dict(item) for item in source_manifests],
+        "sealed_strategy_contract": dict(sealed_contract),
+    }
+
+
+def _validate_strategy_comparison_manifest(
+    manifest_path: Path,
+    comparison_path: Path,
+    expected: pd.DataFrame,
+    source_manifests: Sequence[Mapping[str, str]],
+    sealed_contract: Mapping[str, Any],
+) -> None:
+    manifest = _read_strategy_json(manifest_path, "strategy comparison manifest")
+    if (
+        set(manifest) != _STRATEGY_COMPARISON_MANIFEST_NAMES
+        or manifest.get("schema_version") != 1
+        or manifest.get("status") != "completed"
+        or manifest.get("purpose")
+        != "frozen_rank_model_static_strategy_comparison_2024_2025"
+    ):
+        raise ValueError(f"strategy comparison manifest contract is invalid: {manifest_path}")
+    if manifest.get("source_strategy_manifests") != [
+        dict(item) for item in source_manifests
+    ]:
+        raise ValueError(
+            "strategy comparison source strategy manifest identities do not match"
+        )
+    if manifest.get("sealed_strategy_contract") != dict(sealed_contract):
+        raise ValueError("strategy comparison manifest sealed contract does not match")
+    comparison = manifest.get("comparison")
+    if not isinstance(comparison, Mapping) or set(comparison) != _STRATEGY_COMPARISON_FIELDS:
+        raise ValueError(f"strategy comparison manifest schema is invalid: {manifest_path}")
+    if comparison.get("physical_sha256") != file_sha256(comparison_path):
+        raise ValueError("strategy comparison CSV physical hash does not match manifest")
+    actual = _validated_comparison_csv(comparison_path, expected)
+    expected_metadata = {
+        "path": comparison_path.name,
+        "physical_sha256": file_sha256(comparison_path),
+        "logical_sha256": _comparison_logical_sha256(actual),
+        "row_count": len(actual),
+        "columns": list(_STRATEGY_COMPARISON_COLUMNS),
+        "column_schema": [list(item) for item in _STRATEGY_COMPARISON_COLUMN_SCHEMA],
+    }
+    if dict(comparison) != expected_metadata:
+        raise ValueError(f"strategy comparison manifest metadata is invalid: {manifest_path}")
+
+
+def _temporary_comparison_path(destination: Path, suffix: str) -> Path:
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=suffix, dir=destination.parent
+    )
+    os.close(descriptor)
+    return Path(temporary_name)
+
+
 def compare_strategy_runs(
     run_root: Path,
     output_path: Path,
@@ -1592,19 +1763,37 @@ def compare_strategy_runs(
     names = tuple(model_names)
     if names != LOCKED_MODEL_NAMES:
         raise ValueError("strategy comparison requires exactly the five frozen models")
-    root = Path(run_root)
+    root = Path(run_root).resolve()
     if not root.is_dir():
         raise FileNotFoundError(root)
-    destination = Path(output_path)
+    destination = Path(output_path).resolve()
+    if (
+        root.name != "strategy_runs"
+        or destination.name != "strategy_comparison.csv"
+        or destination.parent != root.parent
+    ):
+        raise ValueError(
+            "strategy comparison output path must be the safe sibling of strategy_runs"
+        )
+    manifest_path = destination.with_suffix(".manifest.json")
     rows: list[dict[str, Any]] = []
     common_source_hashes: dict[str, str] | None = None
+    source_manifests: list[dict[str, str]] = []
     for model_name in names:
         run_directory = root / model_name
         if not run_directory.is_dir():
             raise FileNotFoundError(run_directory)
-        manifest = _read_strategy_json(run_directory / "manifest.json", "manifest")
+        source_manifest_path = run_directory / "manifest.json"
+        manifest = _read_strategy_json(source_manifest_path, "manifest")
         input_hashes = _validate_completed_strategy_manifest(
             manifest, model_name, run_directory
+        )
+        source_manifests.append(
+            {
+                "model_name": model_name,
+                "path": source_manifest_path.relative_to(destination.parent).as_posix(),
+                "sha256": file_sha256(source_manifest_path),
+            }
         )
         current_common_hashes = {
             name: input_hashes[name] for name in _COMMON_STRATEGY_SOURCE_NAMES
@@ -1654,29 +1843,75 @@ def compare_strategy_runs(
         }
         rows.append(row)
 
+    if common_source_hashes is None:
+        raise AssertionError("strategy comparison has no common source hashes")
+    frame = pd.DataFrame(rows, columns=_STRATEGY_COMPARISON_COLUMNS)
+    sealed_contract = _sealed_strategy_contract(common_source_hashes)
     lock = _acquire_strategy_lock(root / ".strategy-comparison.lock")
-    temporary: Path | None = None
+    temporary_csv: Path | None = None
+    temporary_manifest: Path | None = None
+    published_csv = False
     try:
-        if destination.exists():
-            raise FileExistsError(f"strategy comparison is immutable: {destination}")
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+        csv_exists = destination.exists()
+        manifest_exists = manifest_path.exists()
+        if manifest_exists and not csv_exists:
+            raise ValueError(
+                "incomplete strategy comparison publication: manifest exists without CSV"
+            )
+        if csv_exists:
+            actual = _validated_comparison_csv(destination, frame)
+            if manifest_exists:
+                _validate_strategy_comparison_manifest(
+                    manifest_path,
+                    destination,
+                    frame,
+                    source_manifests,
+                    sealed_contract,
+                )
+                return frame
+            temporary_manifest = _temporary_comparison_path(
+                manifest_path, ".manifest.tmp"
+            )
+            _write_json_file(
+                temporary_manifest,
+                _strategy_comparison_manifest(
+                    destination, actual, source_manifests, sealed_contract
+                ),
+            )
+            os.replace(temporary_manifest, manifest_path)
+            temporary_manifest = None
+            return frame
+
+        temporary_csv = _temporary_comparison_path(destination, ".csv.tmp")
+        frame.to_csv(temporary_csv, index=False)
+        temporary_manifest = _temporary_comparison_path(
+            manifest_path, ".manifest.tmp"
         )
-        os.close(descriptor)
-        temporary = Path(temporary_name)
-        frame = pd.DataFrame(rows)
-        frame.to_csv(temporary, index=False)
-        os.replace(temporary, destination)
-        temporary = None
+        _write_json_file(
+            temporary_manifest,
+            _strategy_comparison_manifest(
+                temporary_csv, frame, source_manifests, sealed_contract
+            ),
+        )
+        staged_manifest = _read_strategy_json(
+            temporary_manifest, "strategy comparison manifest"
+        )
+        staged_manifest["comparison"]["path"] = destination.name
+        _write_json_file(temporary_manifest, staged_manifest)
+        os.replace(temporary_csv, destination)
+        temporary_csv = None
+        published_csv = True
+        os.replace(temporary_manifest, manifest_path)
+        temporary_manifest = None
+        published_csv = False
         return frame
     finally:
         try:
-            if temporary is not None and temporary.exists():
-                try:
+            if published_csv and destination.exists() and not manifest_path.exists():
+                destination.unlink()
+            for temporary in (temporary_csv, temporary_manifest):
+                if temporary is not None and temporary.exists():
                     temporary.unlink()
-                except Exception:
-                    pass
         finally:
             _release_strategy_lock(lock)
 
