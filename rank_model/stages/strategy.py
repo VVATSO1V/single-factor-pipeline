@@ -697,6 +697,8 @@ _STRATEGY_OUTPUT_NAMES = (
 )
 _STRATEGY_SOURCE_NAMES = (
     "prediction",
+    "prediction_manifest",
+    "locked_test_schema",
     "market_panel",
     "trading_calendar",
     "frozen_models",
@@ -1104,6 +1106,57 @@ def _strategy_source_hashes(
     if model_name not in LOCKED_MODEL_NAMES:
         raise ValueError(f"strategy model is not frozen: {model_name}")
 
+    hashes = {name: file_sha256(path) for name, path in paths.items()}
+    try:
+        prediction_manifest = json.loads(
+            paths["prediction_manifest"].read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("locked-test prediction manifest is invalid") from error
+    if not isinstance(prediction_manifest, Mapping) or any(
+        (
+            prediction_manifest.get("status") != "completed",
+            prediction_manifest.get("purpose")
+            != "locked_test_static_inference_2024_2025",
+            prediction_manifest.get("run_id") != model_name,
+            prediction_manifest.get("model_name") != model_name,
+            prediction_manifest.get("uses_training") is not False,
+            prediction_manifest.get("uses_refit") is not False,
+            prediction_manifest.get("uses_validation") is not False,
+            prediction_manifest.get("uses_early_stopping") is not False,
+            prediction_manifest.get("uses_entry_tradeable") is not False,
+        )
+    ):
+        raise ValueError("locked-test prediction manifest is invalid")
+    if hashes["prediction"] != prediction_manifest.get("predictions_10d_sha256"):
+        raise ValueError("locked-test prediction hash does not match its manifest")
+    if hashes["locked_test_schema"] != prediction_manifest.get("test_schema_sha256"):
+        raise ValueError("locked-test schema hash does not match prediction manifest")
+    if hashes["frozen_models"] != prediction_manifest.get("frozen_spec_sha256"):
+        raise ValueError("frozen spec hash does not match prediction manifest")
+
+    try:
+        locked_test_schema = json.loads(
+            paths["locked_test_schema"].read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("locked-test schema is invalid") from error
+    if not isinstance(locked_test_schema, Mapping):
+        raise ValueError("locked-test schema must be an object")
+    if locked_test_schema.get("schema_version") != 1:
+        raise ValueError("locked-test schema version must be 1")
+    if locked_test_schema.get("purpose") != "locked_test_2024_2025":
+        raise ValueError("locked-test schema purpose is invalid")
+    if locked_test_schema.get("uses_entry_tradeable") is not False:
+        raise ValueError("locked-test schema entry-tradeable contract is invalid")
+    source_hashes = locked_test_schema.get("source_hashes")
+    if not isinstance(source_hashes, Mapping):
+        raise ValueError("locked-test schema source hashes are invalid")
+    if hashes["market_panel"] != source_hashes.get("market_panel"):
+        raise ValueError("locked-test schema market panel hash does not match")
+    if hashes["trading_calendar"] != source_hashes.get("trading_calendar"):
+        raise ValueError("locked-test schema trading calendar hash does not match")
+
     try:
         conclusion = json.loads(
             paths["locked_test_conclusion"].read_text(encoding="utf-8")
@@ -1135,7 +1188,6 @@ def _strategy_source_hashes(
     ):
         raise ValueError("locked-test conclusion prediction hashes are invalid")
 
-    hashes = {name: file_sha256(path) for name, path in paths.items()}
     if hashes["prediction"] != _require_sha256(
         prediction_hashes.get(model_name), f"{model_name} prediction"
     ):

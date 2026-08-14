@@ -521,6 +521,8 @@ def strategy_fixture(dates):
 def strategy_source_paths(directory: Path, model_name=MODEL_NAMES[0]):
     paths = {
         "prediction": directory / "predictions_10d.parquet",
+        "prediction_manifest": directory / "prediction_manifest.json",
+        "locked_test_schema": directory / "locked_test_schema.json",
         "market_panel": directory / "market_panel.csv",
         "trading_calendar": directory / "trading_calendar.csv",
         "frozen_models": directory / "frozen_models.json",
@@ -532,6 +534,35 @@ def strategy_source_paths(directory: Path, model_name=MODEL_NAMES[0]):
     paths["trading_calendar"].write_text("date\n", encoding="utf-8")
     paths["frozen_models"].write_text('{"candidate_count": 5}\n', encoding="utf-8")
     paths["locked_test_comparison"].write_text("model_name\n", encoding="utf-8")
+    locked_test_schema = {
+        "schema_version": 1,
+        "purpose": "locked_test_2024_2025",
+        "uses_entry_tradeable": False,
+        "source_hashes": {
+            "market_panel": sha256(paths["market_panel"]),
+            "trading_calendar": sha256(paths["trading_calendar"]),
+        },
+    }
+    paths["locked_test_schema"].write_text(
+        json.dumps(locked_test_schema), encoding="utf-8"
+    )
+    prediction_manifest = {
+        "status": "completed",
+        "purpose": "locked_test_static_inference_2024_2025",
+        "run_id": model_name,
+        "model_name": model_name,
+        "uses_training": False,
+        "uses_refit": False,
+        "uses_validation": False,
+        "uses_early_stopping": False,
+        "uses_entry_tradeable": False,
+        "predictions_10d_sha256": sha256(paths["prediction"]),
+        "test_schema_sha256": sha256(paths["locked_test_schema"]),
+        "frozen_spec_sha256": sha256(paths["frozen_models"]),
+    }
+    paths["prediction_manifest"].write_text(
+        json.dumps(prediction_manifest), encoding="utf-8"
+    )
     conclusion = {
         "schema_version": 1,
         "period": {"start": "2024-01-01", "end": "2025-12-31"},
@@ -552,6 +583,12 @@ def strategy_source_paths(directory: Path, model_name=MODEL_NAMES[0]):
         json.dumps(conclusion), encoding="utf-8"
     )
     return paths
+
+
+def update_json(path: Path, **changes):
+    value = json.loads(path.read_text(encoding="utf-8"))
+    value.update(changes)
+    path.write_text(json.dumps(value), encoding="utf-8")
 
 
 class PeriodAndReportingTests(unittest.TestCase):
@@ -905,6 +942,63 @@ class PeriodAndReportingTests(unittest.TestCase):
                     model_name=MODEL_NAMES[0],
                     source_paths=source_paths,
                 )
+
+    def test_publication_rejects_broken_market_calendar_schema_and_manifest_chain(self):
+        from rank_model.stages.strategy import simulate_strategy, write_strategy_run
+
+        predictions, market, calendar = strategy_fixture(self.dates)
+        bundle = simulate_strategy(predictions, market, calendar, SETTINGS)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            destination = directory / MODEL_NAMES[0]
+            cases = (
+                ("market_panel", "market panel hash"),
+                ("trading_calendar", "trading calendar hash"),
+                ("locked_test_schema_purpose", "locked-test schema purpose"),
+                ("locked_test_schema_version", "locked-test schema version"),
+                ("prediction_manifest_status", "prediction manifest is invalid"),
+                ("prediction_manifest_model", "prediction manifest is invalid"),
+            )
+            for source_name, expected_error in cases:
+                with self.subTest(source_name=source_name):
+                    source_paths = strategy_source_paths(directory)
+                    if source_name in ("market_panel", "trading_calendar"):
+                        source_paths[source_name].write_text(
+                            "unrelated contents", encoding="utf-8"
+                        )
+                    elif source_name.startswith("locked_test_schema"):
+                        update_json(
+                            source_paths["locked_test_schema"],
+                            **(
+                                {"purpose": "unrelated"}
+                                if source_name.endswith("purpose")
+                                else {"schema_version": 2}
+                            ),
+                        )
+                        update_json(
+                            source_paths["prediction_manifest"],
+                            test_schema_sha256=sha256(
+                                source_paths["locked_test_schema"]
+                            ),
+                        )
+                    elif source_name.endswith("status"):
+                        update_json(source_paths["prediction_manifest"], status="partial")
+                    else:
+                        update_json(
+                            source_paths["prediction_manifest"],
+                            model_name=MODEL_NAMES[1],
+                        )
+
+                    with self.assertRaisesRegex(ValueError, expected_error):
+                        write_strategy_run(
+                            bundle,
+                            destination,
+                            SETTINGS,
+                            model_name=MODEL_NAMES[0],
+                            source_paths=source_paths,
+                        )
+                    self.assertFalse(destination.exists())
 
     def test_publication_failures_leave_no_destination_and_release_lock(self):
         import rank_model.stages.strategy as strategy_stage
