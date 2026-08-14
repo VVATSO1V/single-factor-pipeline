@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import os
 from pathlib import Path
-from typing import Any, Mapping
+import shutil
+import tempfile
+from typing import Any, BinaryIO, Mapping
 
 import numpy as np
 import pandas as pd
@@ -337,6 +341,16 @@ class TransitionResult:
     end_nav: float
 
 
+@dataclass
+class StrategyBundle:
+    daily_nav: pd.DataFrame
+    trades: pd.DataFrame
+    positions: pd.DataFrame
+    execution_diagnostics: pd.DataFrame
+    ending_positions: pd.DataFrame
+    metrics_summary: dict[str, float | int]
+
+
 _TRADE_COLUMNS = (
     "stock_code",
     "signal_date",
@@ -632,6 +646,475 @@ def transition_at_open(
         total_cost=total_cost,
         end_nav=end_nav,
     )
+
+
+_DAILY_NAV_COLUMNS = (
+    "signal_date",
+    "pre_trade_nav",
+    "nav",
+    "gross_return",
+    "net_return",
+    "cash",
+    "cash_ratio",
+    "holding_count",
+    "desired_count",
+    "buy_notional",
+    "sell_notional",
+    "total_cost",
+    "gross_turnover",
+    "one_way_turnover",
+    "attempted_order_count",
+    "executed_order_count",
+    "blocked_order_count",
+)
+_POSITION_COLUMNS = ("date", "stock_code", "units", "last_mark", "market_value")
+_DIAGNOSTIC_COLUMNS = (
+    "signal_date",
+    "execution_date",
+    "pre_trade_nav",
+    "end_nav",
+    "total_cost",
+    "buy_scale",
+    "attempted_order_count",
+    "executed_order_count",
+    "blocked_order_count",
+    "replacement_buy_count",
+)
+_ENDING_POSITION_COLUMNS = (
+    "asset_type",
+    "stock_code",
+    "units",
+    "last_mark",
+    "market_value",
+)
+_STRATEGY_OUTPUT_NAMES = (
+    "daily_nav.csv",
+    "trades.parquet",
+    "positions.parquet",
+    "execution_diagnostics.csv",
+    "ending_positions.csv",
+    "metrics_summary.json",
+)
+
+
+def _normalize_market_panel(market: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(market, pd.DataFrame):
+        raise ValueError("market panel must be a DataFrame")
+    missing = sorted({"date", "stock_code"}.difference(market.columns))
+    if missing:
+        raise ValueError(f"market panel is missing key columns: {missing}")
+    result = market.copy()
+    try:
+        result["date"] = pd.to_datetime(result["date"], errors="raise").dt.normalize()
+    except (TypeError, ValueError) as error:
+        raise ValueError("market panel dates are invalid") from error
+    result["stock_code"] = result["stock_code"].astype("string").str.strip()
+    if result[["date", "stock_code"]].isna().any().any():
+        raise ValueError("market panel keys must be present")
+    if result["stock_code"].eq("").any():
+        raise ValueError("market panel stock codes must be present")
+    if result.duplicated(["date", "stock_code"]).any():
+        raise ValueError("market panel contains duplicate date,stock_code keys")
+    return result
+
+
+def _position_rows(state: PortfolioState, date: pd.Timestamp) -> list[dict[str, Any]]:
+    return [
+        {
+            "date": date,
+            "stock_code": stock_code,
+            "units": position.units,
+            "last_mark": position.last_mark,
+            "market_value": position.units * position.last_mark,
+        }
+        for stock_code, position in sorted(state.positions.items())
+    ]
+
+
+def _ending_position_frame(state: PortfolioState) -> pd.DataFrame:
+    rows = [
+        {
+            "asset_type": "position",
+            "stock_code": stock_code,
+            "units": position.units,
+            "last_mark": position.last_mark,
+            "market_value": position.units * position.last_mark,
+        }
+        for stock_code, position in sorted(state.positions.items())
+    ]
+    rows.append(
+        {
+            "asset_type": "cash",
+            "stock_code": "CASH",
+            "units": 1.0,
+            "last_mark": state.cash,
+            "market_value": state.cash,
+        }
+    )
+    return pd.DataFrame(rows, columns=_ENDING_POSITION_COLUMNS)
+
+
+def simulate_strategy(
+    predictions: pd.DataFrame,
+    market: pd.DataFrame,
+    calendar: Any,
+    settings: StrategySettings,
+) -> StrategyBundle:
+    """Run the static strategy from each official signal to the next open."""
+    official = _calendar_dates(calendar)
+    period_dates = official[(official >= settings.start) & (official <= settings.end)]
+    if period_dates.empty:
+        raise ValueError("strategy period has no official trading dates")
+    desired_by_date = select_daily_top(predictions, settings, official)
+    if set(desired_by_date) != set(period_dates):
+        raise ValueError("prediction dates must exactly match the strategy trading calendar")
+    market_panel = _normalize_market_panel(market)
+    market_by_date = {
+        pd.Timestamp(date): group.drop(columns="date").reset_index(drop=True)
+        for date, group in market_panel.groupby("date", sort=False)
+    }
+
+    first_date = pd.Timestamp(period_dates[0])
+    state = PortfolioState(cash=settings.initial_nav, positions={}, previous_nav=settings.initial_nav)
+    daily_rows: list[dict[str, Any]] = [
+        {
+            "date": first_date,
+            "signal_date": pd.NaT,
+            "pre_trade_nav": settings.initial_nav,
+            "nav": settings.initial_nav,
+            "gross_return": 0.0,
+            "net_return": 0.0,
+            "cash": settings.initial_nav,
+            "cash_ratio": 1.0,
+            "holding_count": 0,
+            "desired_count": settings.top_k,
+            "buy_notional": 0.0,
+            "sell_notional": 0.0,
+            "total_cost": 0.0,
+            "gross_turnover": 0.0,
+            "one_way_turnover": 0.0,
+            "attempted_order_count": 0,
+            "executed_order_count": 0,
+            "blocked_order_count": 0,
+        }
+    ]
+    trade_frames: list[pd.DataFrame] = []
+    position_rows: list[dict[str, Any]] = []
+    diagnostic_rows: list[dict[str, Any]] = []
+
+    for index in range(1, len(period_dates)):
+        signal_date = pd.Timestamp(period_dates[index - 1])
+        execution_date = pd.Timestamp(period_dates[index])
+        prior_nav = state.previous_nav
+        transition = transition_at_open(
+            state,
+            desired_by_date[signal_date],
+            market_by_date.get(execution_date, pd.DataFrame(columns=["stock_code"])),
+            signal_date,
+            execution_date,
+            settings,
+        )
+        state = transition.state
+        trades = transition.trades.reset_index()
+        if not trades.empty:
+            trade_frames.append(trades)
+        executed = trades["status"].eq("executed")
+        buy_notional = float(
+            trades.loc[executed & trades["side"].eq("buy"), "gross_notional"].sum()
+        )
+        sell_notional = float(
+            trades.loc[executed & trades["side"].eq("sell"), "gross_notional"].sum()
+        )
+        gross_turnover = (
+            (buy_notional + sell_notional) / transition.pre_trade_nav
+            if transition.pre_trade_nav > 0
+            else 0.0
+        )
+        daily_rows.append(
+            {
+                "date": execution_date,
+                "signal_date": signal_date,
+                "pre_trade_nav": transition.pre_trade_nav,
+                "nav": transition.end_nav,
+                "gross_return": (
+                    transition.pre_trade_nav / prior_nav - 1.0 if prior_nav > 0 else 0.0
+                ),
+                "net_return": transition.end_nav / prior_nav - 1.0 if prior_nav > 0 else 0.0,
+                "cash": state.cash,
+                "cash_ratio": state.cash / transition.end_nav if transition.end_nav > 0 else 0.0,
+                "holding_count": len(state.positions),
+                "desired_count": len(desired_by_date[signal_date]),
+                "buy_notional": buy_notional,
+                "sell_notional": sell_notional,
+                "total_cost": transition.total_cost,
+                "gross_turnover": gross_turnover,
+                "one_way_turnover": gross_turnover / 2.0,
+                "attempted_order_count": transition.diagnostics["attempted_order_count"],
+                "executed_order_count": transition.diagnostics["executed_order_count"],
+                "blocked_order_count": transition.diagnostics["blocked_order_count"],
+            }
+        )
+        position_rows.extend(_position_rows(state, execution_date))
+        diagnostic_rows.append(
+            {
+                "signal_date": signal_date,
+                "execution_date": execution_date,
+                **transition.diagnostics,
+            }
+        )
+
+    daily_nav = pd.DataFrame(daily_rows).set_index("date")
+    daily_nav.index = pd.DatetimeIndex(daily_nav.index, name="date")
+    daily_nav = daily_nav.loc[:, _DAILY_NAV_COLUMNS]
+    trades = (
+        pd.concat(trade_frames, ignore_index=True)
+        if trade_frames
+        else pd.DataFrame(columns=_TRADE_COLUMNS)
+    )
+    positions = pd.DataFrame(position_rows, columns=_POSITION_COLUMNS)
+    diagnostics = pd.DataFrame(diagnostic_rows, columns=_DIAGNOSTIC_COLUMNS)
+    bundle = StrategyBundle(
+        daily_nav=daily_nav,
+        trades=trades,
+        positions=positions,
+        execution_diagnostics=diagnostics,
+        ending_positions=_ending_position_frame(state),
+        metrics_summary={},
+    )
+    bundle.metrics_summary = summarize_strategy(bundle, settings)
+    return bundle
+
+
+def summarize_strategy(
+    bundle: StrategyBundle,
+    settings: StrategySettings,
+) -> dict[str, float | int]:
+    """Compute the fixed net-NAV, risk, execution, and turnover summary."""
+    if bundle.daily_nav.empty:
+        raise ValueError("strategy bundle has no daily NAV rows")
+    observations = bundle.daily_nav.iloc[1:]
+    returns = observations["net_return"].astype("float64")
+    elapsed = len(returns)
+    ending_nav = float(bundle.daily_nav["nav"].iloc[-1])
+    cumulative_return = ending_nav / settings.initial_nav - 1.0
+    if elapsed == 0:
+        cagr = 0.0
+    elif ending_nav <= 0:
+        cagr = -1.0
+    else:
+        cagr = (ending_nav / settings.initial_nav) ** (
+            settings.annualization_days / elapsed
+        ) - 1.0
+    daily_volatility = float(returns.std(ddof=1)) if elapsed > 1 else 0.0
+    if not np.isfinite(daily_volatility):
+        daily_volatility = 0.0
+    annualized_volatility = daily_volatility * np.sqrt(settings.annualization_days)
+    sharpe_ratio = (
+        float(returns.mean()) / daily_volatility * np.sqrt(settings.annualization_days)
+        if daily_volatility > 0
+        else 0.0
+    )
+    nav = bundle.daily_nav["nav"].astype("float64")
+    max_drawdown = float(-(nav / nav.cummax() - 1.0).min())
+    average_cash_ratio = float(bundle.daily_nav["cash_ratio"].mean())
+    average_gross_turnover = (
+        float(observations["gross_turnover"].mean()) if elapsed else 0.0
+    )
+    average_one_way_turnover = (
+        float(observations["one_way_turnover"].mean()) if elapsed else 0.0
+    )
+
+    trades = bundle.trades
+    buy_attempts = int(trades["side"].eq("buy").sum()) if not trades.empty else 0
+    sell_attempts = int(trades["side"].eq("sell").sum()) if not trades.empty else 0
+    executed = trades["status"].eq("executed") if not trades.empty else pd.Series(dtype=bool)
+    executed_buys = int((executed & trades["side"].eq("buy")).sum()) if not trades.empty else 0
+    executed_sells = int((executed & trades["side"].eq("sell")).sum()) if not trades.empty else 0
+    blocked_sales = (
+        trades["side"].eq("sell") & trades["status"].eq("blocked")
+        if not trades.empty
+        else pd.Series(dtype=bool)
+    )
+    blocked_sale_days = (
+        int(trades.loc[blocked_sales, "execution_date"].nunique()) if not trades.empty else 0
+    )
+    total_gross_turnover = float(observations["gross_turnover"].sum())
+    total_one_way_turnover = float(observations["one_way_turnover"].sum())
+    win_rate = float(returns.gt(0).mean()) if elapsed else 0.0
+    return {
+        "elapsed_trading_observations": elapsed,
+        "cumulative_return": cumulative_return,
+        "cagr": cagr,
+        "annualized_return": cagr,
+        "annualized_volatility": float(annualized_volatility),
+        "sharpe_ratio": float(sharpe_ratio),
+        "max_drawdown": max_drawdown,
+        "win_rate": win_rate,
+        "average_cash_ratio": average_cash_ratio,
+        "gross_turnover": total_gross_turnover,
+        "one_way_turnover": total_one_way_turnover,
+        "average_gross_turnover": average_gross_turnover,
+        "average_one_way_turnover": average_one_way_turnover,
+        "average_turnover": average_one_way_turnover,
+        "annualized_gross_turnover": average_gross_turnover * settings.annualization_days,
+        "annualized_one_way_turnover": average_one_way_turnover * settings.annualization_days,
+        "annualized_turnover": average_one_way_turnover * settings.annualization_days,
+        "total_cost": float(observations["total_cost"].sum()),
+        "buy_attempt_count": buy_attempts,
+        "sell_attempt_count": sell_attempts,
+        "buy_count": executed_buys,
+        "sell_count": executed_sells,
+        "buy_fill_rate": executed_buys / buy_attempts if buy_attempts else 0.0,
+        "sell_fill_rate": executed_sells / sell_attempts if sell_attempts else 0.0,
+        "blocked_sale_days": blocked_sale_days,
+        "ending_nav": ending_nav,
+    }
+
+
+def _acquire_strategy_lock(path: Path) -> BinaryIO:
+    handle = path.open("a+b")
+    if handle.seek(0, os.SEEK_END) == 0:
+        handle.write(b"0")
+        handle.flush()
+    handle.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        handle.close()
+        raise FileExistsError(f"another strategy publication holds: {path}") from error
+    return handle
+
+
+def _release_strategy_lock(handle: BinaryIO) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    handle.close()
+
+
+def _settings_manifest(settings: StrategySettings) -> dict[str, Any]:
+    return {
+        "start": settings.start.date().isoformat(),
+        "end": settings.end.date().isoformat(),
+        "top_k": settings.top_k,
+        "expected_cross_section_size": settings.expected_cross_section_size,
+        "min_listing_days": settings.min_listing_days,
+        "initial_nav": settings.initial_nav,
+        "commission_rate": settings.commission_rate,
+        "slippage_rate": settings.slippage_rate,
+        "sell_stamp_duty_rate": settings.sell_stamp_duty_rate,
+        "buy_cost_rate": settings.buy_cost_rate,
+        "sell_cost_rate": settings.sell_cost_rate,
+        "limit_tolerance": settings.limit_tolerance,
+        "annualization_days": settings.annualization_days,
+    }
+
+
+def _write_json_file(path: Path, value: Mapping[str, Any]) -> None:
+    path.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False)
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _validated_input_hashes(input_sha256: Mapping[str, str] | None) -> dict[str, str]:
+    if input_sha256 is None:
+        return {}
+    if not isinstance(input_sha256, Mapping):
+        raise ValueError("input SHA-256 contract must be a mapping")
+    result: dict[str, str] = {}
+    for name, value in input_sha256.items():
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("input SHA-256 artifact names must be present")
+        if not isinstance(value, str) or len(value) != 64:
+            raise ValueError(f"input SHA-256 is invalid: {name}")
+        try:
+            int(value, 16)
+        except ValueError as error:
+            raise ValueError(f"input SHA-256 is invalid: {name}") from error
+        result[name] = value.lower()
+    return result
+
+
+def write_strategy_run(
+    bundle: StrategyBundle,
+    destination: Path,
+    settings: StrategySettings,
+    *,
+    model_name: str | None = None,
+    input_sha256: Mapping[str, str] | None = None,
+) -> Path:
+    """Atomically publish one immutable strategy report directory."""
+    destination = Path(destination)
+    input_hashes = _validated_input_hashes(input_sha256)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    lock = _acquire_strategy_lock(destination.parent / ".strategy.lock")
+    staging: Path | None = None
+    try:
+        if destination.exists():
+            raise FileExistsError(f"strategy run already exists: {destination}")
+        staging = Path(
+            tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent)
+        )
+        bundle.daily_nav.reset_index().to_csv(staging / "daily_nav.csv", index=False)
+        bundle.trades.to_parquet(staging / "trades.parquet", index=False)
+        bundle.positions.to_parquet(staging / "positions.parquet", index=False)
+        bundle.execution_diagnostics.to_csv(
+            staging / "execution_diagnostics.csv", index=False
+        )
+        bundle.ending_positions.to_csv(staging / "ending_positions.csv", index=False)
+        _write_json_file(staging / "metrics_summary.json", bundle.metrics_summary)
+        output_hashes = {
+            name: file_sha256(staging / name) for name in _STRATEGY_OUTPUT_NAMES
+        }
+        manifest = {
+            "schema_version": 1,
+            "status": "completed",
+            "purpose": "frozen_rank_model_static_strategy_2024_2025",
+            "model_name": model_name or destination.name,
+            "settings": _settings_manifest(settings),
+            "rows": {
+                "daily_nav": len(bundle.daily_nav),
+                "execution_dates": len(bundle.execution_diagnostics),
+                "trades": len(bundle.trades),
+                "positions": len(bundle.positions),
+                "ending_positions": len(bundle.ending_positions),
+            },
+            "formulas": {
+                "cumulative_return": "ending_nav / initial_nav - 1",
+                "cagr": "(ending_nav / initial_nav) ** (annualization_days / elapsed_trading_observations) - 1",
+                "annualized_volatility": "sample_std(net_return) * sqrt(annualization_days)",
+                "sharpe_ratio": "mean(net_return) / sample_std(net_return) * sqrt(annualization_days)",
+                "max_drawdown": "max(1 - nav / running_max_nav)",
+                "gross_turnover": "(buy_notional + sell_notional) / pre_trade_nav",
+                "one_way_turnover": "gross_turnover / 2",
+                "annualized_turnover": "mean(daily_one_way_turnover) * annualization_days",
+            },
+            "input_sha256": input_hashes,
+            "output_sha256": output_hashes,
+        }
+        _write_json_file(staging / "manifest.json", manifest)
+        os.replace(staging, destination)
+        staging = None
+    finally:
+        if staging is not None and staging.exists():
+            shutil.rmtree(staging)
+        _release_strategy_lock(lock)
+    return destination
 
 
 def _require_sha256(value: Any, label: str) -> str:

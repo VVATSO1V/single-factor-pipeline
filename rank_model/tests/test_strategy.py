@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -483,3 +484,252 @@ class TransitionTests(unittest.TestCase):
                 self.execution_date,
                 SETTINGS,
             )
+
+
+def strategy_fixture(dates):
+    dates = pd.DatetimeIndex(pd.to_datetime(dates))
+    stock_codes = np.array([f"S{index:04d}" for index in range(1000)])
+    predictions = pd.DataFrame(
+        {
+            "date": np.repeat(dates.to_numpy(), len(stock_codes)),
+            "stock_code": np.tile(stock_codes, len(dates)),
+            "split": "test",
+            "horizon": 10,
+            "score_raw": np.tile(np.arange(1000, dtype="float64"), len(dates)),
+        }
+    )
+    selected_codes = stock_codes[-SETTINGS.top_k :]
+    execution_dates = dates[1:]
+    market = pd.DataFrame(
+        {
+            "date": np.repeat(execution_dates.to_numpy(), len(selected_codes)),
+            "stock_code": np.tile(selected_codes, len(execution_dates)),
+            "has_price_record": True,
+            "is_suspended": False,
+            "is_st": False,
+            "listing_days": 500.0,
+            "raw_open": 10.0,
+            "post_open": 10.0,
+            "limit_up": 11.0,
+            "limit_down": 9.0,
+        }
+    )
+    return predictions, market, dates
+
+
+class PeriodAndReportingTests(unittest.TestCase):
+    dates = pd.to_datetime(
+        ["2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"]
+    )
+
+    def test_signal_executes_on_next_official_date(self):
+        from rank_model.stages.strategy import simulate_strategy
+
+        predictions, market, calendar = strategy_fixture(self.dates)
+
+        bundle = simulate_strategy(predictions, market, calendar, SETTINGS)
+
+        self.assertEqual(
+            bundle.trades.iloc[0]["execution_date"], pd.Timestamp("2024-01-03")
+        )
+        self.assertEqual(
+            bundle.trades.iloc[0]["signal_date"], pd.Timestamp("2024-01-02")
+        )
+
+    def test_full_period_has_initial_row_and_484_executions(self):
+        from rank_model.stages.strategy import simulate_strategy
+
+        business_dates = pd.bdate_range("2024-01-02", "2025-12-31")
+        chosen = np.linspace(0, len(business_dates) - 1, 485, dtype=int)
+        calendar = business_dates[chosen]
+        predictions, market, calendar = strategy_fixture(calendar)
+
+        bundle = simulate_strategy(predictions, market, calendar, SETTINGS)
+
+        self.assertEqual(len(bundle.daily_nav), 485)
+        self.assertEqual(len(bundle.execution_diagnostics), 484)
+        self.assertEqual(bundle.daily_nav.index[0], pd.Timestamp("2024-01-02"))
+        self.assertEqual(bundle.daily_nav.index[-1], pd.Timestamp("2025-12-31"))
+        self.assertEqual(
+            bundle.execution_diagnostics.iloc[-1]["signal_date"], calendar[-2]
+        )
+        self.assertEqual(
+            bundle.execution_diagnostics.iloc[-1]["execution_date"], calendar[-1]
+        )
+
+    def test_missing_suspended_mark_is_carried_until_reopen(self):
+        from rank_model.stages.strategy import simulate_strategy
+
+        predictions, market, calendar = strategy_fixture(self.dates)
+        suspended_day = pd.Timestamp("2024-01-04")
+        reopen_day = pd.Timestamp("2024-01-05")
+        stock_code = "S0999"
+        suspended = market["date"].eq(suspended_day) & market["stock_code"].eq(
+            stock_code
+        )
+        market.loc[suspended, "has_price_record"] = False
+        market.loc[suspended, "is_suspended"] = True
+        market.loc[suspended, ["raw_open", "post_open", "limit_up", "limit_down"]] = np.nan
+        reopened = market["date"].eq(reopen_day) & market["stock_code"].eq(stock_code)
+        market.loc[reopened, "post_open"] = 20.0
+
+        bundle = simulate_strategy(predictions, market, calendar, SETTINGS)
+
+        self.assertEqual(bundle.daily_nav.loc[suspended_day, "gross_return"], 0.0)
+        self.assertNotEqual(bundle.daily_nav.loc[reopen_day, "gross_return"], 0.0)
+        final_position = bundle.ending_positions.loc[
+            bundle.ending_positions["stock_code"].eq(stock_code)
+        ].iloc[0]
+        self.assertEqual(final_position["last_mark"], 20.0)
+
+    def test_target_columns_cannot_change_strategy_output(self):
+        from rank_model.stages.strategy import simulate_strategy
+
+        predictions, market, calendar = strategy_fixture(self.dates)
+        first = simulate_strategy(predictions, market, calendar, SETTINGS)
+        changed = predictions.assign(target_10d=999.0, rank_target_10d=-999.0)
+        second = simulate_strategy(changed, market, calendar, SETTINGS)
+
+        pd.testing.assert_frame_equal(first.daily_nav, second.daily_nav)
+        pd.testing.assert_frame_equal(first.trades, second.trades)
+        pd.testing.assert_frame_equal(first.positions, second.positions)
+
+    def test_summary_uses_elapsed_returns_and_exact_report_columns(self):
+        from rank_model.stages.strategy import simulate_strategy, summarize_strategy
+
+        predictions, market, calendar = strategy_fixture(self.dates)
+        market.loc[market["date"].eq(self.dates[2]), "post_open"] = 11.0
+        market.loc[market["date"].eq(self.dates[3]), "post_open"] = 9.0
+        bundle = simulate_strategy(predictions, market, calendar, SETTINGS)
+
+        summary = summarize_strategy(bundle, SETTINGS)
+        returns = bundle.daily_nav["net_return"].iloc[1:]
+        cumulative = bundle.daily_nav["nav"].iloc[-1] / SETTINGS.initial_nav - 1.0
+        expected_cagr = (1.0 + cumulative) ** (
+            SETTINGS.annualization_days / len(returns)
+        ) - 1.0
+        expected_volatility = returns.std(ddof=1) * np.sqrt(
+            SETTINGS.annualization_days
+        )
+
+        self.assertAlmostEqual(summary["cumulative_return"], cumulative)
+        self.assertAlmostEqual(summary["cagr"], expected_cagr)
+        self.assertAlmostEqual(summary["annualized_volatility"], expected_volatility)
+        self.assertAlmostEqual(
+            summary["annualized_gross_turnover"],
+            bundle.daily_nav["gross_turnover"].iloc[1:].mean()
+            * SETTINGS.annualization_days,
+        )
+        self.assertEqual(summary, bundle.metrics_summary)
+        self.assertTrue(
+            {
+                "gross_return",
+                "net_return",
+                "cash_ratio",
+                "gross_turnover",
+                "one_way_turnover",
+                "attempted_order_count",
+                "executed_order_count",
+                "blocked_order_count",
+            }.issubset(bundle.daily_nav.columns)
+        )
+
+    def test_summary_reports_cost_fills_and_blocked_sale_days(self):
+        from rank_model.stages.strategy import simulate_strategy
+
+        predictions, market, calendar = strategy_fixture(self.dates)
+        replacement_codes = [f"S{index:04d}" for index in range(800, 900)]
+        replacement_signal = predictions["date"].eq(self.dates[1]) & predictions[
+            "stock_code"
+        ].isin(replacement_codes)
+        predictions.loc[replacement_signal, "score_raw"] += 2000.0
+        replacement_market = pd.DataFrame(
+            {
+                "date": np.repeat(self.dates[2:].to_numpy(), len(replacement_codes)),
+                "stock_code": np.tile(replacement_codes, len(self.dates[2:])),
+                "has_price_record": True,
+                "is_suspended": False,
+                "is_st": False,
+                "listing_days": 500.0,
+                "raw_open": 10.0,
+                "post_open": 10.0,
+                "limit_up": 11.0,
+                "limit_down": 9.0,
+            }
+        )
+        market = pd.concat([market, replacement_market], ignore_index=True)
+        blocked_sale = market["date"].eq(self.dates[2]) & market["stock_code"].eq(
+            "S0999"
+        )
+        market.loc[blocked_sale, "is_suspended"] = True
+
+        bundle = simulate_strategy(predictions, market, calendar, SETTINGS)
+        summary = bundle.metrics_summary
+
+        self.assertEqual(summary["buy_attempt_count"], 299)
+        self.assertEqual(summary["buy_count"], 299)
+        self.assertEqual(summary["sell_attempt_count"], 200)
+        self.assertEqual(summary["sell_count"], 199)
+        self.assertEqual(summary["buy_fill_rate"], 1.0)
+        self.assertEqual(summary["sell_fill_rate"], 199 / 200)
+        self.assertEqual(summary["blocked_sale_days"], 1)
+        self.assertAlmostEqual(summary["total_cost"], bundle.trades["cost"].sum())
+        self.assertEqual(
+            bundle.ending_positions["asset_type"].eq("position").sum(), 100
+        )
+
+    def test_publication_is_hashed_atomic_and_immutable(self):
+        from rank_model.stages.strategy import (
+            _acquire_strategy_lock,
+            _release_strategy_lock,
+            simulate_strategy,
+            write_strategy_run,
+        )
+
+        predictions, market, calendar = strategy_fixture(self.dates)
+        bundle = simulate_strategy(predictions, market, calendar, SETTINGS)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            destination = Path(temporary_directory) / "fixture-model"
+            with self.assertRaisesRegex(ValueError, "input SHA-256"):
+                write_strategy_run(
+                    bundle,
+                    destination,
+                    SETTINGS,
+                    input_sha256={"predictions_10d.parquet": "not-a-hash"},
+                )
+            self.assertFalse(destination.exists())
+            lock = _acquire_strategy_lock(destination.parent / ".strategy.lock")
+            try:
+                with self.assertRaisesRegex(FileExistsError, "publication"):
+                    write_strategy_run(bundle, destination, SETTINGS)
+            finally:
+                _release_strategy_lock(lock)
+            result = write_strategy_run(
+                bundle,
+                destination,
+                SETTINGS,
+                model_name="fixture-model",
+                input_sha256={"predictions_10d.parquet": "0" * 64},
+            )
+            manifest = json.loads(
+                (destination / "manifest.json").read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(result, destination)
+            self.assertEqual(manifest["status"], "completed")
+            self.assertEqual(
+                set(manifest["output_sha256"]),
+                {
+                    "daily_nav.csv",
+                    "trades.parquet",
+                    "positions.parquet",
+                    "execution_diagnostics.csv",
+                    "ending_positions.csv",
+                    "metrics_summary.json",
+                },
+            )
+            for name, expected_hash in manifest["output_sha256"].items():
+                self.assertEqual(sha256(destination / name), expected_hash)
+            with self.assertRaises(FileExistsError):
+                write_strategy_run(bundle, destination, SETTINGS)
