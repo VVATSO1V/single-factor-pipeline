@@ -46,6 +46,57 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def conclusion_contract_fixture(directory: Path):
+    frozen_spec = directory / "frozen_models.json"
+    comparison = directory / "locked_test_comparison.csv"
+    prediction = directory / "predictions_10d.parquet"
+    locked_test_schema = directory / "locked_test_schema.json"
+    frozen_spec.write_text('{"candidate_count": 5}', encoding="utf-8")
+    comparison.write_text("model_name\\n", encoding="utf-8")
+    prediction.write_bytes(b"original prediction bytes")
+    locked_test_schema.write_text('{"schema_version": 1}', encoding="utf-8")
+
+    prediction_manifests = {}
+    for model_name in MODEL_NAMES:
+        manifest = directory / f"{model_name}_run_manifest.json"
+        manifest.write_text(
+            json.dumps({"model_name": model_name}),
+            encoding="utf-8",
+        )
+        prediction_manifests[model_name] = manifest
+
+    conclusion = {
+        "schema_version": 1,
+        "period": {"start": "2024-01-01", "end": "2025-12-31"},
+        "selection_policy": "no_test_based_selection",
+        "retuning_allowed": False,
+        "strategy_models": list(MODEL_NAMES),
+        "artifact_sha256": {
+            "frozen_models": sha256(frozen_spec),
+            "locked_test_comparison": sha256(comparison),
+            "locked_test_schema": sha256(locked_test_schema),
+            "predictions": {
+                model_name: sha256(prediction) for model_name in MODEL_NAMES
+            },
+            "prediction_manifests": {
+                model_name: sha256(path)
+                for model_name, path in prediction_manifests.items()
+            },
+        },
+        "locked_test_metrics": [
+            {"model_name": model_name} for model_name in MODEL_NAMES
+        ],
+    }
+    return {
+        "frozen_spec": frozen_spec,
+        "comparison": comparison,
+        "prediction": prediction,
+        "locked_test_schema": locked_test_schema,
+        "prediction_manifests": prediction_manifests,
+        "conclusion": conclusion,
+    }
+
+
 class StrategyContractTests(unittest.TestCase):
     def test_fixed_settings_are_loaded_exactly(self):
         settings = load_strategy_settings(VALID_CONFIG)
@@ -57,36 +108,17 @@ class StrategyContractTests(unittest.TestCase):
 
     def test_conclusion_accepts_valid_sealed_inputs(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            directory = Path(temporary_directory)
-            frozen_spec = directory / "frozen_models.json"
-            comparison = directory / "locked_test_comparison.csv"
-            prediction = directory / "predictions_10d.parquet"
-            frozen_spec.write_text('{"candidate_count": 5}', encoding="utf-8")
-            comparison.write_text("model_name\\n", encoding="utf-8")
-            prediction.write_bytes(b"original prediction bytes")
-            conclusion = {
-                "schema_version": 1,
-                "period": {"start": "2024-01-01", "end": "2025-12-31"},
-                "selection_policy": "no_test_based_selection",
-                "retuning_allowed": False,
-                "strategy_models": list(MODEL_NAMES),
-                "artifact_sha256": {
-                    "frozen_models": sha256(frozen_spec),
-                    "locked_test_comparison": sha256(comparison),
-                    "predictions": {
-                        model_name: sha256(prediction) for model_name in MODEL_NAMES
-                    },
-                },
-                "locked_test_metrics": [
-                    {"model_name": model_name} for model_name in MODEL_NAMES
-                ],
-            }
+            fixture = conclusion_contract_fixture(Path(temporary_directory))
 
             result = validate_locked_test_conclusion(
-                conclusion=conclusion,
-                frozen_spec_path=frozen_spec,
-                comparison_path=comparison,
-                prediction_paths={model_name: prediction for model_name in MODEL_NAMES},
+                conclusion=fixture["conclusion"],
+                frozen_spec_path=fixture["frozen_spec"],
+                comparison_path=fixture["comparison"],
+                prediction_paths={
+                    model_name: fixture["prediction"] for model_name in MODEL_NAMES
+                },
+                locked_test_schema_path=fixture["locked_test_schema"],
+                prediction_manifest_paths=fixture["prediction_manifests"],
             )
 
         self.assertIsNone(result)
@@ -94,45 +126,96 @@ class StrategyContractTests(unittest.TestCase):
     def test_conclusion_rejects_changed_prediction_hash(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
-            frozen_spec = directory / "frozen_models.json"
-            comparison = directory / "locked_test_comparison.csv"
-            prediction = directory / "predictions_10d.parquet"
+            fixture = conclusion_contract_fixture(directory)
             changed_prediction = directory / "changed_predictions_10d.parquet"
-            frozen_spec.write_text('{"candidate_count": 5}', encoding="utf-8")
-            comparison.write_text("model_name\\n", encoding="utf-8")
-            prediction.write_bytes(b"original prediction bytes")
             changed_prediction.write_bytes(b"changed prediction bytes")
-            conclusion = {
-                "schema_version": 1,
-                "period": {"start": "2024-01-01", "end": "2025-12-31"},
-                "selection_policy": "no_test_based_selection",
-                "retuning_allowed": False,
-                "strategy_models": list(MODEL_NAMES),
-                "artifact_sha256": {
-                    "frozen_models": sha256(frozen_spec),
-                    "locked_test_comparison": sha256(comparison),
-                    "predictions": {
-                        model_name: sha256(prediction) for model_name in MODEL_NAMES
-                    },
-                },
-                "locked_test_metrics": [
-                    {"model_name": model_name} for model_name in MODEL_NAMES
-                ],
-            }
 
             with self.assertRaisesRegex(ValueError, "prediction hash"):
                 validate_locked_test_conclusion(
-                    conclusion=conclusion,
-                    frozen_spec_path=frozen_spec,
-                    comparison_path=comparison,
+                    conclusion=fixture["conclusion"],
+                    frozen_spec_path=fixture["frozen_spec"],
+                    comparison_path=fixture["comparison"],
                     prediction_paths={
                         model_name: (
                             changed_prediction
                             if model_name == "ridge_rank_regression"
-                            else prediction
+                            else fixture["prediction"]
                         )
                         for model_name in MODEL_NAMES
                     },
+                    locked_test_schema_path=fixture["locked_test_schema"],
+                    prediction_manifest_paths=fixture["prediction_manifests"],
+                )
+
+    def test_conclusion_requires_and_validates_schema_and_manifest_anchors(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            fixture = conclusion_contract_fixture(directory)
+            arguments = {
+                "frozen_spec_path": fixture["frozen_spec"],
+                "comparison_path": fixture["comparison"],
+                "prediction_paths": {
+                    model_name: fixture["prediction"] for model_name in MODEL_NAMES
+                },
+                "locked_test_schema_path": fixture["locked_test_schema"],
+                "prediction_manifest_paths": fixture["prediction_manifests"],
+            }
+
+            missing_schema = json.loads(json.dumps(fixture["conclusion"]))
+            del missing_schema["artifact_sha256"]["locked_test_schema"]
+            with self.assertRaisesRegex(ValueError, "schema hash"):
+                validate_locked_test_conclusion(
+                    conclusion=missing_schema,
+                    **arguments,
+                )
+
+            missing_manifest = json.loads(json.dumps(fixture["conclusion"]))
+            del missing_manifest["artifact_sha256"]["prediction_manifests"][
+                MODEL_NAMES[-1]
+            ]
+            with self.assertRaisesRegex(ValueError, "manifest hashes"):
+                validate_locked_test_conclusion(
+                    conclusion=missing_manifest,
+                    **arguments,
+                )
+
+            altered_schema = json.loads(json.dumps(fixture["conclusion"]))
+            altered_schema["artifact_sha256"]["locked_test_schema"] = "0" * 64
+            with self.assertRaisesRegex(ValueError, "schema hash"):
+                validate_locked_test_conclusion(
+                    conclusion=altered_schema,
+                    **arguments,
+                )
+
+            altered_manifest = json.loads(json.dumps(fixture["conclusion"]))
+            altered_manifest["artifact_sha256"]["prediction_manifests"][
+                MODEL_NAMES[0]
+            ] = "0" * 64
+            with self.assertRaisesRegex(ValueError, "prediction manifest hash"):
+                validate_locked_test_conclusion(
+                    conclusion=altered_manifest,
+                    **arguments,
+                )
+
+            incomplete_manifest_paths = dict(arguments)
+            incomplete_manifest_paths["prediction_manifest_paths"] = dict(
+                fixture["prediction_manifests"]
+            )
+            del incomplete_manifest_paths["prediction_manifest_paths"][MODEL_NAMES[-1]]
+            with self.assertRaisesRegex(ValueError, "manifest paths"):
+                validate_locked_test_conclusion(
+                    conclusion=fixture["conclusion"],
+                    **incomplete_manifest_paths,
+                )
+
+            fixture["prediction_manifests"][MODEL_NAMES[0]].write_text(
+                '{"model_name": "changed"}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "prediction manifest hash"):
+                validate_locked_test_conclusion(
+                    conclusion=fixture["conclusion"],
+                    **arguments,
                 )
 
 
@@ -572,8 +655,17 @@ def strategy_source_paths(directory: Path, model_name=MODEL_NAMES[0]):
         "artifact_sha256": {
             "frozen_models": sha256(paths["frozen_models"]),
             "locked_test_comparison": sha256(paths["locked_test_comparison"]),
+            "locked_test_schema": sha256(paths["locked_test_schema"]),
             "predictions": {
                 name: sha256(paths["prediction"]) if name == model_name else "0" * 64
+                for name in MODEL_NAMES
+            },
+            "prediction_manifests": {
+                name: (
+                    sha256(paths["prediction_manifest"])
+                    if name == model_name
+                    else "0" * 64
+                )
                 for name in MODEL_NAMES
             },
         },
@@ -955,10 +1047,10 @@ class PeriodAndReportingTests(unittest.TestCase):
             cases = (
                 ("market_panel", "market panel hash"),
                 ("trading_calendar", "trading calendar hash"),
-                ("locked_test_schema_purpose", "locked-test schema purpose"),
-                ("locked_test_schema_version", "locked-test schema version"),
-                ("prediction_manifest_status", "prediction manifest is invalid"),
-                ("prediction_manifest_model", "prediction manifest is invalid"),
+                ("locked_test_schema_purpose", "locked-test schema hash"),
+                ("locked_test_schema_version", "locked-test schema hash"),
+                ("prediction_manifest_status", "prediction manifest hash"),
+                ("prediction_manifest_model", "prediction manifest hash"),
             )
             for source_name, expected_error in cases:
                 with self.subTest(source_name=source_name):
@@ -999,6 +1091,113 @@ class PeriodAndReportingTests(unittest.TestCase):
                             source_paths=source_paths,
                         )
                     self.assertFalse(destination.exists())
+
+    def test_publication_rejects_coordinated_provenance_replacement(self):
+        from rank_model.stages.strategy import simulate_strategy, write_strategy_run
+
+        predictions, market, calendar = strategy_fixture(self.dates)
+        bundle = simulate_strategy(predictions, market, calendar, SETTINGS)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            destination = directory / MODEL_NAMES[0]
+            source_paths = strategy_source_paths(directory)
+            source_paths["market_panel"].write_text(
+                "date,stock_code\n2024-01-02,replacement\n",
+                encoding="utf-8",
+            )
+            source_paths["trading_calendar"].write_text(
+                "date\n2024-01-02\n",
+                encoding="utf-8",
+            )
+            source_paths["locked_test_schema"].write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "purpose": "locked_test_2024_2025",
+                        "uses_entry_tradeable": False,
+                        "source_hashes": {
+                            "market_panel": sha256(source_paths["market_panel"]),
+                            "trading_calendar": sha256(
+                                source_paths["trading_calendar"]
+                            ),
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            source_paths["prediction_manifest"].write_text(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "purpose": "locked_test_static_inference_2024_2025",
+                        "run_id": MODEL_NAMES[0],
+                        "model_name": MODEL_NAMES[0],
+                        "uses_training": False,
+                        "uses_refit": False,
+                        "uses_validation": False,
+                        "uses_early_stopping": False,
+                        "uses_entry_tradeable": False,
+                        "predictions_10d_sha256": sha256(
+                            source_paths["prediction"]
+                        ),
+                        "test_schema_sha256": sha256(
+                            source_paths["locked_test_schema"]
+                        ),
+                        "frozen_spec_sha256": sha256(
+                            source_paths["frozen_models"]
+                        ),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "locked-test (schema|prediction manifest) hash",
+            ):
+                write_strategy_run(
+                    bundle,
+                    destination,
+                    SETTINGS,
+                    model_name=MODEL_NAMES[0],
+                    source_paths=source_paths,
+                )
+            self.assertFalse(destination.exists())
+
+    def test_publication_rejects_missing_or_altered_conclusion_anchors(self):
+        from rank_model.stages.strategy import simulate_strategy, write_strategy_run
+
+        predictions, market, calendar = strategy_fixture(self.dates)
+        bundle = simulate_strategy(predictions, market, calendar, SETTINGS)
+
+        for case, expected_error in (
+            ("missing_schema", "schema hash"),
+            ("altered_manifest", "prediction manifest hash"),
+        ):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                destination = directory / MODEL_NAMES[0]
+                source_paths = strategy_source_paths(directory)
+                conclusion_path = source_paths["locked_test_conclusion"]
+                conclusion = json.loads(conclusion_path.read_text(encoding="utf-8"))
+                if case == "missing_schema":
+                    del conclusion["artifact_sha256"]["locked_test_schema"]
+                else:
+                    conclusion["artifact_sha256"]["prediction_manifests"][
+                        MODEL_NAMES[0]
+                    ] = "f" * 64
+                conclusion_path.write_text(json.dumps(conclusion), encoding="utf-8")
+
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    write_strategy_run(
+                        bundle,
+                        destination,
+                        SETTINGS,
+                        model_name=MODEL_NAMES[0],
+                        source_paths=source_paths,
+                    )
+                self.assertFalse(destination.exists())
 
     def test_publication_failures_leave_no_destination_and_release_lock(self):
         import rank_model.stages.strategy as strategy_stage

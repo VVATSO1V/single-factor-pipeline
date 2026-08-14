@@ -1108,6 +1108,48 @@ def _strategy_source_hashes(
 
     hashes = {name: file_sha256(path) for name, path in paths.items()}
     try:
+        conclusion = json.loads(
+            paths["locked_test_conclusion"].read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("locked-test conclusion is invalid") from error
+    if not isinstance(conclusion, Mapping):
+        raise ValueError("locked-test conclusion must be an object")
+    if conclusion.get("schema_version") != 1:
+        raise ValueError("locked-test conclusion schema version must be 1")
+    if conclusion.get("period") != {
+        "start": STRATEGY_START.strftime("%Y-%m-%d"),
+        "end": STRATEGY_END.strftime("%Y-%m-%d"),
+    }:
+        raise ValueError("locked-test conclusion period is invalid")
+    if conclusion.get("selection_policy") != "no_test_based_selection":
+        raise ValueError("locked-test conclusion selection policy is invalid")
+    if conclusion.get("retuning_allowed") is not False:
+        raise ValueError("locked-test conclusion must prohibit retuning")
+    if tuple(conclusion.get("strategy_models", ())) != LOCKED_MODEL_NAMES:
+        raise ValueError("locked-test conclusion must contain exactly the five frozen models")
+
+    (
+        expected_frozen_hash,
+        expected_comparison_hash,
+        expected_schema_hash,
+        prediction_hashes,
+        prediction_manifest_hashes,
+    ) = _locked_test_artifact_hashes(conclusion)
+    if hashes["locked_test_schema"] != expected_schema_hash:
+        raise ValueError("locked-test conclusion locked-test schema hash does not match")
+    if hashes["prediction_manifest"] != prediction_manifest_hashes[model_name]:
+        raise ValueError(
+            "locked-test conclusion locked-test prediction manifest hash does not match"
+        )
+    if hashes["prediction"] != prediction_hashes[model_name]:
+        raise ValueError("locked-test conclusion prediction hash does not match")
+    if hashes["frozen_models"] != expected_frozen_hash:
+        raise ValueError("locked-test conclusion frozen spec hash does not match")
+    if hashes["locked_test_comparison"] != expected_comparison_hash:
+        raise ValueError("locked-test conclusion comparison hash does not match")
+
+    try:
         prediction_manifest = json.loads(
             paths["prediction_manifest"].read_text(encoding="utf-8")
         )
@@ -1156,50 +1198,6 @@ def _strategy_source_hashes(
         raise ValueError("locked-test schema market panel hash does not match")
     if hashes["trading_calendar"] != source_hashes.get("trading_calendar"):
         raise ValueError("locked-test schema trading calendar hash does not match")
-
-    try:
-        conclusion = json.loads(
-            paths["locked_test_conclusion"].read_text(encoding="utf-8")
-        )
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise ValueError("locked-test conclusion is invalid") from error
-    if not isinstance(conclusion, Mapping):
-        raise ValueError("locked-test conclusion must be an object")
-    if conclusion.get("schema_version") != 1:
-        raise ValueError("locked-test conclusion schema version must be 1")
-    if conclusion.get("period") != {
-        "start": STRATEGY_START.strftime("%Y-%m-%d"),
-        "end": STRATEGY_END.strftime("%Y-%m-%d"),
-    }:
-        raise ValueError("locked-test conclusion period is invalid")
-    if conclusion.get("selection_policy") != "no_test_based_selection":
-        raise ValueError("locked-test conclusion selection policy is invalid")
-    if conclusion.get("retuning_allowed") is not False:
-        raise ValueError("locked-test conclusion must prohibit retuning")
-    if tuple(conclusion.get("strategy_models", ())) != LOCKED_MODEL_NAMES:
-        raise ValueError("locked-test conclusion must contain exactly the five frozen models")
-
-    artifact_hashes = conclusion.get("artifact_sha256")
-    if not isinstance(artifact_hashes, Mapping):
-        raise ValueError("locked-test conclusion is missing artifact hashes")
-    prediction_hashes = artifact_hashes.get("predictions")
-    if not isinstance(prediction_hashes, Mapping) or set(prediction_hashes) != set(
-        LOCKED_MODEL_NAMES
-    ):
-        raise ValueError("locked-test conclusion prediction hashes are invalid")
-
-    if hashes["prediction"] != _require_sha256(
-        prediction_hashes.get(model_name), f"{model_name} prediction"
-    ):
-        raise ValueError("locked-test conclusion prediction hash does not match")
-    if hashes["frozen_models"] != _require_sha256(
-        artifact_hashes.get("frozen_models"), "frozen spec"
-    ):
-        raise ValueError("locked-test conclusion frozen spec hash does not match")
-    if hashes["locked_test_comparison"] != _require_sha256(
-        artifact_hashes.get("locked_test_comparison"), "comparison"
-    ):
-        raise ValueError("locked-test conclusion comparison hash does not match")
     return hashes
 
 
@@ -1292,12 +1290,63 @@ def _require_sha256(value: Any, label: str) -> str:
     return value
 
 
+def _locked_test_artifact_hashes(conclusion: Mapping[str, Any]):
+    artifact_hashes = conclusion.get("artifact_sha256")
+    if not isinstance(artifact_hashes, Mapping):
+        raise ValueError("locked-test conclusion is missing artifact hashes")
+    expected_frozen_hash = _require_sha256(
+        artifact_hashes.get("frozen_models"), "frozen spec"
+    )
+    expected_comparison_hash = _require_sha256(
+        artifact_hashes.get("locked_test_comparison"), "comparison"
+    )
+    expected_schema_hash = _require_sha256(
+        artifact_hashes.get("locked_test_schema"), "locked-test schema"
+    )
+    prediction_hashes = artifact_hashes.get("predictions")
+    if not isinstance(prediction_hashes, Mapping) or set(prediction_hashes) != set(
+        LOCKED_MODEL_NAMES
+    ):
+        raise ValueError(
+            "locked-test conclusion must contain prediction hashes for five models"
+        )
+    prediction_manifest_hashes = artifact_hashes.get("prediction_manifests")
+    if not isinstance(prediction_manifest_hashes, Mapping) or set(
+        prediction_manifest_hashes
+    ) != set(LOCKED_MODEL_NAMES):
+        raise ValueError(
+            "locked-test conclusion must contain prediction manifest hashes for five models"
+        )
+    checked_prediction_hashes = {
+        model_name: _require_sha256(
+            prediction_hashes[model_name], f"{model_name} prediction"
+        )
+        for model_name in LOCKED_MODEL_NAMES
+    }
+    checked_manifest_hashes = {
+        model_name: _require_sha256(
+            prediction_manifest_hashes[model_name],
+            f"{model_name} prediction manifest",
+        )
+        for model_name in LOCKED_MODEL_NAMES
+    }
+    return (
+        expected_frozen_hash,
+        expected_comparison_hash,
+        expected_schema_hash,
+        checked_prediction_hashes,
+        checked_manifest_hashes,
+    )
+
+
 def validate_locked_test_conclusion(
     *,
     conclusion: Mapping[str, Any],
     frozen_spec_path: Path,
     comparison_path: Path,
     prediction_paths: Mapping[str, Path],
+    locked_test_schema_path: Path,
+    prediction_manifest_paths: Mapping[str, Path],
 ) -> None:
     """Verify that the sealed conclusion still binds every strategy input."""
     if conclusion.get("schema_version") != 1:
@@ -1322,28 +1371,37 @@ def validate_locked_test_conclusion(
     if tuple(row.get("model_name") for row in metrics if isinstance(row, Mapping)) != LOCKED_MODEL_NAMES:
         raise ValueError("locked-test conclusion metric rows must cover frozen models")
 
-    artifact_hashes = conclusion.get("artifact_sha256")
-    if not isinstance(artifact_hashes, Mapping):
-        raise ValueError("locked-test conclusion is missing artifact hashes")
-    expected_frozen_hash = _require_sha256(artifact_hashes.get("frozen_models"), "frozen spec")
-    expected_comparison_hash = _require_sha256(
-        artifact_hashes.get("locked_test_comparison"), "comparison"
-    )
-    prediction_hashes = artifact_hashes.get("predictions")
-    if not isinstance(prediction_hashes, Mapping) or set(prediction_hashes) != set(
-        LOCKED_MODEL_NAMES
-    ):
-        raise ValueError("locked-test conclusion must contain prediction hashes for five models")
+    (
+        expected_frozen_hash,
+        expected_comparison_hash,
+        expected_schema_hash,
+        prediction_hashes,
+        prediction_manifest_hashes,
+    ) = _locked_test_artifact_hashes(conclusion)
 
     if file_sha256(Path(frozen_spec_path)) != expected_frozen_hash:
         raise ValueError("locked-test conclusion frozen spec hash does not match")
     if file_sha256(Path(comparison_path)) != expected_comparison_hash:
         raise ValueError("locked-test conclusion comparison hash does not match")
+    if file_sha256(Path(locked_test_schema_path)) != expected_schema_hash:
+        raise ValueError("locked-test conclusion locked-test schema hash does not match")
     if set(prediction_paths) != set(LOCKED_MODEL_NAMES):
         raise ValueError("locked-test conclusion requires prediction paths for five models")
-    for model_name in LOCKED_MODEL_NAMES:
-        expected_prediction_hash = _require_sha256(
-            prediction_hashes[model_name], f"{model_name} prediction"
+    if set(prediction_manifest_paths) != set(LOCKED_MODEL_NAMES):
+        raise ValueError(
+            "locked-test conclusion requires prediction manifest paths for five models"
         )
-        if file_sha256(Path(prediction_paths[model_name])) != expected_prediction_hash:
-            raise ValueError(f"locked-test conclusion prediction hash does not match: {model_name}")
+    for model_name in LOCKED_MODEL_NAMES:
+        if file_sha256(Path(prediction_paths[model_name])) != prediction_hashes[
+            model_name
+        ]:
+            raise ValueError(
+                f"locked-test conclusion prediction hash does not match: {model_name}"
+            )
+        if file_sha256(
+            Path(prediction_manifest_paths[model_name])
+        ) != prediction_manifest_hashes[model_name]:
+            raise ValueError(
+                "locked-test conclusion prediction manifest hash does not match: "
+                f"{model_name}"
+            )

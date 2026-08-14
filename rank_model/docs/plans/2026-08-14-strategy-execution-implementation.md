@@ -36,7 +36,7 @@
 - Modify: `rank_model/stages/strategy.py`
 
 **Interfaces:**
-- Consumes: the existing frozen specification and locked-test comparison/prediction hashes.
+- Consumes: the existing frozen specification, locked-test comparison, locked-test schema, five prediction files, and five prediction manifests.
 - Produces: `StrategySettings`, `load_strategy_settings(config)`, and `validate_locked_test_conclusion(...)`.
 
 - [ ] **Step 1: Write failing configuration and conclusion tests**
@@ -57,6 +57,8 @@ class StrategyContractTests(unittest.TestCase):
                 frozen_spec_path=frozen_spec,
                 comparison_path=comparison,
                 prediction_paths={"ridge_rank_regression": changed_prediction},
+                locked_test_schema_path=locked_test_schema,
+                prediction_manifest_paths=prediction_manifests,
             )
 ```
 
@@ -115,12 +117,16 @@ class StrategySettings:
 `validate_locked_test_conclusion` must require exactly the five frozen models,
 the exact 2024-2025 boundary, `selection_policy = "no_test_based_selection"`,
 and exact SHA-256 matches for `frozen_models.json`, the locked-test comparison,
-and every prediction file.
+the locked-test schema, every prediction file, and every locked-test prediction
+manifest. `artifact_sha256.prediction_manifests` and the supplied manifest-path
+mapping must each contain exactly all five frozen model names.
 
 - [ ] **Step 5: Populate the tracked conclusion snapshot**
 
 Record the existing five test metric rows and artifact hashes without adding a
-winner or recommendation field. Include:
+winner or recommendation field. The artifact hashes must include
+`locked_test_schema`, all five `predictions`, and all five
+`prediction_manifests`. Include:
 
 ```json
 {
@@ -332,7 +338,13 @@ volatility, zero-rate Sharpe, max drawdown, win rate, average cash ratio, gross
 and one-way turnover, annualized turnover, total cost, fill rates, blocked-sale
 days, and ending NAV. Write through a sibling temporary directory, hash every
 artifact, write the manifest last, then atomically rename. Reject an existing
-destination and protect publication with a process lock.
+destination and protect publication with a process lock. Require exactly eight
+source paths: prediction, prediction manifest, locked-test schema, market
+panel, trading calendar, frozen models, locked-test conclusion, and locked-test
+comparison. Before trusting the manifest or schema contents, require their
+actual hashes to match the schema and exact five-model manifest anchors in the
+sealed conclusion; then validate the manifest-to-schema-to-market/calendar
+provenance chain.
 
 - [ ] **Step 5: Run tests and commit**
 

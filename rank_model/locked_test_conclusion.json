@@ -16,12 +16,20 @@
     "artifact_sha256":  {
                             "frozen_models":  "dab7b46711906853a7785825c899de1fdffd37b244cf1a97f5af55b80092dd38",
                             "locked_test_comparison":  "901fcc8eaeef3f968aac587333c82957bd067bc24d370f00eb599f677ddb4e76",
+                            "locked_test_schema":  "c0dcfed0b4b6f2a104f57847d9881ee1dfe1d26009e66ebacaae27a5df2fe305",
                             "predictions":  {
                                                 "ridge_rank_regression":  "a9d8c26861b99773d4ca47a2ae1a284b2d55836c61a251f5884c990e4094b633",
                                                 "xgboost_rank_regression":  "a5399a72f5d504a27672032663b589523ce3b743193a78a62ec3bb339e28eac6",
                                                 "lightgbm_rank_regression":  "1ee3565efc44fe7445c85eca5927d1b5d30599b23c34eabb753fd6cd32da1670",
                                                 "lightgbm_lambdarank":  "ba317b60dd5e8eb6f2dfd4b1ca57d2cafa6b92784dce59a3325b9194d4d89b4a",
                                                 "mlp_top100_hybrid_rank":  "a3545bcfdb519b651e16180f381d905c3ee0206df44db02d8673b691d8dbccda"
+                                            },
+                            "prediction_manifests":  {
+                                                        "ridge_rank_regression":  "aabe4c246deb48bc32976840b09820de9842af8cc702826829f36c880de72bda",
+                                                        "xgboost_rank_regression":  "cde2465a5495987e7559fcc0e6fdf6a9300fb28a8c2888cdfacea8d58b6ccc96",
+                                                        "lightgbm_rank_regression":  "31cd898419946a6207163d73c3df87c0ca481b77f655186c3ed63db9b5fd2331",
+                                                        "lightgbm_lambdarank":  "71a0b941d6f1547745e004be62a780138a44b4265351c8d14e97eb895fb18cb6",
+                                                        "mlp_top100_hybrid_rank":  "ec008fa28b7459a96bd14f2b1721c176b00fac1723ecd0eb3b6d16f5f4d7f6cb"
                                             }
                         },
     "locked_test_metrics":  [
