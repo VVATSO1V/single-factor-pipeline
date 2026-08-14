@@ -54,6 +54,11 @@ from rank_model.stages.locked_test import (
     predict_locked_test_model,
     prepare_locked_test_dataset,
 )
+from rank_model.stages.strategy import (
+    backtest_locked_strategy,
+    compare_strategy_runs,
+    load_strategy_settings,
+)
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -136,6 +141,8 @@ def load_config(config_path: Path) -> dict[str, Any]:
             f"mad_width={LOCKED_MAD_WIDTH}, windows={list(LOCKED_WINDOWS)}, "
             f"cap_coverage_threshold={LOCKED_CAP_COVERAGE_THRESHOLD}"
         )
+    load_strategy_settings(config)
+    _validate_strategy_paths(config, path)
     return config
 
 
@@ -264,6 +271,44 @@ def _validate_locked_test_paths(
     return resolved
 
 
+def _validate_strategy_paths(
+    config: dict[str, Any], config_path: Path
+) -> dict[str, Path]:
+    source_names = ("market_panel", "trading_calendar")
+    sealed_names = (
+        "locked_test_schema",
+        "locked_test_runs_dir",
+        "frozen_spec",
+        "locked_test_conclusion",
+        "locked_test_comparison",
+    )
+    output_names = ("strategy_runs_dir", "strategy_comparison")
+    required = (*source_names, *sealed_names, *output_names)
+    try:
+        resolved = {
+            name: resolve_config_path(config_path, config["paths"][name])
+            for name in required
+        }
+    except (KeyError, TypeError) as error:
+        raise ValueError("strategy paths are incomplete") from error
+    for name in source_names:
+        if not _is_model_data_path(resolved[name]):
+            raise ValueError(f"paths.{name} must resolve directly under model/data")
+    for name in (*sealed_names, *output_names):
+        if not _is_within(resolved[name], PACKAGE_DIR) or _is_inside_model_data(
+            resolved[name]
+        ):
+            raise ValueError(
+                f"paths.{name} must resolve under rank_model outside model/data"
+            )
+    expected_runs_directory = (PACKAGE_DIR / "strategy_runs").resolve()
+    if resolved["strategy_runs_dir"] != expected_runs_directory:
+        raise ValueError(
+            "paths.strategy_runs_dir must resolve to rank_model/strategy_runs"
+        )
+    return resolved
+
+
 def command_prepare_test(config: dict[str, Any], config_path: Path) -> dict[str, Any]:
     """Publish the sealed local 2024-2025 rank-model dataset."""
     paths = _validate_configured_paths(config, config_path)
@@ -346,6 +391,42 @@ def command_compare_test(
         output_runs_directory=paths["locked_test_runs_dir"],
         output_path=paths["locked_test_comparison"],
         model_names=LOCKED_MODEL_NAMES,
+    )
+
+
+def command_backtest_strategy(
+    config: dict[str, Any], config_path: Path, model_name: str
+) -> Path:
+    """Run and publish one immutable frozen-model strategy report."""
+    paths = _validate_strategy_paths(config, config_path)
+    locked_run_directory = paths["locked_test_runs_dir"] / model_name
+    source_paths = {
+        "prediction": locked_run_directory / "predictions_10d.parquet",
+        "prediction_manifest": locked_run_directory / "manifest.json",
+        "locked_test_schema": paths["locked_test_schema"],
+        "market_panel": paths["market_panel"],
+        "trading_calendar": paths["trading_calendar"],
+        "frozen_models": paths["frozen_spec"],
+        "locked_test_conclusion": paths["locked_test_conclusion"],
+        "locked_test_comparison": paths["locked_test_comparison"],
+    }
+    return backtest_locked_strategy(
+        model_name,
+        destination=paths["strategy_runs_dir"] / model_name,
+        settings=load_strategy_settings(config),
+        source_paths=source_paths,
+    )
+
+
+def command_compare_strategy(
+    config: dict[str, Any], config_path: Path
+) -> pd.DataFrame:
+    """Publish one descriptive comparison for all frozen-model strategies."""
+    paths = _validate_strategy_paths(config, config_path)
+    return compare_strategy_runs(
+        paths["strategy_runs_dir"],
+        paths["strategy_comparison"],
+        LOCKED_MODEL_NAMES,
     )
 
 
@@ -682,6 +763,15 @@ def make_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "compare-test", help="Compare all completed locked-test model reports."
     )
+    strategy_parser = subparsers.add_parser(
+        "backtest-strategy", help="Run one frozen model's static strategy."
+    )
+    strategy_parser.add_argument(
+        "--model", required=True, choices=LOCKED_MODEL_NAMES
+    )
+    subparsers.add_parser(
+        "compare-strategy", help="Compare all five completed strategy runs."
+    )
     return parser
 
 
@@ -778,6 +868,24 @@ def main() -> None:
             parser = make_parser()
             parser.error(str(error))
         print(f"locked-test comparison written: rows={len(comparison)}")
+        return
+    if args.command == "backtest-strategy":
+        try:
+            directory = command_backtest_strategy(
+                config, config_path, args.model
+            )
+        except (FileNotFoundError, ValueError, FileExistsError) as error:
+            parser = make_parser()
+            parser.error(str(error))
+        print(f"strategy run written: {directory}")
+        return
+    if args.command == "compare-strategy":
+        try:
+            comparison = command_compare_strategy(config, config_path)
+        except (FileNotFoundError, ValueError, FileExistsError) as error:
+            parser = make_parser()
+            parser.error(str(error))
+        print(f"strategy comparison written: rows={len(comparison)}")
         return
     if args.command != "prepare":
         raise NotImplementedError(f"{args.command} is not wired in this task")

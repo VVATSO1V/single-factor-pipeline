@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import tempfile
 import unittest
@@ -677,6 +678,96 @@ def strategy_source_paths(directory: Path, model_name=MODEL_NAMES[0]):
     return paths
 
 
+def executable_strategy_source_paths(directory: Path, model_name=MODEL_NAMES[0]):
+    paths = strategy_source_paths(directory, model_name)
+    dates = pd.to_datetime(["2024-01-02", "2024-01-03"])
+    predictions, market, calendar = strategy_fixture(dates)
+    predictions.to_parquet(paths["prediction"], index=False)
+    market.to_csv(paths["market_panel"], index=False)
+    pd.DataFrame({"date": calendar}).to_csv(paths["trading_calendar"], index=False)
+    paths["frozen_models"].write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "candidate_count": len(MODEL_NAMES),
+                "candidates": [
+                    {"model_name": name} for name in MODEL_NAMES
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    pd.DataFrame({"model_name": MODEL_NAMES}).to_csv(
+        paths["locked_test_comparison"], index=False
+    )
+    paths["locked_test_schema"].write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "purpose": "locked_test_2024_2025",
+                "uses_entry_tradeable": False,
+                "source_hashes": {
+                    "market_panel": sha256(paths["market_panel"]),
+                    "trading_calendar": sha256(paths["trading_calendar"]),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    paths["prediction_manifest"].write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "purpose": "locked_test_static_inference_2024_2025",
+                "run_id": model_name,
+                "model_name": model_name,
+                "uses_training": False,
+                "uses_refit": False,
+                "uses_validation": False,
+                "uses_early_stopping": False,
+                "uses_entry_tradeable": False,
+                "predictions_10d_sha256": sha256(paths["prediction"]),
+                "test_schema_sha256": sha256(paths["locked_test_schema"]),
+                "frozen_spec_sha256": sha256(paths["frozen_models"]),
+            }
+        ),
+        encoding="utf-8",
+    )
+    refresh_strategy_conclusion(paths, model_name)
+    return paths
+
+
+def refresh_strategy_conclusion(paths: dict[str, Path], model_name: str) -> None:
+    conclusion = {
+        "schema_version": 1,
+        "period": {"start": "2024-01-01", "end": "2025-12-31"},
+        "selection_policy": "no_test_based_selection",
+        "retuning_allowed": False,
+        "strategy_models": list(MODEL_NAMES),
+        "artifact_sha256": {
+            "frozen_models": sha256(paths["frozen_models"]),
+            "locked_test_comparison": sha256(paths["locked_test_comparison"]),
+            "locked_test_schema": sha256(paths["locked_test_schema"]),
+            "predictions": {
+                name: sha256(paths["prediction"]) if name == model_name else "0" * 64
+                for name in MODEL_NAMES
+            },
+            "prediction_manifests": {
+                name: (
+                    sha256(paths["prediction_manifest"])
+                    if name == model_name
+                    else "0" * 64
+                )
+                for name in MODEL_NAMES
+            },
+        },
+        "locked_test_metrics": [{"model_name": name} for name in MODEL_NAMES],
+    }
+    paths["locked_test_conclusion"].write_text(
+        json.dumps(conclusion), encoding="utf-8"
+    )
+
+
 def update_json(path: Path, **changes):
     value = json.loads(path.read_text(encoding="utf-8"))
     value.update(changes)
@@ -1314,3 +1405,330 @@ class PeriodAndReportingTests(unittest.TestCase):
                 directory / ".strategy.lock"
             )
             strategy_stage._release_strategy_lock(lock)
+
+
+class CliAndComparisonTests(unittest.TestCase):
+    @staticmethod
+    def _write_completed_run(run_root: Path, model_name: str, index: int) -> None:
+        run_directory = run_root / model_name
+        run_directory.mkdir()
+        summary_path = run_directory / "metrics_summary.json"
+        summary_path.write_text(
+            json.dumps(
+                {
+                    "cumulative_return": index / 10,
+                    "ending_nav": 1 + index / 10,
+                }
+            ),
+            encoding="utf-8",
+        )
+        output_names = (
+            "daily_nav.csv",
+            "trades.parquet",
+            "positions.parquet",
+            "execution_diagnostics.csv",
+            "ending_positions.csv",
+            "metrics_summary.json",
+        )
+        for name in output_names:
+            path = run_directory / name
+            if path != summary_path:
+                path.write_bytes(name.encode("ascii"))
+        manifest = {
+            "schema_version": 1,
+            "status": "completed",
+            "purpose": "frozen_rank_model_static_strategy_2024_2025",
+            "model_name": model_name,
+            "output_sha256": {
+                name: sha256(run_directory / name) for name in output_names
+            },
+        }
+        (run_directory / "manifest.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+
+    def test_parser_accepts_only_frozen_strategy_models(self):
+        from rank_model.pipeline import make_parser
+
+        args = make_parser().parse_args(
+            ["backtest-strategy", "--model", "lightgbm_lambdarank"]
+        )
+
+        self.assertEqual(args.model, "lightgbm_lambdarank")
+        with self.assertRaises(SystemExit):
+            make_parser().parse_args(
+                ["backtest-strategy", "--model", "mlp_rank_regression"]
+            )
+
+    def test_comparison_has_five_rows_and_no_decision_column(self):
+        from rank_model.stages.strategy import compare_strategy_runs
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            run_root = Path(temporary_directory) / "strategy_runs"
+            run_root.mkdir()
+            output = Path(temporary_directory) / "strategy_comparison.csv"
+            for index, model_name in enumerate(MODEL_NAMES):
+                self._write_completed_run(run_root, model_name, index)
+
+            frame = compare_strategy_runs(run_root, output, MODEL_NAMES)
+
+            self.assertEqual(frame["model_name"].tolist(), list(MODEL_NAMES))
+            self.assertTrue(
+                {"winner", "accept", "champion"}.isdisjoint(frame.columns)
+            )
+            pd.testing.assert_frame_equal(pd.read_csv(output), frame)
+
+    def test_comparison_requires_every_completed_frozen_model(self):
+        from rank_model.stages.strategy import compare_strategy_runs
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            run_root = Path(temporary_directory) / "strategy_runs"
+            run_root.mkdir()
+            for index, model_name in enumerate(MODEL_NAMES[:-1]):
+                self._write_completed_run(run_root, model_name, index)
+
+            with self.assertRaises(FileNotFoundError):
+                compare_strategy_runs(
+                    run_root,
+                    Path(temporary_directory) / "strategy_comparison.csv",
+                    MODEL_NAMES,
+                )
+
+    def test_comparison_rejects_incomplete_completed_manifest(self):
+        from rank_model.stages.strategy import compare_strategy_runs
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            run_root = Path(temporary_directory) / "strategy_runs"
+            run_root.mkdir()
+            for index, model_name in enumerate(MODEL_NAMES):
+                self._write_completed_run(run_root, model_name, index)
+            manifest_path = run_root / MODEL_NAMES[2] / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            del manifest["output_sha256"]["positions.parquet"]
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "output hashes"):
+                compare_strategy_runs(
+                    run_root,
+                    Path(temporary_directory) / "strategy_comparison.csv",
+                    MODEL_NAMES,
+                )
+
+    def test_load_config_validates_strategy_and_resolves_path_boundaries(self):
+        from rank_model.pipeline import (
+            DEFAULT_CONFIG_PATH,
+            PACKAGE_DIR,
+            _validate_strategy_paths,
+            load_config,
+        )
+
+        config = load_config(DEFAULT_CONFIG_PATH)
+        paths = _validate_strategy_paths(config, DEFAULT_CONFIG_PATH)
+
+        self.assertEqual(
+            set(paths),
+            {
+                "market_panel",
+                "trading_calendar",
+                "locked_test_schema",
+                "locked_test_runs_dir",
+                "frozen_spec",
+                "locked_test_conclusion",
+                "locked_test_comparison",
+                "strategy_runs_dir",
+                "strategy_comparison",
+            },
+        )
+        self.assertEqual(paths["strategy_runs_dir"], PACKAGE_DIR / "strategy_runs")
+        self.assertEqual(
+            paths["market_panel"].parent,
+            PACKAGE_DIR.parent / "model" / "data",
+        )
+
+        raw_config = DEFAULT_CONFIG_PATH.read_text(encoding="utf-8").replace(
+            "top_k = 100", "top_k = 99", 1
+        )
+        with tempfile.NamedTemporaryFile(
+            "w",
+            suffix=".toml",
+            dir=PACKAGE_DIR,
+            delete=False,
+            encoding="utf-8",
+        ) as handle:
+            handle.write(raw_config)
+            invalid_config_path = Path(handle.name)
+        try:
+            with self.assertRaisesRegex(ValueError, "strategy top_k"):
+                load_config(invalid_config_path)
+        finally:
+            invalid_config_path.unlink()
+
+        cases = (
+            ("market_panel", "data/market_panel.csv", "model/data"),
+            (
+                "locked_test_conclusion",
+                "../model/data/locked_test_conclusion.json",
+                "rank_model",
+            ),
+            ("strategy_runs_dir", "../strategy_runs", "rank_model"),
+        )
+        for name, raw_path, expected_error in cases:
+            with self.subTest(path=name):
+                changed = {**config, "paths": {**config["paths"], name: raw_path}}
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    _validate_strategy_paths(changed, DEFAULT_CONFIG_PATH)
+
+    def test_backtest_loads_eight_sources_and_publishes_immutable_run(self):
+        from rank_model.stages.strategy import backtest_locked_strategy
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            source_paths = executable_strategy_source_paths(directory)
+            destination = directory / "strategy_runs" / MODEL_NAMES[0]
+
+            result = backtest_locked_strategy(
+                MODEL_NAMES[0],
+                destination=destination,
+                settings=SETTINGS,
+                source_paths=source_paths,
+            )
+
+            self.assertEqual(result, destination)
+            manifest = json.loads(
+                (destination / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                manifest["input_sha256"],
+                {name: sha256(path) for name, path in source_paths.items()},
+            )
+            self.assertEqual(len(pd.read_csv(destination / "daily_nav.csv")), 2)
+            with self.assertRaises(FileExistsError):
+                backtest_locked_strategy(
+                    MODEL_NAMES[0],
+                    destination=destination,
+                    settings=SETTINGS,
+                    source_paths=source_paths,
+                )
+
+    def test_backtest_parses_frozen_spec_and_locked_comparison(self):
+        from rank_model.stages.strategy import backtest_locked_strategy
+
+        for case, expected_error in (
+            ("frozen_spec", "frozen specification"),
+            ("comparison", "locked-test comparison"),
+        ):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                source_paths = executable_strategy_source_paths(directory)
+                if case == "frozen_spec":
+                    source_paths["frozen_models"].write_text(
+                        json.dumps(
+                            {
+                                "schema_version": 1,
+                                "candidate_count": 4,
+                                "candidates": [
+                                    {"model_name": name} for name in MODEL_NAMES[1:]
+                                ],
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    update_json(
+                        source_paths["prediction_manifest"],
+                        frozen_spec_sha256=sha256(source_paths["frozen_models"]),
+                    )
+                else:
+                    pd.DataFrame(
+                        {
+                            "model_name": MODEL_NAMES,
+                            "winner": [True, False, False, False, False],
+                        }
+                    ).to_csv(source_paths["locked_test_comparison"], index=False)
+                refresh_strategy_conclusion(source_paths, MODEL_NAMES[0])
+
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    backtest_locked_strategy(
+                        MODEL_NAMES[0],
+                        destination=directory / "strategy_runs" / MODEL_NAMES[0],
+                        settings=SETTINGS,
+                        source_paths=source_paths,
+                    )
+
+    def test_command_supplies_exact_eight_paths(self):
+        import rank_model.pipeline as pipeline
+
+        config = pipeline.load_config(pipeline.DEFAULT_CONFIG_PATH)
+        resolved = pipeline._validate_strategy_paths(
+            config, pipeline.DEFAULT_CONFIG_PATH
+        )
+        model_name = MODEL_NAMES[0]
+        run_directory = resolved["locked_test_runs_dir"] / model_name
+        expected_sources = {
+            "prediction": run_directory / "predictions_10d.parquet",
+            "prediction_manifest": run_directory / "manifest.json",
+            "locked_test_schema": resolved["locked_test_schema"],
+            "market_panel": resolved["market_panel"],
+            "trading_calendar": resolved["trading_calendar"],
+            "frozen_models": resolved["frozen_spec"],
+            "locked_test_conclusion": resolved["locked_test_conclusion"],
+            "locked_test_comparison": resolved["locked_test_comparison"],
+        }
+        expected_destination = resolved["strategy_runs_dir"] / model_name
+
+        with mock.patch.object(
+            pipeline,
+            "backtest_locked_strategy",
+            return_value=expected_destination,
+        ) as backtest:
+            result = pipeline.command_backtest_strategy(
+                config, pipeline.DEFAULT_CONFIG_PATH, model_name
+            )
+
+        self.assertEqual(result, expected_destination)
+        self.assertEqual(backtest.call_args.kwargs["source_paths"], expected_sources)
+        self.assertEqual(
+            backtest.call_args.kwargs["destination"], expected_destination
+        )
+
+    def test_main_dispatches_strategy_commands_and_reports_expected_errors(self):
+        import rank_model.pipeline as pipeline
+
+        config = pipeline.load_config(pipeline.DEFAULT_CONFIG_PATH)
+        cases = (
+            (
+                ["pipeline", "backtest-strategy", "--model", MODEL_NAMES[0]],
+                "command_backtest_strategy",
+                Path("completed-run"),
+            ),
+            (
+                ["pipeline", "compare-strategy"],
+                "command_compare_strategy",
+                pd.DataFrame({"model_name": MODEL_NAMES}),
+            ),
+        )
+        for argv, command_name, result in cases:
+            with self.subTest(command=argv[1]), mock.patch(
+                "sys.argv", argv
+            ), mock.patch.object(
+                pipeline, "load_config", return_value=config
+            ), mock.patch.object(
+                pipeline, command_name, return_value=result
+            ) as command, mock.patch(
+                "builtins.print"
+            ) as output:
+                pipeline.main()
+                command.assert_called_once()
+                output.assert_called_once()
+
+            for error_type in (FileNotFoundError, ValueError, FileExistsError):
+                with self.subTest(command=argv[1], error=error_type.__name__), mock.patch(
+                    "sys.argv", argv
+                ), mock.patch.object(
+                    pipeline, "load_config", return_value=config
+                ), mock.patch.object(
+                    pipeline, command_name, side_effect=error_type("expected failure")
+                ), mock.patch(
+                    "sys.stderr", new=io.StringIO()
+                ):
+                    with self.assertRaisesRegex(SystemExit, "2"):
+                        pipeline.main()

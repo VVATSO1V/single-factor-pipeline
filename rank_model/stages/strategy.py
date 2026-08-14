@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
-from typing import Any, BinaryIO, Mapping
+from typing import Any, BinaryIO, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -1278,6 +1278,175 @@ def write_strategy_run(
         finally:
             _release_strategy_lock(lock)
     return destination
+
+
+def _read_strategy_json(path: Path, label: str) -> dict[str, Any]:
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid {label}: {path}") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must contain an object: {path}")
+    return value
+
+
+def backtest_locked_strategy(
+    model_name: str,
+    *,
+    destination: Path,
+    settings: StrategySettings,
+    source_paths: Mapping[str, Path],
+) -> Path:
+    """Load sealed inputs, simulate one frozen model, and publish its run."""
+    destination = Path(destination)
+    if destination.exists():
+        raise FileExistsError(f"strategy run already exists: {destination}")
+    _strategy_source_hashes(source_paths, model_name)
+    paths = {name: Path(source_paths[name]) for name in _STRATEGY_SOURCE_NAMES}
+
+    frozen_spec = _read_strategy_json(paths["frozen_models"], "frozen specification")
+    candidates = frozen_spec.get("candidates")
+    candidate_names = (
+        tuple(
+            candidate.get("model_name")
+            for candidate in candidates
+            if isinstance(candidate, Mapping)
+        )
+        if isinstance(candidates, list)
+        else ()
+    )
+    if (
+        frozen_spec.get("schema_version") != 1
+        or frozen_spec.get("candidate_count") != len(LOCKED_MODEL_NAMES)
+        or candidate_names != LOCKED_MODEL_NAMES
+    ):
+        raise ValueError("frozen specification must contain exactly the five models")
+
+    try:
+        locked_comparison = pd.read_csv(paths["locked_test_comparison"])
+    except (OSError, UnicodeError, pd.errors.ParserError) as error:
+        raise ValueError("locked-test comparison is invalid") from error
+    if (
+        "model_name" not in locked_comparison
+        or tuple(locked_comparison["model_name"].tolist()) != LOCKED_MODEL_NAMES
+        or not {"winner", "accept", "champion"}.isdisjoint(
+            locked_comparison.columns
+        )
+    ):
+        raise ValueError(
+            "locked-test comparison must contain five models and no decision fields"
+        )
+
+    try:
+        predictions = pd.read_parquet(paths["prediction"])
+    except (OSError, ValueError) as error:
+        raise ValueError("locked-test prediction file is invalid") from error
+    try:
+        market_panel = pd.read_csv(paths["market_panel"])
+        trading_calendar = pd.read_csv(paths["trading_calendar"])
+    except (OSError, UnicodeError, pd.errors.ParserError) as error:
+        raise ValueError(
+            "strategy market data or trading calendar is invalid"
+        ) from error
+
+    bundle = simulate_strategy(
+        predictions,
+        market_panel,
+        trading_calendar,
+        settings,
+    )
+    return write_strategy_run(
+        bundle,
+        destination,
+        settings,
+        model_name=model_name,
+        source_paths=paths,
+    )
+
+
+def compare_strategy_runs(
+    run_root: Path,
+    output_path: Path,
+    model_names: Sequence[str] = LOCKED_MODEL_NAMES,
+) -> pd.DataFrame:
+    """Publish descriptive metrics for all five completed frozen-model runs."""
+    names = tuple(model_names)
+    if names != LOCKED_MODEL_NAMES:
+        raise ValueError("strategy comparison requires exactly the five frozen models")
+    root = Path(run_root)
+    if not root.is_dir():
+        raise FileNotFoundError(root)
+    destination = Path(output_path)
+    rows: list[dict[str, Any]] = []
+    for model_name in names:
+        run_directory = root / model_name
+        if not run_directory.is_dir():
+            raise FileNotFoundError(run_directory)
+        manifest = _read_strategy_json(run_directory / "manifest.json", "manifest")
+        if any(
+            (
+                manifest.get("schema_version") != 1,
+                manifest.get("status") != "completed",
+                manifest.get("purpose")
+                != "frozen_rank_model_static_strategy_2024_2025",
+                manifest.get("model_name") != model_name,
+            )
+        ):
+            raise ValueError(f"strategy run is not completed: {run_directory}")
+        hashes = manifest.get("output_sha256")
+        if (
+            not isinstance(hashes, Mapping)
+            or set(hashes) != set(_STRATEGY_OUTPUT_NAMES)
+            or any(not isinstance(hashes[name], str) for name in _STRATEGY_OUTPUT_NAMES)
+        ):
+            raise ValueError(f"strategy run output hashes are invalid: {run_directory}")
+        for name in _STRATEGY_OUTPUT_NAMES:
+            artifact_path = run_directory / name
+            if not artifact_path.is_file():
+                raise FileNotFoundError(artifact_path)
+            if file_sha256(artifact_path) != hashes[name]:
+                raise ValueError(
+                    f"strategy output hash mismatch for {name}: {run_directory}"
+                )
+        summary_path = run_directory / "metrics_summary.json"
+        summary = _read_strategy_json(summary_path, "strategy metrics summary")
+        row = {
+            "model_name": model_name,
+            **{
+                key: value
+                for key, value in summary.items()
+                if key not in {"model_name", "winner", "accept", "champion"}
+            },
+        }
+        rows.append(row)
+
+    lock = _acquire_strategy_lock(root / ".strategy-comparison.lock")
+    temporary: Path | None = None
+    try:
+        if destination.exists():
+            raise FileExistsError(f"strategy comparison is immutable: {destination}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+        )
+        os.close(descriptor)
+        temporary = Path(temporary_name)
+        frame = pd.DataFrame(rows)
+        frame.to_csv(temporary, index=False)
+        os.replace(temporary, destination)
+        temporary = None
+        return frame
+    finally:
+        try:
+            if temporary is not None and temporary.exists():
+                try:
+                    temporary.unlink()
+                except Exception:
+                    pass
+        finally:
+            _release_strategy_lock(lock)
 
 
 def _require_sha256(value: Any, label: str) -> str:
