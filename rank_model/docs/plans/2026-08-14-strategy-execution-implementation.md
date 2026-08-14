@@ -150,13 +150,13 @@ Commit: `feat(rank-model): seal static strategy contract`
 
 **Interfaces:**
 - Consumes: normalized prediction and market-panel frames plus `StrategySettings`.
-- Produces: `select_daily_top(predictions, settings)`, `buy_decision(row, settings)`, and `sell_decision(row, settings)`.
+- Produces: `select_daily_top(predictions, settings, calendar)`, `buy_decision(row, settings)`, and `sell_decision(row, settings)`.
 
 - [ ] **Step 1: Add failing selection and rule tests**
 
 ```python
 def test_top100_uses_score_then_stock_code(self):
-    selected = select_daily_top(tied_predictions, SETTINGS)
+    selected = select_daily_top(tied_predictions, SETTINGS, calendar)
     self.assertEqual(selected[first_date][:3], ("A", "B", "C"))
 
 def test_buy_and_sell_rules_are_asymmetric(self):
