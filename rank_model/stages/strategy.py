@@ -136,7 +136,7 @@ def _calendar_dates(calendar: Any) -> pd.DatetimeIndex:
 def _validate_predictions(
     predictions: pd.DataFrame,
     settings: StrategySettings,
-    calendar: Any = None,
+    calendar: Any,
 ) -> pd.DataFrame:
     if not isinstance(predictions, pd.DataFrame):
         raise ValueError("predictions must be a DataFrame")
@@ -172,10 +172,11 @@ def _validate_predictions(
     if not counts.eq(settings.expected_cross_section_size).all():
         raise ValueError("prediction cross-section size is not exactly 1000")
 
-    if calendar is not None:
-        official = _calendar_dates(calendar)
-        if not result["date"].isin(official).all():
-            raise ValueError("prediction dates do not match the trading calendar")
+    if calendar is None:
+        raise ValueError("official trading calendar is required")
+    official = _calendar_dates(calendar)
+    if not result["date"].isin(official).all():
+        raise ValueError("prediction dates do not match the trading calendar")
     return result
 
 
@@ -191,7 +192,7 @@ def validate_prediction_calendar(
 def select_daily_top(
     predictions: pd.DataFrame,
     settings: StrategySettings,
-    calendar: Any = None,
+    calendar: Any,
 ) -> dict[pd.Timestamp, tuple[str, ...]]:
     """Select each date's deterministic highest-scoring stock codes."""
     normalized = _validate_predictions(predictions, settings, calendar)

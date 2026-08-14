@@ -135,6 +135,7 @@ class StrategyContractTests(unittest.TestCase):
 
 
 SETTINGS = load_strategy_settings(VALID_CONFIG)
+OFFICIAL_CALENDAR = pd.to_datetime(["2024-01-02"])
 
 
 def prediction_frame(*, dates=("2024-01-02",), rows_per_date=1000):
@@ -186,7 +187,7 @@ class SignalAndRuleTests(unittest.TestCase):
 
         from rank_model.stages.strategy import select_daily_top
 
-        selected = select_daily_top(predictions, SETTINGS)
+        selected = select_daily_top(predictions, SETTINGS, OFFICIAL_CALENDAR)
 
         self.assertEqual(selected[pd.Timestamp("2024-01-02")][:3], ("A", "B", "C"))
 
@@ -212,16 +213,16 @@ class SignalAndRuleTests(unittest.TestCase):
         duplicate = prediction_frame()
         duplicate.loc[1, "stock_code"] = duplicate.loc[0, "stock_code"]
         with self.assertRaisesRegex(ValueError, "duplicate"):
-            select_daily_top(duplicate, SETTINGS)
+            select_daily_top(duplicate, SETTINGS, OFFICIAL_CALENDAR)
 
         non_finite = prediction_frame()
         non_finite.loc[0, "score_raw"] = np.inf
         with self.assertRaisesRegex(ValueError, "finite"):
-            select_daily_top(non_finite, SETTINGS)
+            select_daily_top(non_finite, SETTINGS, OFFICIAL_CALENDAR)
 
         wrong_size = prediction_frame(rows_per_date=999)
         with self.assertRaisesRegex(ValueError, "cross-section"):
-            select_daily_top(wrong_size, SETTINGS)
+            select_daily_top(wrong_size, SETTINGS, OFFICIAL_CALENDAR)
 
     def test_selection_rejects_non_test_predictions_and_off_calendar_dates(self):
         from rank_model.stages.strategy import select_daily_top, validate_prediction_calendar
@@ -229,7 +230,7 @@ class SignalAndRuleTests(unittest.TestCase):
         wrong_split = prediction_frame()
         wrong_split.loc[0, "split"] = "validation"
         with self.assertRaisesRegex(ValueError, "test split"):
-            select_daily_top(wrong_split, SETTINGS)
+            select_daily_top(wrong_split, SETTINGS, OFFICIAL_CALENDAR)
 
         wrong_date = prediction_frame(dates=("2024-01-03",))
         calendar = pd.to_datetime(["2024-01-02"])
@@ -243,6 +244,28 @@ class SignalAndRuleTests(unittest.TestCase):
         wrong_horizon.loc[0, "horizon"] = 5
         with self.assertRaisesRegex(ValueError, "horizon"):
             validate_prediction_calendar(wrong_horizon, calendar, SETTINGS)
+
+    def test_selection_requires_official_calendar_membership(self):
+        from rank_model.stages.strategy import select_daily_top
+
+        with self.assertRaisesRegex(ValueError, "official trading calendar"):
+            select_daily_top(prediction_frame(), SETTINGS, None)
+
+        weekend = prediction_frame(dates=("2024-01-06",))
+        with self.assertRaisesRegex(ValueError, "calendar"):
+            select_daily_top(weekend, SETTINGS, OFFICIAL_CALENDAR)
+
+    def test_sell_ignores_listing_age_and_limit_up(self):
+        from rank_model.stages.strategy import sell_decision
+
+        self.assertEqual(
+            sell_decision(market_row(listing_days=1.0), SETTINGS),
+            (True, "eligible"),
+        )
+        self.assertEqual(
+            sell_decision(market_row(raw_open=11.0, limit_up=11.0), SETTINGS),
+            (True, "eligible"),
+        )
 
     def test_execution_requires_complete_data(self):
         from rank_model.stages.strategy import buy_decision, sell_decision
