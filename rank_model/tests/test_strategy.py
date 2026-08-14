@@ -50,6 +50,42 @@ class StrategyContractTests(unittest.TestCase):
         self.assertEqual(settings.buy_cost_rate, 0.0006)
         self.assertEqual(settings.sell_cost_rate, 0.0011)
 
+    def test_conclusion_accepts_valid_sealed_inputs(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            frozen_spec = directory / "frozen_models.json"
+            comparison = directory / "locked_test_comparison.csv"
+            prediction = directory / "predictions_10d.parquet"
+            frozen_spec.write_text('{"candidate_count": 5}', encoding="utf-8")
+            comparison.write_text("model_name\\n", encoding="utf-8")
+            prediction.write_bytes(b"original prediction bytes")
+            conclusion = {
+                "schema_version": 1,
+                "period": {"start": "2024-01-01", "end": "2025-12-31"},
+                "selection_policy": "no_test_based_selection",
+                "retuning_allowed": False,
+                "strategy_models": list(MODEL_NAMES),
+                "artifact_sha256": {
+                    "frozen_models": sha256(frozen_spec),
+                    "locked_test_comparison": sha256(comparison),
+                    "predictions": {
+                        model_name: sha256(prediction) for model_name in MODEL_NAMES
+                    },
+                },
+                "locked_test_metrics": [
+                    {"model_name": model_name} for model_name in MODEL_NAMES
+                ],
+            }
+
+            result = validate_locked_test_conclusion(
+                conclusion=conclusion,
+                frozen_spec_path=frozen_spec,
+                comparison_path=comparison,
+                prediction_paths={model_name: prediction for model_name in MODEL_NAMES},
+            )
+
+        self.assertIsNone(result)
+
     def test_conclusion_rejects_changed_prediction_hash(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
