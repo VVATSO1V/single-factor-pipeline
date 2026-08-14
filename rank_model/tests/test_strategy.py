@@ -6,6 +6,7 @@ import hashlib
 import json
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import numpy as np
@@ -517,6 +518,42 @@ def strategy_fixture(dates):
     return predictions, market, dates
 
 
+def strategy_source_paths(directory: Path, model_name=MODEL_NAMES[0]):
+    paths = {
+        "prediction": directory / "predictions_10d.parquet",
+        "market_panel": directory / "market_panel.csv",
+        "trading_calendar": directory / "trading_calendar.csv",
+        "frozen_models": directory / "frozen_models.json",
+        "locked_test_conclusion": directory / "locked_test_conclusion.json",
+        "locked_test_comparison": directory / "locked_test_comparison.csv",
+    }
+    paths["prediction"].write_bytes(b"sealed prediction")
+    paths["market_panel"].write_text("date,stock_code\n", encoding="utf-8")
+    paths["trading_calendar"].write_text("date\n", encoding="utf-8")
+    paths["frozen_models"].write_text('{"candidate_count": 5}\n', encoding="utf-8")
+    paths["locked_test_comparison"].write_text("model_name\n", encoding="utf-8")
+    conclusion = {
+        "schema_version": 1,
+        "period": {"start": "2024-01-01", "end": "2025-12-31"},
+        "selection_policy": "no_test_based_selection",
+        "retuning_allowed": False,
+        "strategy_models": list(MODEL_NAMES),
+        "artifact_sha256": {
+            "frozen_models": sha256(paths["frozen_models"]),
+            "locked_test_comparison": sha256(paths["locked_test_comparison"]),
+            "predictions": {
+                name: sha256(paths["prediction"]) if name == model_name else "0" * 64
+                for name in MODEL_NAMES
+            },
+        },
+        "locked_test_metrics": [{"model_name": name} for name in MODEL_NAMES],
+    }
+    paths["locked_test_conclusion"].write_text(
+        json.dumps(conclusion), encoding="utf-8"
+    )
+    return paths
+
+
 class PeriodAndReportingTests(unittest.TestCase):
     dates = pd.to_datetime(
         ["2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"]
@@ -576,7 +613,7 @@ class PeriodAndReportingTests(unittest.TestCase):
         bundle = simulate_strategy(predictions, market, calendar, SETTINGS)
 
         self.assertEqual(bundle.daily_nav.loc[suspended_day, "gross_return"], 0.0)
-        self.assertNotEqual(bundle.daily_nav.loc[reopen_day, "gross_return"], 0.0)
+        self.assertAlmostEqual(bundle.daily_nav.loc[reopen_day, "gross_return"], 0.01)
         final_position = bundle.ending_positions.loc[
             bundle.ending_positions["stock_code"].eq(stock_code)
         ].iloc[0]
@@ -593,6 +630,11 @@ class PeriodAndReportingTests(unittest.TestCase):
         pd.testing.assert_frame_equal(first.daily_nav, second.daily_nav)
         pd.testing.assert_frame_equal(first.trades, second.trades)
         pd.testing.assert_frame_equal(first.positions, second.positions)
+        pd.testing.assert_frame_equal(
+            first.execution_diagnostics, second.execution_diagnostics
+        )
+        pd.testing.assert_frame_equal(first.ending_positions, second.ending_positions)
+        self.assertEqual(first.metrics_summary, second.metrics_summary)
 
     def test_summary_uses_elapsed_returns_and_exact_report_columns(self):
         from rank_model.stages.strategy import simulate_strategy, summarize_strategy
@@ -603,23 +645,63 @@ class PeriodAndReportingTests(unittest.TestCase):
         bundle = simulate_strategy(predictions, market, calendar, SETTINGS)
 
         summary = summarize_strategy(bundle, SETTINGS)
-        returns = bundle.daily_nav["net_return"].iloc[1:]
-        cumulative = bundle.daily_nav["nav"].iloc[-1] / SETTINGS.initial_nav - 1.0
-        expected_cagr = (1.0 + cumulative) ** (
-            SETTINGS.annualization_days / len(returns)
-        ) - 1.0
-        expected_volatility = returns.std(ddof=1) * np.sqrt(
+        initial_buy_nav = 1.0 / 1.0006
+        expected_returns = np.array(
+            [initial_buy_nav - 1.0, 0.1, 9.0 / 11.0 - 1.0], dtype="float64"
+        )
+        cumulative = 0.9 / 1.0006 - 1.0
+        expected_cagr = (1.0 + cumulative) ** (SETTINGS.annualization_days / 3) - 1.0
+        expected_daily_volatility = expected_returns.std(ddof=1)
+        expected_volatility = expected_daily_volatility * np.sqrt(
             SETTINGS.annualization_days
         )
+        first_day_gross_turnover = 1.0 / 1.0006
 
+        np.testing.assert_allclose(
+            bundle.daily_nav["net_return"].iloc[1:].to_numpy(), expected_returns
+        )
+        self.assertAlmostEqual(bundle.daily_nav.iloc[2]["gross_return"], 0.1)
+        self.assertAlmostEqual(
+            bundle.daily_nav.iloc[3]["gross_return"], 9.0 / 11.0 - 1.0
+        )
+        self.assertEqual(summary["elapsed_trading_observations"], 3)
         self.assertAlmostEqual(summary["cumulative_return"], cumulative)
         self.assertAlmostEqual(summary["cagr"], expected_cagr)
+        self.assertAlmostEqual(summary["annualized_return"], expected_cagr)
         self.assertAlmostEqual(summary["annualized_volatility"], expected_volatility)
         self.assertAlmostEqual(
-            summary["annualized_gross_turnover"],
-            bundle.daily_nav["gross_turnover"].iloc[1:].mean()
-            * SETTINGS.annualization_days,
+            summary["sharpe_ratio"],
+            expected_returns.mean()
+            / expected_daily_volatility
+            * np.sqrt(SETTINGS.annualization_days),
         )
+        self.assertAlmostEqual(summary["max_drawdown"], 2.0 / 11.0)
+        self.assertAlmostEqual(summary["win_rate"], 1.0 / 3.0)
+        self.assertAlmostEqual(summary["average_cash_ratio"], 0.25)
+        self.assertAlmostEqual(summary["gross_turnover"], first_day_gross_turnover)
+        self.assertAlmostEqual(
+            summary["one_way_turnover"], first_day_gross_turnover / 2.0
+        )
+        self.assertAlmostEqual(
+            summary["average_gross_turnover"], first_day_gross_turnover / 3.0
+        )
+        self.assertAlmostEqual(
+            summary["average_one_way_turnover"], first_day_gross_turnover / 6.0
+        )
+        self.assertAlmostEqual(
+            summary["annualized_gross_turnover"],
+            first_day_gross_turnover / 3.0 * SETTINGS.annualization_days,
+        )
+        self.assertAlmostEqual(
+            summary["annualized_one_way_turnover"],
+            first_day_gross_turnover / 6.0 * SETTINGS.annualization_days,
+        )
+        self.assertAlmostEqual(
+            summary["annualized_turnover"],
+            first_day_gross_turnover / 6.0 * SETTINGS.annualization_days,
+        )
+        self.assertAlmostEqual(summary["total_cost"], 0.0006 / 1.0006)
+        self.assertAlmostEqual(summary["ending_nav"], 0.9 / 1.0006)
         self.assertEqual(summary, bundle.metrics_summary)
         self.assertTrue(
             {
@@ -690,27 +772,78 @@ class PeriodAndReportingTests(unittest.TestCase):
         bundle = simulate_strategy(predictions, market, calendar, SETTINGS)
 
         with tempfile.TemporaryDirectory() as temporary_directory:
-            destination = Path(temporary_directory) / "fixture-model"
-            with self.assertRaisesRegex(ValueError, "input SHA-256"):
+            directory = Path(temporary_directory)
+            destination = directory / MODEL_NAMES[0]
+            source_paths = strategy_source_paths(directory)
+            missing = dict(source_paths)
+            del missing["market_panel"]
+            with self.assertRaisesRegex(ValueError, "exact source artifact set"):
                 write_strategy_run(
                     bundle,
                     destination,
                     SETTINGS,
-                    input_sha256={"predictions_10d.parquet": "not-a-hash"},
+                    model_name=MODEL_NAMES[0],
+                    source_paths=missing,
                 )
+            extra = {**source_paths, "fabricated": directory / "fabricated.txt"}
+            extra["fabricated"].write_text("fabricated", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "exact source artifact set"):
+                write_strategy_run(
+                    bundle,
+                    destination,
+                    SETTINGS,
+                    model_name=MODEL_NAMES[0],
+                    source_paths=extra,
+                )
+            for invalid_path in (directory, None):
+                with self.subTest(invalid_path=invalid_path):
+                    non_file = {**source_paths, "market_panel": invalid_path}
+                    with self.assertRaisesRegex(
+                        ValueError, "source artifact is not a file"
+                    ):
+                        write_strategy_run(
+                            bundle,
+                            destination,
+                            SETTINGS,
+                            model_name=MODEL_NAMES[0],
+                            source_paths=non_file,
+                        )
+            for source_name, expected_error in (
+                ("prediction", "prediction hash"),
+                ("frozen_models", "frozen spec hash"),
+                ("locked_test_comparison", "comparison hash"),
+            ):
+                with self.subTest(changed_source=source_name):
+                    source_paths = strategy_source_paths(directory)
+                    source_paths[source_name].write_bytes(b"changed contents")
+                    with self.assertRaisesRegex(ValueError, expected_error):
+                        write_strategy_run(
+                            bundle,
+                            destination,
+                            SETTINGS,
+                            model_name=MODEL_NAMES[0],
+                            source_paths=source_paths,
+                        )
             self.assertFalse(destination.exists())
+            source_paths = strategy_source_paths(directory)
             lock = _acquire_strategy_lock(destination.parent / ".strategy.lock")
             try:
                 with self.assertRaisesRegex(FileExistsError, "publication"):
-                    write_strategy_run(bundle, destination, SETTINGS)
+                    write_strategy_run(
+                        bundle,
+                        destination,
+                        SETTINGS,
+                        model_name=MODEL_NAMES[0],
+                        source_paths=source_paths,
+                    )
             finally:
                 _release_strategy_lock(lock)
             result = write_strategy_run(
                 bundle,
                 destination,
                 SETTINGS,
-                model_name="fixture-model",
-                input_sha256={"predictions_10d.parquet": "0" * 64},
+                model_name=MODEL_NAMES[0],
+                source_paths=source_paths,
             )
             manifest = json.loads(
                 (destination / "manifest.json").read_text(encoding="utf-8")
@@ -718,6 +851,35 @@ class PeriodAndReportingTests(unittest.TestCase):
 
             self.assertEqual(result, destination)
             self.assertEqual(manifest["status"], "completed")
+            self.assertEqual(set(manifest["formulas"]), set(bundle.metrics_summary))
+            self.assertEqual(
+                manifest["formulas"]["win_rate"],
+                "count(net_return > 0 over execution rows) / elapsed_trading_observations",
+            )
+            self.assertEqual(
+                manifest["formulas"]["buy_fill_rate"],
+                "buy_count / buy_attempt_count; 0 when buy_attempt_count is 0",
+            )
+            self.assertEqual(
+                manifest["formulas"]["blocked_sale_days"],
+                "count(distinct execution_date with at least one blocked sell order)",
+            )
+            self.assertEqual(
+                manifest["observation_conventions"],
+                {
+                    "annualization_factor": SETTINGS.annualization_days,
+                    "initial_nav_row": (
+                        "included in max_drawdown and average_cash_ratio; excluded "
+                        "from return, turnover, cost, and win-rate observations"
+                    ),
+                    "return_denominator": "prior execution's ending NAV",
+                    "turnover_denominator": "same execution's marked pre-trade NAV",
+                    "fill_rate_denominator": "attempted order rows on the same side",
+                    "blocked_sale_day_count": (
+                        "distinct execution dates with at least one blocked sell"
+                    ),
+                },
+            )
             self.assertEqual(
                 set(manifest["output_sha256"]),
                 {
@@ -731,5 +893,131 @@ class PeriodAndReportingTests(unittest.TestCase):
             )
             for name, expected_hash in manifest["output_sha256"].items():
                 self.assertEqual(sha256(destination / name), expected_hash)
+            self.assertEqual(
+                manifest["input_sha256"],
+                {name: sha256(path) for name, path in source_paths.items()},
+            )
             with self.assertRaises(FileExistsError):
-                write_strategy_run(bundle, destination, SETTINGS)
+                write_strategy_run(
+                    bundle,
+                    destination,
+                    SETTINGS,
+                    model_name=MODEL_NAMES[0],
+                    source_paths=source_paths,
+                )
+
+    def test_publication_failures_leave_no_destination_and_release_lock(self):
+        import rank_model.stages.strategy as strategy_stage
+
+        predictions, market, calendar = strategy_fixture(self.dates)
+        bundle = strategy_stage.simulate_strategy(
+            predictions, market, calendar, SETTINGS
+        )
+        real_hash = strategy_stage.file_sha256
+        real_json_write = strategy_stage._write_json_file
+
+        for fault in ("artifact write", "artifact hash", "manifest write", "rename"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                destination = directory / MODEL_NAMES[0]
+                source_paths = strategy_source_paths(directory)
+
+                if fault == "artifact write":
+                    patcher = mock.patch.object(
+                        pd.DataFrame,
+                        "to_parquet",
+                        side_effect=RuntimeError(fault),
+                    )
+                elif fault == "artifact hash":
+                    def fail_staged_hash(path):
+                        if Path(path).parent != directory:
+                            raise RuntimeError(fault)
+                        return real_hash(Path(path))
+
+                    patcher = mock.patch.object(
+                        strategy_stage, "file_sha256", side_effect=fail_staged_hash
+                    )
+                elif fault == "manifest write":
+                    def fail_manifest(path, value):
+                        if Path(path).name == "manifest.json":
+                            raise RuntimeError(fault)
+                        return real_json_write(Path(path), value)
+
+                    patcher = mock.patch.object(
+                        strategy_stage, "_write_json_file", side_effect=fail_manifest
+                    )
+                else:
+                    patcher = mock.patch.object(
+                        strategy_stage.os,
+                        "replace",
+                        side_effect=RuntimeError(fault),
+                    )
+
+                with mock.patch.object(
+                    strategy_stage,
+                    "_release_strategy_lock",
+                    wraps=strategy_stage._release_strategy_lock,
+                ) as release_lock, patcher:
+                    with self.assertRaisesRegex(RuntimeError, fault):
+                        strategy_stage.write_strategy_run(
+                            bundle,
+                            destination,
+                            SETTINGS,
+                            model_name=MODEL_NAMES[0],
+                            source_paths=source_paths,
+                        )
+
+                self.assertFalse(destination.exists())
+                self.assertEqual(
+                    [path for path in directory.iterdir() if path.name.startswith(".")],
+                    [directory / ".strategy.lock"],
+                )
+                release_lock.assert_called_once()
+                lock = strategy_stage._acquire_strategy_lock(
+                    directory / ".strategy.lock"
+                )
+                strategy_stage._release_strategy_lock(lock)
+
+    def test_cleanup_failure_preserves_primary_error_and_releases_lock(self):
+        import rank_model.stages.strategy as strategy_stage
+
+        predictions, market, calendar = strategy_fixture(self.dates)
+        bundle = strategy_stage.simulate_strategy(
+            predictions, market, calendar, SETTINGS
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            destination = directory / MODEL_NAMES[0]
+            source_paths = strategy_source_paths(directory)
+            with mock.patch.object(
+                strategy_stage,
+                "_release_strategy_lock",
+                wraps=strategy_stage._release_strategy_lock,
+            ) as release_lock:
+                with mock.patch.object(
+                    pd.DataFrame,
+                    "to_parquet",
+                    side_effect=RuntimeError("primary artifact write failure"),
+                ), mock.patch.object(
+                    strategy_stage.shutil,
+                    "rmtree",
+                    side_effect=RuntimeError("cleanup failure"),
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "primary artifact write failure"
+                    ):
+                        strategy_stage.write_strategy_run(
+                            bundle,
+                            destination,
+                            SETTINGS,
+                            model_name=MODEL_NAMES[0],
+                            source_paths=source_paths,
+                        )
+
+            self.assertFalse(destination.exists())
+            release_lock.assert_called_once()
+            lock = strategy_stage._acquire_strategy_lock(
+                directory / ".strategy.lock"
+            )
+            strategy_stage._release_strategy_lock(lock)

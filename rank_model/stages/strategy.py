@@ -695,6 +695,62 @@ _STRATEGY_OUTPUT_NAMES = (
     "ending_positions.csv",
     "metrics_summary.json",
 )
+_STRATEGY_SOURCE_NAMES = (
+    "prediction",
+    "market_panel",
+    "trading_calendar",
+    "frozen_models",
+    "locked_test_conclusion",
+    "locked_test_comparison",
+)
+_SUMMARY_FORMULAS = {
+    "elapsed_trading_observations": "count(daily_nav rows excluding initial state)",
+    "cumulative_return": "ending_nav / initial_nav - 1",
+    "cagr": (
+        "(ending_nav / initial_nav) ** "
+        "(annualization_days / elapsed_trading_observations) - 1"
+    ),
+    "annualized_return": "cagr",
+    "annualized_volatility": (
+        "sample_std(net_return over execution rows) * sqrt(annualization_days)"
+    ),
+    "sharpe_ratio": (
+        "mean(net_return over execution rows) / sample_std(net_return over execution "
+        "rows) * sqrt(annualization_days); 0 when sample_std is 0"
+    ),
+    "max_drawdown": "max(1 - nav / running_max_nav) over all NAV rows",
+    "win_rate": (
+        "count(net_return > 0 over execution rows) / elapsed_trading_observations"
+    ),
+    "average_cash_ratio": "mean(cash / nav) over all NAV rows including initial state",
+    "gross_turnover": "sum(daily gross_turnover over execution rows)",
+    "one_way_turnover": "sum(daily gross_turnover / 2 over execution rows)",
+    "average_gross_turnover": "mean(daily gross_turnover over execution rows)",
+    "average_one_way_turnover": (
+        "mean(daily gross_turnover / 2 over execution rows)"
+    ),
+    "average_turnover": "average_one_way_turnover",
+    "annualized_gross_turnover": (
+        "average_gross_turnover * annualization_days"
+    ),
+    "annualized_one_way_turnover": (
+        "average_one_way_turnover * annualization_days"
+    ),
+    "annualized_turnover": "annualized_one_way_turnover",
+    "total_cost": "sum(total_cost over execution rows)",
+    "buy_attempt_count": "count(trade rows with side = buy)",
+    "sell_attempt_count": "count(trade rows with side = sell)",
+    "buy_count": "count(trade rows with side = buy and status = executed)",
+    "sell_count": "count(trade rows with side = sell and status = executed)",
+    "buy_fill_rate": "buy_count / buy_attempt_count; 0 when buy_attempt_count is 0",
+    "sell_fill_rate": (
+        "sell_count / sell_attempt_count; 0 when sell_attempt_count is 0"
+    ),
+    "blocked_sale_days": (
+        "count(distinct execution_date with at least one blocked sell order)"
+    ),
+    "ending_nav": "nav on the final daily_nav row",
+}
 
 
 def _normalize_market_panel(market: pd.DataFrame) -> pd.DataFrame:
@@ -1031,23 +1087,68 @@ def _write_json_file(path: Path, value: Mapping[str, Any]) -> None:
     )
 
 
-def _validated_input_hashes(input_sha256: Mapping[str, str] | None) -> dict[str, str]:
-    if input_sha256 is None:
-        return {}
-    if not isinstance(input_sha256, Mapping):
-        raise ValueError("input SHA-256 contract must be a mapping")
-    result: dict[str, str] = {}
-    for name, value in input_sha256.items():
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError("input SHA-256 artifact names must be present")
-        if not isinstance(value, str) or len(value) != 64:
-            raise ValueError(f"input SHA-256 is invalid: {name}")
-        try:
-            int(value, 16)
-        except ValueError as error:
-            raise ValueError(f"input SHA-256 is invalid: {name}") from error
-        result[name] = value.lower()
-    return result
+def _strategy_source_hashes(
+    source_paths: Mapping[str, Path], model_name: str
+) -> dict[str, str]:
+    if not isinstance(source_paths, Mapping) or set(source_paths) != set(
+        _STRATEGY_SOURCE_NAMES
+    ):
+        raise ValueError("strategy publication requires the exact source artifact set")
+    try:
+        paths = {name: Path(source_paths[name]) for name in _STRATEGY_SOURCE_NAMES}
+    except (TypeError, ValueError) as error:
+        raise ValueError("strategy source artifact is not a file") from error
+    for name, path in paths.items():
+        if not path.is_file():
+            raise ValueError(f"strategy source artifact is not a file: {name}")
+    if model_name not in LOCKED_MODEL_NAMES:
+        raise ValueError(f"strategy model is not frozen: {model_name}")
+
+    try:
+        conclusion = json.loads(
+            paths["locked_test_conclusion"].read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("locked-test conclusion is invalid") from error
+    if not isinstance(conclusion, Mapping):
+        raise ValueError("locked-test conclusion must be an object")
+    if conclusion.get("schema_version") != 1:
+        raise ValueError("locked-test conclusion schema version must be 1")
+    if conclusion.get("period") != {
+        "start": STRATEGY_START.strftime("%Y-%m-%d"),
+        "end": STRATEGY_END.strftime("%Y-%m-%d"),
+    }:
+        raise ValueError("locked-test conclusion period is invalid")
+    if conclusion.get("selection_policy") != "no_test_based_selection":
+        raise ValueError("locked-test conclusion selection policy is invalid")
+    if conclusion.get("retuning_allowed") is not False:
+        raise ValueError("locked-test conclusion must prohibit retuning")
+    if tuple(conclusion.get("strategy_models", ())) != LOCKED_MODEL_NAMES:
+        raise ValueError("locked-test conclusion must contain exactly the five frozen models")
+
+    artifact_hashes = conclusion.get("artifact_sha256")
+    if not isinstance(artifact_hashes, Mapping):
+        raise ValueError("locked-test conclusion is missing artifact hashes")
+    prediction_hashes = artifact_hashes.get("predictions")
+    if not isinstance(prediction_hashes, Mapping) or set(prediction_hashes) != set(
+        LOCKED_MODEL_NAMES
+    ):
+        raise ValueError("locked-test conclusion prediction hashes are invalid")
+
+    hashes = {name: file_sha256(path) for name, path in paths.items()}
+    if hashes["prediction"] != _require_sha256(
+        prediction_hashes.get(model_name), f"{model_name} prediction"
+    ):
+        raise ValueError("locked-test conclusion prediction hash does not match")
+    if hashes["frozen_models"] != _require_sha256(
+        artifact_hashes.get("frozen_models"), "frozen spec"
+    ):
+        raise ValueError("locked-test conclusion frozen spec hash does not match")
+    if hashes["locked_test_comparison"] != _require_sha256(
+        artifact_hashes.get("locked_test_comparison"), "comparison"
+    ):
+        raise ValueError("locked-test conclusion comparison hash does not match")
+    return hashes
 
 
 def write_strategy_run(
@@ -1055,12 +1156,12 @@ def write_strategy_run(
     destination: Path,
     settings: StrategySettings,
     *,
-    model_name: str | None = None,
-    input_sha256: Mapping[str, str] | None = None,
+    model_name: str,
+    source_paths: Mapping[str, Path],
 ) -> Path:
     """Atomically publish one immutable strategy report directory."""
     destination = Path(destination)
-    input_hashes = _validated_input_hashes(input_sha256)
+    input_hashes = _strategy_source_hashes(source_paths, model_name)
     destination.parent.mkdir(parents=True, exist_ok=True)
     lock = _acquire_strategy_lock(destination.parent / ".strategy.lock")
     staging: Path | None = None
@@ -1081,11 +1182,13 @@ def write_strategy_run(
         output_hashes = {
             name: file_sha256(staging / name) for name in _STRATEGY_OUTPUT_NAMES
         }
+        if set(_SUMMARY_FORMULAS) != set(bundle.metrics_summary):
+            raise ValueError("strategy summary formula contract is incomplete")
         manifest = {
             "schema_version": 1,
             "status": "completed",
             "purpose": "frozen_rank_model_static_strategy_2024_2025",
-            "model_name": model_name or destination.name,
+            "model_name": model_name,
             "settings": _settings_manifest(settings),
             "rows": {
                 "daily_nav": len(bundle.daily_nav),
@@ -1094,15 +1197,19 @@ def write_strategy_run(
                 "positions": len(bundle.positions),
                 "ending_positions": len(bundle.ending_positions),
             },
-            "formulas": {
-                "cumulative_return": "ending_nav / initial_nav - 1",
-                "cagr": "(ending_nav / initial_nav) ** (annualization_days / elapsed_trading_observations) - 1",
-                "annualized_volatility": "sample_std(net_return) * sqrt(annualization_days)",
-                "sharpe_ratio": "mean(net_return) / sample_std(net_return) * sqrt(annualization_days)",
-                "max_drawdown": "max(1 - nav / running_max_nav)",
-                "gross_turnover": "(buy_notional + sell_notional) / pre_trade_nav",
-                "one_way_turnover": "gross_turnover / 2",
-                "annualized_turnover": "mean(daily_one_way_turnover) * annualization_days",
+            "formulas": _SUMMARY_FORMULAS,
+            "observation_conventions": {
+                "annualization_factor": settings.annualization_days,
+                "initial_nav_row": (
+                    "included in max_drawdown and average_cash_ratio; excluded "
+                    "from return, turnover, cost, and win-rate observations"
+                ),
+                "return_denominator": "prior execution's ending NAV",
+                "turnover_denominator": "same execution's marked pre-trade NAV",
+                "fill_rate_denominator": "attempted order rows on the same side",
+                "blocked_sale_day_count": (
+                    "distinct execution dates with at least one blocked sell"
+                ),
             },
             "input_sha256": input_hashes,
             "output_sha256": output_hashes,
@@ -1111,9 +1218,15 @@ def write_strategy_run(
         os.replace(staging, destination)
         staging = None
     finally:
-        if staging is not None and staging.exists():
-            shutil.rmtree(staging)
-        _release_strategy_lock(lock)
+        try:
+            if staging is not None and staging.exists():
+                try:
+                    shutil.rmtree(staging)
+                except Exception:
+                    # Cleanup is best-effort; preserve the publication error.
+                    pass
+        finally:
+            _release_strategy_lock(lock)
     return destination
 
 
