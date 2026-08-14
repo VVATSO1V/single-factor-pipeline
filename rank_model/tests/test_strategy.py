@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import tempfile
 import unittest
 from unittest import mock
@@ -1410,16 +1411,27 @@ class PeriodAndReportingTests(unittest.TestCase):
 class CliAndComparisonTests(unittest.TestCase):
     @staticmethod
     def _write_completed_run(run_root: Path, model_name: str, index: int) -> None:
+        from rank_model.stages.strategy import _SUMMARY_FORMULAS
+
         run_directory = run_root / model_name
         run_directory.mkdir()
         summary_path = run_directory / "metrics_summary.json"
+        integer_metrics = {
+            "elapsed_trading_observations",
+            "buy_attempt_count",
+            "sell_attempt_count",
+            "buy_count",
+            "sell_count",
+            "blocked_sale_days",
+        }
+        summary = {
+            name: index if name in integer_metrics else index / 10
+            for name in _SUMMARY_FORMULAS
+        }
+        summary["elapsed_trading_observations"] = 484
+        summary["ending_nav"] = 1 + index / 10
         summary_path.write_text(
-            json.dumps(
-                {
-                    "cumulative_return": index / 10,
-                    "ending_nav": 1 + index / 10,
-                }
-            ),
+            json.dumps(summary),
             encoding="utf-8",
         )
         output_names = (
@@ -1430,15 +1442,87 @@ class CliAndComparisonTests(unittest.TestCase):
             "ending_positions.csv",
             "metrics_summary.json",
         )
-        for name in output_names:
-            path = run_directory / name
-            if path != summary_path:
-                path.write_bytes(name.encode("ascii"))
+        pd.DataFrame({"row": range(485)}).to_csv(
+            run_directory / "daily_nav.csv", index=False
+        )
+        pd.DataFrame({"row": range(index)}).to_parquet(
+            run_directory / "trades.parquet", index=False
+        )
+        pd.DataFrame({"row": range(index)}).to_parquet(
+            run_directory / "positions.parquet", index=False
+        )
+        pd.DataFrame({"row": range(484)}).to_csv(
+            run_directory / "execution_diagnostics.csv", index=False
+        )
+        pd.DataFrame({"row": range(101)}).to_csv(
+            run_directory / "ending_positions.csv", index=False
+        )
+        settings = {
+            "start": "2024-01-01",
+            "end": "2025-12-31",
+            "top_k": 100,
+            "expected_cross_section_size": 1000,
+            "min_listing_days": 120,
+            "initial_nav": 1.0,
+            "commission_rate": 0.0001,
+            "slippage_rate": 0.0005,
+            "sell_stamp_duty_rate": 0.0005,
+            "buy_cost_rate": 0.0006,
+            "sell_cost_rate": 0.0011,
+            "limit_tolerance": 1e-8,
+            "annualization_days": 252,
+        }
+        observation_conventions = {
+            "annualization_factor": 252,
+            "initial_nav_row": (
+                "included in max_drawdown and average_cash_ratio; excluded "
+                "from return, turnover, cost, and win-rate observations"
+            ),
+            "return_denominator": "prior execution's ending NAV",
+            "turnover_denominator": "same execution's marked pre-trade NAV",
+            "fill_rate_denominator": "attempted order rows on the same side",
+            "blocked_sale_day_count": (
+                "distinct execution dates with at least one blocked sell"
+            ),
+        }
+        common_sources = (
+            "locked_test_schema",
+            "market_panel",
+            "trading_calendar",
+            "frozen_models",
+            "locked_test_conclusion",
+            "locked_test_comparison",
+        )
+        input_hashes = {
+            name: hashlib.sha256(name.encode("ascii")).hexdigest()
+            for name in common_sources
+        }
+        input_hashes.update(
+            {
+                "prediction": hashlib.sha256(
+                    f"prediction:{model_name}".encode("ascii")
+                ).hexdigest(),
+                "prediction_manifest": hashlib.sha256(
+                    f"manifest:{model_name}".encode("ascii")
+                ).hexdigest(),
+            }
+        )
         manifest = {
             "schema_version": 1,
             "status": "completed",
             "purpose": "frozen_rank_model_static_strategy_2024_2025",
             "model_name": model_name,
+            "settings": settings,
+            "rows": {
+                "daily_nav": 485,
+                "execution_dates": 484,
+                "trades": index,
+                "positions": index,
+                "ending_positions": 101,
+            },
+            "formulas": _SUMMARY_FORMULAS,
+            "observation_conventions": observation_conventions,
+            "input_sha256": input_hashes,
             "output_sha256": {
                 name: sha256(run_directory / name) for name in output_names
             },
@@ -1461,7 +1545,7 @@ class CliAndComparisonTests(unittest.TestCase):
             )
 
     def test_comparison_has_five_rows_and_no_decision_column(self):
-        from rank_model.stages.strategy import compare_strategy_runs
+        from rank_model.stages.strategy import _SUMMARY_FORMULAS, compare_strategy_runs
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             run_root = Path(temporary_directory) / "strategy_runs"
@@ -1474,7 +1558,17 @@ class CliAndComparisonTests(unittest.TestCase):
 
             self.assertEqual(frame["model_name"].tolist(), list(MODEL_NAMES))
             self.assertTrue(
-                {"winner", "accept", "champion"}.isdisjoint(frame.columns)
+                {
+                    "winner",
+                    "accept",
+                    "champion",
+                    "parameter_update",
+                    "recommendation",
+                    "selected_model",
+                }.isdisjoint(frame.columns)
+            )
+            self.assertEqual(
+                tuple(frame.columns), ("model_name", *_SUMMARY_FORMULAS)
             )
             pd.testing.assert_frame_equal(pd.read_csv(output), frame)
 
@@ -1508,6 +1602,127 @@ class CliAndComparisonTests(unittest.TestCase):
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
             with self.assertRaisesRegex(ValueError, "output hashes"):
+                compare_strategy_runs(
+                    run_root,
+                    Path(temporary_directory) / "strategy_comparison.csv",
+                    MODEL_NAMES,
+                )
+
+    def test_comparison_rejects_unknown_or_missing_metric_keys(self):
+        from rank_model.stages.strategy import compare_strategy_runs
+
+        cases = {
+            "parameter_update": "increase risk",
+            "recommendation": "select this model",
+            "selected_model": MODEL_NAMES[0],
+            "unknown_metric": 1.0,
+        }
+        for field, value in cases.items():
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                run_root = Path(temporary) / "strategy_runs"
+                run_root.mkdir()
+                for index, model_name in enumerate(MODEL_NAMES):
+                    self._write_completed_run(run_root, model_name, index)
+                run_directory = run_root / MODEL_NAMES[0]
+                summary_path = run_directory / "metrics_summary.json"
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                summary[field] = value
+                summary_path.write_text(json.dumps(summary), encoding="utf-8")
+                manifest_path = run_directory / "manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest["output_sha256"]["metrics_summary.json"] = sha256(
+                    summary_path
+                )
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+                with self.assertRaisesRegex(ValueError, "metric keys"):
+                    compare_strategy_runs(
+                        run_root,
+                        Path(temporary) / "strategy_comparison.csv",
+                        MODEL_NAMES,
+                    )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            run_root = Path(temporary_directory) / "strategy_runs"
+            run_root.mkdir()
+            for index, model_name in enumerate(MODEL_NAMES):
+                self._write_completed_run(run_root, model_name, index)
+            run_directory = run_root / MODEL_NAMES[0]
+            summary_path = run_directory / "metrics_summary.json"
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            del summary["sharpe_ratio"]
+            summary_path.write_text(json.dumps(summary), encoding="utf-8")
+            manifest_path = run_directory / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["output_sha256"]["metrics_summary.json"] = sha256(summary_path)
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "metric keys"):
+                compare_strategy_runs(
+                    run_root,
+                    Path(temporary_directory) / "strategy_comparison.csv",
+                    MODEL_NAMES,
+                )
+
+    def test_comparison_rejects_task4_manifest_contract_tampering(self):
+        from rank_model.stages.strategy import compare_strategy_runs
+
+        cases = (
+            "status",
+            "model",
+            "top_level",
+            "settings",
+            "formulas",
+            "observations",
+            "rows",
+            "input_keys",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                run_root = Path(temporary) / "strategy_runs"
+                run_root.mkdir()
+                for index, model_name in enumerate(MODEL_NAMES):
+                    self._write_completed_run(run_root, model_name, index)
+                manifest_path = run_root / MODEL_NAMES[1] / "manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if case == "status":
+                    manifest["status"] = "partial"
+                elif case == "model":
+                    manifest["model_name"] = MODEL_NAMES[0]
+                elif case == "top_level":
+                    manifest["recommendation"] = "pick me"
+                elif case == "settings":
+                    manifest["settings"]["top_k"] = 99
+                elif case == "formulas":
+                    manifest["formulas"]["sharpe_ratio"] = "changed"
+                elif case == "observations":
+                    manifest["observation_conventions"]["annualization_factor"] = 365
+                elif case == "rows":
+                    manifest["rows"]["trades"] += 1
+                else:
+                    del manifest["input_sha256"]["trading_calendar"]
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+                with self.assertRaisesRegex(ValueError, "strategy run"):
+                    compare_strategy_runs(
+                        run_root,
+                        Path(temporary) / "strategy_comparison.csv",
+                        MODEL_NAMES,
+                    )
+
+    def test_comparison_requires_common_non_model_source_hashes(self):
+        from rank_model.stages.strategy import compare_strategy_runs
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            run_root = Path(temporary_directory) / "strategy_runs"
+            run_root.mkdir()
+            for index, model_name in enumerate(MODEL_NAMES):
+                self._write_completed_run(run_root, model_name, index)
+            manifest_path = run_root / MODEL_NAMES[-1] / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["input_sha256"]["market_panel"] = "f" * 64
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "common source hashes"):
                 compare_strategy_runs(
                     run_root,
                     Path(temporary_directory) / "strategy_comparison.csv",
@@ -1578,6 +1793,50 @@ class CliAndComparisonTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, expected_error):
                     _validate_strategy_paths(changed, DEFAULT_CONFIG_PATH)
 
+    def test_strategy_sources_are_anchored_to_this_worktrees_model_data(self):
+        from rank_model.pipeline import (
+            DEFAULT_CONFIG_PATH,
+            _validate_strategy_paths,
+            load_config,
+        )
+
+        config = load_config(DEFAULT_CONFIG_PATH)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            external_data = Path(temporary_directory) / "model" / "data"
+            external_data.mkdir(parents=True)
+            external_market = external_data / "market_panel.csv"
+            external_market.touch()
+            changed = {
+                **config,
+                "paths": {
+                    **config["paths"],
+                    "market_panel": str(external_market),
+                },
+            }
+            with self.assertRaisesRegex(ValueError, "model/data"):
+                _validate_strategy_paths(changed, DEFAULT_CONFIG_PATH)
+
+            escape = Path(temporary_directory) / "escape"
+            escape.mkdir()
+            escaped_calendar = escape / "trading_calendar.csv"
+            escaped_calendar.touch()
+            shaped_model = Path(temporary_directory) / "shaped" / "model"
+            shaped_model.mkdir(parents=True)
+            linked_data = shaped_model / "data"
+            try:
+                os.symlink(escape, linked_data, target_is_directory=True)
+            except OSError:
+                return
+            linked = {
+                **config,
+                "paths": {
+                    **config["paths"],
+                    "trading_calendar": str(linked_data / escaped_calendar.name),
+                },
+            }
+            with self.assertRaisesRegex(ValueError, "model/data"):
+                _validate_strategy_paths(linked, DEFAULT_CONFIG_PATH)
+
     def test_backtest_loads_eight_sources_and_publishes_immutable_run(self):
         from rank_model.stages.strategy import backtest_locked_strategy
 
@@ -1609,6 +1868,67 @@ class CliAndComparisonTests(unittest.TestCase):
                     settings=SETTINGS,
                     source_paths=source_paths,
                 )
+
+    def test_market_ingestion_is_chunked_typed_and_calendar_bounded(self):
+        import rank_model.stages.strategy as strategy_stage
+
+        rows = pd.DataFrame(
+            [
+                {"date": "2023-12-29", "stock_code": "OLD"},
+                {"date": "2024-01-02", "stock_code": "A"},
+                {"date": "2024-01-06", "stock_code": "WEEKEND"},
+                {"date": "2024-01-03", "stock_code": "B"},
+                {"date": "2026-01-02", "stock_code": "FUTURE"},
+            ]
+        )
+        for name, value in (
+            ("has_price_record", True),
+            ("is_suspended", False),
+            ("is_st", False),
+            ("listing_days", 500.0),
+            ("raw_open", 10.0),
+            ("post_open", 10.0),
+            ("limit_up", 11.0),
+            ("limit_down", 9.0),
+            ("unused_column", "not loaded"),
+        ):
+            rows[name] = value
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            market_path = Path(temporary_directory) / "market_panel.csv"
+            rows.to_csv(market_path, index=False)
+            calendar = pd.to_datetime(["2024-01-02", "2024-01-03"])
+            with mock.patch.object(
+                strategy_stage, "MARKET_READ_CHUNK_SIZE", 2
+            ), mock.patch.object(
+                pd, "read_csv", wraps=pd.read_csv
+            ) as read_csv:
+                panel = strategy_stage._load_strategy_market_panel(
+                    market_path, calendar, SETTINGS
+                )
+
+            kwargs = read_csv.call_args.kwargs
+            self.assertEqual(
+                tuple(kwargs["usecols"]), strategy_stage.MARKET_EXECUTION_COLUMNS
+            )
+            self.assertEqual(kwargs["dtype"], strategy_stage.MARKET_EXECUTION_DTYPES)
+            self.assertEqual(kwargs["chunksize"], 2)
+            self.assertEqual(panel["stock_code"].tolist(), ["A", "B"])
+            self.assertEqual(
+                panel["date"].tolist(),
+                [pd.Timestamp("2024-01-02"), pd.Timestamp("2024-01-03")],
+            )
+            self.assertNotIn("unused_column", panel)
+
+            duplicate = pd.concat(
+                [rows.iloc[:3], rows.iloc[[1]], rows.iloc[3:]], ignore_index=True
+            )
+            duplicate.to_csv(market_path, index=False)
+            with mock.patch.object(strategy_stage, "MARKET_READ_CHUNK_SIZE", 2):
+                with self.assertRaisesRegex(ValueError, "duplicate"):
+                    strategy_stage._load_strategy_market_panel(
+                        market_path, calendar, SETTINGS
+                    )
 
     def test_backtest_parses_frozen_spec_and_locked_comparison(self):
         from rank_model.stages.strategy import backtest_locked_strategy
@@ -1730,5 +2050,34 @@ class CliAndComparisonTests(unittest.TestCase):
                 ), mock.patch(
                     "sys.stderr", new=io.StringIO()
                 ):
+                    with self.assertRaisesRegex(SystemExit, "2"):
+                        pipeline.main()
+
+    def test_main_reports_missing_and_invalid_strategy_configs_through_argparse(self):
+        import rank_model.pipeline as pipeline
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            missing = directory / "missing.toml"
+            invalid = directory / "invalid.toml"
+            invalid.write_text("[project]\n", encoding="utf-8")
+            cases = (
+                (["pipeline", "--config", str(missing), "compare-strategy"], missing),
+                (
+                    [
+                        "pipeline",
+                        "--config",
+                        str(invalid),
+                        "backtest-strategy",
+                        "--model",
+                        MODEL_NAMES[0],
+                    ],
+                    invalid,
+                ),
+            )
+            for argv, path in cases:
+                with self.subTest(path=path.name), mock.patch(
+                    "sys.argv", argv
+                ), mock.patch("sys.stderr", new=io.StringIO()):
                     with self.assertRaisesRegex(SystemExit, "2"):
                         pipeline.main()

@@ -168,9 +168,9 @@ def _is_within(path: Path, directory: Path) -> bool:
 
 
 def _is_model_data_path(path: Path) -> bool:
-    """Accept a source only when it is directly beneath a model/data directory."""
-    parent = path.resolve().parent
-    return parent.name == "data" and parent.parent.name == "model"
+    """Accept a source only when it is directly beneath this worktree's model/data."""
+    expected = (PACKAGE_DIR.parent / "model" / "data").resolve()
+    return path.resolve().parent == expected
 
 
 def _is_inside_model_data(path: Path) -> bool:
@@ -776,9 +776,13 @@ def make_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    args = make_parser().parse_args()
+    parser = make_parser()
+    args = parser.parse_args()
     config_path = Path(args.config).resolve()
-    config = load_config(config_path)
+    try:
+        config = load_config(config_path)
+    except (FileNotFoundError, ValueError) as error:
+        parser.error(str(error))
     if args.command == "doctor":
         try:
             checks = command_doctor(config, config_path)

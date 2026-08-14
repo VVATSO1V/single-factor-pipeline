@@ -37,6 +37,31 @@ STRATEGY_SELL_STAMP_DUTY_BPS = 5.0
 STRATEGY_LIMIT_TOLERANCE = 1e-8
 STRATEGY_ANNUALIZATION_DAYS = 252
 PREDICTION_COLUMNS = ("date", "stock_code", "score_raw", "split", "horizon")
+MARKET_EXECUTION_COLUMNS = (
+    "date",
+    "stock_code",
+    "has_price_record",
+    "is_suspended",
+    "is_st",
+    "listing_days",
+    "raw_open",
+    "post_open",
+    "limit_up",
+    "limit_down",
+)
+MARKET_EXECUTION_DTYPES = {
+    "date": "string",
+    "stock_code": "string",
+    "has_price_record": "boolean",
+    "is_suspended": "boolean",
+    "is_st": "boolean",
+    "listing_days": "float64",
+    "raw_open": "float64",
+    "post_open": "float64",
+    "limit_up": "float64",
+    "limit_down": "float64",
+}
+MARKET_READ_CHUNK_SIZE = 100_000
 
 
 @dataclass(frozen=True)
@@ -753,6 +778,113 @@ _SUMMARY_FORMULAS = {
     ),
     "ending_nav": "nav on the final daily_nav row",
 }
+_STRATEGY_SETTINGS_CONTRACT = {
+    "start": "2024-01-01",
+    "end": "2025-12-31",
+    "top_k": 100,
+    "expected_cross_section_size": 1000,
+    "min_listing_days": 120,
+    "initial_nav": 1.0,
+    "commission_rate": 0.0001,
+    "slippage_rate": 0.0005,
+    "sell_stamp_duty_rate": 0.0005,
+    "buy_cost_rate": 0.0006,
+    "sell_cost_rate": 0.0011,
+    "limit_tolerance": 1e-8,
+    "annualization_days": 252,
+}
+_STRATEGY_OBSERVATION_CONVENTIONS = {
+    "annualization_factor": 252,
+    "initial_nav_row": (
+        "included in max_drawdown and average_cash_ratio; excluded "
+        "from return, turnover, cost, and win-rate observations"
+    ),
+    "return_denominator": "prior execution's ending NAV",
+    "turnover_denominator": "same execution's marked pre-trade NAV",
+    "fill_rate_denominator": "attempted order rows on the same side",
+    "blocked_sale_day_count": (
+        "distinct execution dates with at least one blocked sell"
+    ),
+}
+_STRATEGY_MANIFEST_NAMES = {
+    "schema_version",
+    "status",
+    "purpose",
+    "model_name",
+    "settings",
+    "rows",
+    "formulas",
+    "observation_conventions",
+    "input_sha256",
+    "output_sha256",
+}
+_STRATEGY_ROW_NAMES = {
+    "daily_nav",
+    "execution_dates",
+    "trades",
+    "positions",
+    "ending_positions",
+}
+_STRATEGY_INTEGER_METRICS = {
+    "elapsed_trading_observations",
+    "buy_attempt_count",
+    "sell_attempt_count",
+    "buy_count",
+    "sell_count",
+    "blocked_sale_days",
+}
+_COMMON_STRATEGY_SOURCE_NAMES = tuple(
+    name
+    for name in _STRATEGY_SOURCE_NAMES
+    if name not in {"prediction", "prediction_manifest"}
+)
+
+
+def _load_strategy_market_panel(
+    path: Path,
+    calendar: Any,
+    settings: StrategySettings,
+) -> pd.DataFrame:
+    """Stream only execution rows on the exact official strategy calendar."""
+    official = _calendar_dates(calendar)
+    period_dates = official[(official >= settings.start) & (official <= settings.end)]
+    if period_dates.empty:
+        raise ValueError("strategy period has no official trading dates")
+    required_dates = set(period_dates)
+    seen_keys: set[tuple[pd.Timestamp, str]] = set()
+    frames: list[pd.DataFrame] = []
+    try:
+        reader = pd.read_csv(
+            Path(path),
+            usecols=list(MARKET_EXECUTION_COLUMNS),
+            dtype=MARKET_EXECUTION_DTYPES,
+            chunksize=MARKET_READ_CHUNK_SIZE,
+        )
+        with reader:
+            for chunk in reader:
+                chunk["date"] = pd.to_datetime(
+                    chunk["date"], errors="raise"
+                ).dt.normalize()
+                chunk = chunk.loc[chunk["date"].isin(required_dates)].copy()
+                if chunk.empty:
+                    continue
+                chunk["stock_code"] = chunk["stock_code"].str.strip()
+                if chunk[["date", "stock_code"]].isna().any().any() or chunk[
+                    "stock_code"
+                ].eq("").any():
+                    raise ValueError("market panel keys must be present")
+                keys = list(zip(chunk["date"], chunk["stock_code"], strict=True))
+                if len(keys) != len(set(keys)) or any(key in seen_keys for key in keys):
+                    raise ValueError(
+                        "market panel contains duplicate date,stock_code keys across chunks"
+                    )
+                seen_keys.update(keys)
+                frames.append(chunk)
+    except (OSError, UnicodeError, pd.errors.ParserError) as error:
+        raise ValueError("strategy market panel is invalid") from error
+    if not frames:
+        return pd.DataFrame(columns=MARKET_EXECUTION_COLUMNS)
+    return pd.concat(frames, ignore_index=True)
 
 
 def _normalize_market_panel(market: pd.DataFrame) -> pd.DataFrame:
@@ -1248,19 +1380,7 @@ def write_strategy_run(
                 "ending_positions": len(bundle.ending_positions),
             },
             "formulas": _SUMMARY_FORMULAS,
-            "observation_conventions": {
-                "annualization_factor": settings.annualization_days,
-                "initial_nav_row": (
-                    "included in max_drawdown and average_cash_ratio; excluded "
-                    "from return, turnover, cost, and win-rate observations"
-                ),
-                "return_denominator": "prior execution's ending NAV",
-                "turnover_denominator": "same execution's marked pre-trade NAV",
-                "fill_rate_denominator": "attempted order rows on the same side",
-                "blocked_sale_day_count": (
-                    "distinct execution dates with at least one blocked sell"
-                ),
-            },
+            "observation_conventions": _STRATEGY_OBSERVATION_CONVENTIONS,
             "input_sha256": input_hashes,
             "output_sha256": output_hashes,
         }
@@ -1344,12 +1464,16 @@ def backtest_locked_strategy(
     except (OSError, ValueError) as error:
         raise ValueError("locked-test prediction file is invalid") from error
     try:
-        market_panel = pd.read_csv(paths["market_panel"])
-        trading_calendar = pd.read_csv(paths["trading_calendar"])
+        trading_calendar = pd.read_csv(
+            paths["trading_calendar"],
+            usecols=["date"],
+            dtype={"date": "string"},
+        )
     except (OSError, UnicodeError, pd.errors.ParserError) as error:
-        raise ValueError(
-            "strategy market data or trading calendar is invalid"
-        ) from error
+        raise ValueError("strategy trading calendar is invalid") from error
+    market_panel = _load_strategy_market_panel(
+        paths["market_panel"], trading_calendar, settings
+    )
 
     bundle = simulate_strategy(
         predictions,
@@ -1366,6 +1490,99 @@ def backtest_locked_strategy(
     )
 
 
+def _is_sha256(value: Any) -> bool:
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
+
+
+def _validate_completed_strategy_manifest(
+    manifest: Mapping[str, Any], model_name: str, run_directory: Path
+) -> dict[str, str]:
+    if set(manifest) != _STRATEGY_MANIFEST_NAMES:
+        raise ValueError(f"strategy run manifest schema is invalid: {run_directory}")
+    if any(
+        (
+            manifest.get("schema_version") != 1,
+            manifest.get("status") != "completed",
+            manifest.get("purpose")
+            != "frozen_rank_model_static_strategy_2024_2025",
+            manifest.get("model_name") != model_name,
+        )
+    ):
+        raise ValueError(f"strategy run is not completed: {run_directory}")
+    if manifest.get("settings") != _STRATEGY_SETTINGS_CONTRACT:
+        raise ValueError(f"strategy run settings contract is invalid: {run_directory}")
+    if manifest.get("formulas") != _SUMMARY_FORMULAS:
+        raise ValueError(f"strategy run formula contract is invalid: {run_directory}")
+    if manifest.get("observation_conventions") != _STRATEGY_OBSERVATION_CONVENTIONS:
+        raise ValueError(
+            f"strategy run observation contract is invalid: {run_directory}"
+        )
+
+    rows = manifest.get("rows")
+    if (
+        not isinstance(rows, Mapping)
+        or set(rows) != _STRATEGY_ROW_NAMES
+        or any(
+            isinstance(rows[name], bool)
+            or not isinstance(rows[name], int)
+            or rows[name] < 0
+            for name in _STRATEGY_ROW_NAMES
+        )
+        or rows["daily_nav"] != 485
+        or rows["execution_dates"] != 484
+        or rows["daily_nav"] != rows["execution_dates"] + 1
+        or rows["ending_positions"] < 1
+    ):
+        raise ValueError(f"strategy run row counts are invalid: {run_directory}")
+
+    input_hashes = manifest.get("input_sha256")
+    if (
+        not isinstance(input_hashes, Mapping)
+        or set(input_hashes) != set(_STRATEGY_SOURCE_NAMES)
+        or any(not _is_sha256(input_hashes[name]) for name in _STRATEGY_SOURCE_NAMES)
+    ):
+        raise ValueError(f"strategy run input hashes are invalid: {run_directory}")
+    output_hashes = manifest.get("output_sha256")
+    if (
+        not isinstance(output_hashes, Mapping)
+        or set(output_hashes) != set(_STRATEGY_OUTPUT_NAMES)
+        or any(not _is_sha256(output_hashes[name]) for name in _STRATEGY_OUTPUT_NAMES)
+    ):
+        raise ValueError(f"strategy run output hashes are invalid: {run_directory}")
+    return {name: input_hashes[name] for name in _STRATEGY_SOURCE_NAMES}
+
+
+def _strategy_artifact_row_counts(run_directory: Path) -> dict[str, int]:
+    try:
+        import pyarrow.parquet as pq
+
+        return {
+            "daily_nav": len(pd.read_csv(run_directory / "daily_nav.csv")),
+            "execution_dates": len(
+                pd.read_csv(run_directory / "execution_diagnostics.csv")
+            ),
+            "trades": pq.ParquetFile(
+                run_directory / "trades.parquet"
+            ).metadata.num_rows,
+            "positions": pq.ParquetFile(
+                run_directory / "positions.parquet"
+            ).metadata.num_rows,
+            "ending_positions": len(
+                pd.read_csv(run_directory / "ending_positions.csv")
+            ),
+        }
+    except Exception as error:
+        raise ValueError(
+            f"strategy run output row counts are unreadable: {run_directory}"
+        ) from error
+
+
 def compare_strategy_runs(
     run_root: Path,
     output_path: Path,
@@ -1380,28 +1597,23 @@ def compare_strategy_runs(
         raise FileNotFoundError(root)
     destination = Path(output_path)
     rows: list[dict[str, Any]] = []
+    common_source_hashes: dict[str, str] | None = None
     for model_name in names:
         run_directory = root / model_name
         if not run_directory.is_dir():
             raise FileNotFoundError(run_directory)
         manifest = _read_strategy_json(run_directory / "manifest.json", "manifest")
-        if any(
-            (
-                manifest.get("schema_version") != 1,
-                manifest.get("status") != "completed",
-                manifest.get("purpose")
-                != "frozen_rank_model_static_strategy_2024_2025",
-                manifest.get("model_name") != model_name,
-            )
-        ):
-            raise ValueError(f"strategy run is not completed: {run_directory}")
-        hashes = manifest.get("output_sha256")
-        if (
-            not isinstance(hashes, Mapping)
-            or set(hashes) != set(_STRATEGY_OUTPUT_NAMES)
-            or any(not isinstance(hashes[name], str) for name in _STRATEGY_OUTPUT_NAMES)
-        ):
-            raise ValueError(f"strategy run output hashes are invalid: {run_directory}")
+        input_hashes = _validate_completed_strategy_manifest(
+            manifest, model_name, run_directory
+        )
+        current_common_hashes = {
+            name: input_hashes[name] for name in _COMMON_STRATEGY_SOURCE_NAMES
+        }
+        if common_source_hashes is None:
+            common_source_hashes = current_common_hashes
+        elif current_common_hashes != common_source_hashes:
+            raise ValueError("strategy runs have different common source hashes")
+        hashes = manifest["output_sha256"]
         for name in _STRATEGY_OUTPUT_NAMES:
             artifact_path = run_directory / name
             if not artifact_path.is_file():
@@ -1410,15 +1622,35 @@ def compare_strategy_runs(
                 raise ValueError(
                     f"strategy output hash mismatch for {name}: {run_directory}"
                 )
+        if _strategy_artifact_row_counts(run_directory) != manifest["rows"]:
+            raise ValueError(
+                f"strategy run output row counts do not match: {run_directory}"
+            )
         summary_path = run_directory / "metrics_summary.json"
         summary = _read_strategy_json(summary_path, "strategy metrics summary")
+        if set(summary) != set(_SUMMARY_FORMULAS):
+            raise ValueError(f"strategy metric keys are invalid: {run_directory}")
+        if any(
+            isinstance(summary[name], bool)
+            or not isinstance(summary[name], (int, float))
+            or not np.isfinite(summary[name])
+            for name in _SUMMARY_FORMULAS
+        ):
+            raise ValueError(f"strategy metric values are invalid: {run_directory}")
+        if any(
+            isinstance(summary[name], bool) or not isinstance(summary[name], int)
+            for name in _STRATEGY_INTEGER_METRICS
+        ):
+            raise ValueError(f"strategy metric counts are invalid: {run_directory}")
+        if summary["elapsed_trading_observations"] != manifest["rows"][
+            "execution_dates"
+        ]:
+            raise ValueError(
+                f"strategy metric row count is invalid: {run_directory}"
+            )
         row = {
             "model_name": model_name,
-            **{
-                key: value
-                for key, value in summary.items()
-                if key not in {"model_name", "winner", "accept", "champion"}
-            },
+            **{key: summary[key] for key in _SUMMARY_FORMULAS},
         }
         rows.append(row)
 
