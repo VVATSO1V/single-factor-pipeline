@@ -285,6 +285,23 @@ class SignalAndRuleTests(unittest.TestCase):
         self.assertEqual(buy_decision(suspended, SETTINGS), (False, "suspended"))
         self.assertEqual(sell_decision(suspended, SETTINGS), (False, "suspended"))
 
+    def test_missing_and_malformed_suspension_status_blocks_both_sides(self):
+        from rank_model.stages.strategy import buy_decision, sell_decision
+
+        for row in (
+            market_row().drop("is_suspended"),
+            market_row(is_suspended="false"),
+        ):
+            self.assertEqual(buy_decision(row, SETTINGS), (False, "suspension_status"))
+            self.assertEqual(sell_decision(row, SETTINGS), (False, "suspension_status"))
+
+    def test_missing_and_malformed_st_status_blocks_buys_only(self):
+        from rank_model.stages.strategy import buy_decision, sell_decision
+
+        for row in (market_row().drop("is_st"), market_row(is_st="false")):
+            self.assertEqual(buy_decision(row, SETTINGS), (False, "st_status"))
+            self.assertEqual(sell_decision(row, SETTINGS), (True, "eligible"))
+
 
 class TransitionTests(unittest.TestCase):
     signal_date = pd.Timestamp("2024-01-02")
@@ -318,6 +335,33 @@ class TransitionTests(unittest.TestCase):
         self.assertEqual(result.state.positions["B"].units, state.positions["B"].units)
         self.assertEqual(result.state.positions["B"].last_mark, 15.0)
         self.assertNotIn("B", result.trades.index)
+
+    def test_missing_and_malformed_suspension_status_carry_existing_marks(self):
+        from rank_model.stages.strategy import (
+            PortfolioState,
+            Position,
+            transition_at_open,
+        )
+
+        for row in (
+            market_row(post_open=20.0).drop("is_suspended"),
+            market_row(is_suspended="false", post_open=20.0),
+        ):
+            state = PortfolioState(
+                cash=0.0,
+                positions={"A": Position(units=0.1, last_mark=10.0)},
+                previous_nav=1.0,
+            )
+            result = transition_at_open(
+                state,
+                ("A",),
+                market_slice(A=row),
+                self.signal_date,
+                self.execution_date,
+                SETTINGS,
+            )
+
+            self.assertEqual(result.state.positions["A"].last_mark, 10.0)
 
     def test_blocked_sale_is_carried_and_buy_is_not_replaced(self):
         from rank_model.stages.strategy import (

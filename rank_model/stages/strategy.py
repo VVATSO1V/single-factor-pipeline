@@ -228,15 +228,15 @@ def _missing(value: Any) -> bool:
     return bool(result) if isinstance(result, (bool, np.bool_)) else False
 
 
-def _boolean_field(row: Any, field: str, missing_reason: str) -> tuple[bool, str] | None:
+def _boolean_field(row: Any, field: str) -> tuple[bool, str] | None:
     value = _row_value(row, field)
     if _missing(value):
-        return False, missing_reason
+        return None
     if isinstance(value, (bool, np.bool_)):
         return bool(value), ""
     if isinstance(value, (int, float, np.integer, np.floating)) and value in (0, 1):
         return bool(value), ""
-    return False, missing_reason
+    return None
 
 
 def _positive_number(row: Any, field: str) -> tuple[float | None, str | None]:
@@ -253,10 +253,10 @@ def _positive_number(row: Any, field: str) -> tuple[float | None, str | None]:
 
 
 def _common_execution_data(row: Any) -> tuple[dict[str, float], tuple[bool, str] | None]:
-    price_record = _boolean_field(row, "has_price_record", "price_record")
+    price_record = _boolean_field(row, "has_price_record")
     if price_record is None or not price_record[0]:
         return {}, (False, "price_record")
-    suspended = _boolean_field(row, "is_suspended", "suspension_status")
+    suspended = _boolean_field(row, "is_suspended")
     if suspended is None:
         return {}, (False, "suspension_status")
     if suspended[0]:
@@ -287,7 +287,7 @@ def buy_decision(row: Any, settings: StrategySettings) -> tuple[bool, str]:
     if blocked is not None:
         return blocked
 
-    st = _boolean_field(row, "is_st", "st_status")
+    st = _boolean_field(row, "is_st")
     if st is None:
         return False, "st_status"
     if st[0]:
@@ -374,8 +374,8 @@ def _market_rows_by_stock(market: Any) -> dict[str, Any]:
 def _mark_price(row: Any) -> float | None:
     if row is None:
         return None
-    has_price_record = _boolean_field(row, "has_price_record", "price_record")
-    is_suspended = _boolean_field(row, "is_suspended", "suspension_status")
+    has_price_record = _boolean_field(row, "has_price_record")
+    is_suspended = _boolean_field(row, "is_suspended")
     if (
         has_price_record is None
         or not has_price_record[0]
