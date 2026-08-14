@@ -178,6 +178,103 @@ per-model inference, evaluation, and comparison all exclude concurrent writers.
 `entry_tradeable` and all T+1 status filters remain excluded here and enter only
 the later strategy backtest.
 
+## 2024-2025 Static Strategy
+
+After all five sealed locked-test prediction runs exist, run the same static
+Top100 strategy for every frozen model and publish the descriptive comparison:
+
+```powershell
+$models = @(
+  "ridge_rank_regression",
+  "xgboost_rank_regression",
+  "lightgbm_rank_regression",
+  "lightgbm_lambdarank",
+  "mlp_top100_hybrid_rank"
+)
+foreach ($model in $models) {
+  & $python -m rank_model.pipeline --config rank_model\config.toml `
+    backtest-strategy --model $model
+}
+& $python -m rank_model.pipeline --config rank_model\config.toml compare-strategy
+```
+
+Both commands are immutable publishers. `backtest-strategy` fails when its
+model directory already exists, and `compare-strategy` fails when
+`strategy_comparison.csv` already exists. Delete neither output as part of a
+normal rerun.
+
+The strategy period is the 485 official dates from 2024-01-02 through
+2025-12-31. A Top100 signal observed after the close on date T executes only at
+the next official open T+1, producing 484 execution observations plus one
+initial NAV row. The 2025-12-31 signal is not executed because its next open is
+outside the sealed period; dates from 2026 onward remain reserved for forward
+simulation. Orders use only finite `score_raw`, with `stock_code` ascending as
+the deterministic tie breaker. Targets, locked-test metrics, and comparison
+results never enter selection, sizing, or execution.
+
+Rebalancing uses strict set differences. Existing Top100 holdings are untouched,
+holdings outside Top100 become sell attempts, and new Top100 names become buy
+attempts. A blocked sell remains held and is retried while outside Top100. A
+blocked buy is not replaced by rank 101 or any other name. Every eligible buy
+requests `pre_trade_nav / 100`; when available cash cannot fund all eligible
+buys plus costs, one common scale factor is applied to all of them.
+
+A buy requires a non-ST, non-suspended stock with at least 120 listing days,
+valid positive open, adjusted-open, and limit data, and an open at neither
+limit. A sell is blocked only by suspension, missing valid execution or
+valuation data, or an open at limit-down; ST status, listing age, and limit-up
+do not block a sale. Limit checks use unadjusted `raw_open`, `limit_up`, and
+`limit_down`; units and valuation use adjusted `post_open`. A holding without a
+valid mark carries its last valid adjusted-open mark until trading resumes. The
+period ends without forced liquidation.
+
+The execution and report formulas are:
+
+```text
+pre_trade_nav = cash + sum(units * current_or_carried_post_open)
+requested_buy_gross = pre_trade_nav / 100
+buy_cost = executed_buy_gross * (0.0001 commission + 0.0005 slippage)
+sell_cost = executed_sell_gross *
+            (0.0001 commission + 0.0005 slippage + 0.0005 stamp duty)
+end_nav = pre_trade_nav - total_cost
+gross_return = pre_trade_nav / prior_execution_end_nav - 1
+net_return = end_nav / prior_execution_end_nav - 1
+gross_turnover = (executed_buy_gross + executed_sell_gross) / pre_trade_nav
+one_way_turnover = gross_turnover / 2
+cumulative_return = ending_nav / initial_nav - 1
+cagr = (ending_nav / initial_nav) ** (252 / 484) - 1
+annualized_volatility = sample_std(net_return) * sqrt(252)
+sharpe_ratio = mean(net_return) / sample_std(net_return) * sqrt(252)
+max_drawdown = max(1 - nav / running_max_nav)
+win_rate = count(net_return > 0) / 484
+fill_rate = executed_orders / attempted_orders, separately by side
+```
+
+The initial NAV row is included in maximum drawdown and average cash ratio, but
+excluded from return, turnover, cost, and win-rate observations. Average
+turnover uses the 484 execution rows; annualized turnover multiplies the daily
+average by 252. `total_cost` is the sum of daily trade-level costs, and blocked
+sale days count distinct execution dates with at least one blocked sell.
+
+Each directory under `rank_model/strategy_runs/<model-name>` contains:
+
+```text
+daily_nav.csv
+trades.parquet
+positions.parquet
+execution_diagnostics.csv
+ending_positions.csv
+metrics_summary.json
+manifest.json
+```
+
+The manifest records fixed settings, formula and observation contracts, row
+counts, and SHA-256 hashes for all eight sealed inputs and six report outputs.
+`ending_positions.csv` contains the final positions and cash snapshot for
+forward simulation. `rank_model/strategy_comparison.csv` contains exactly five
+rows with `model_name` plus the exact strategy metric schema; it intentionally
+has no winner, decision, acceptance, rejection, or parameter-update field.
+
 ## Artifacts
 
 `prepare` creates the following files under `rank_model/data`:
