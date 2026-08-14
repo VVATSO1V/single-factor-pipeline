@@ -314,6 +314,326 @@ def buy_decision(row: Any, settings: StrategySettings) -> tuple[bool, str]:
     return True, "eligible"
 
 
+@dataclass
+class Position:
+    units: float
+    last_mark: float
+
+
+@dataclass
+class PortfolioState:
+    cash: float
+    positions: dict[str, Position]
+    previous_nav: float
+
+
+@dataclass
+class TransitionResult:
+    state: PortfolioState
+    trades: pd.DataFrame
+    diagnostics: dict[str, float | int]
+    pre_trade_nav: float
+    total_cost: float
+    end_nav: float
+
+
+_TRADE_COLUMNS = (
+    "stock_code",
+    "signal_date",
+    "execution_date",
+    "side",
+    "status",
+    "reason",
+    "requested_gross_notional",
+    "gross_notional",
+    "cost",
+    "units",
+    "raw_open",
+    "post_open",
+)
+
+
+def _market_rows_by_stock(market: Any) -> dict[str, Any]:
+    if not isinstance(market, pd.DataFrame):
+        raise ValueError("execution market slice must be a DataFrame")
+    if "stock_code" in market:
+        stock_codes = market["stock_code"].astype("string")
+    else:
+        stock_codes = pd.Series(market.index, index=market.index, dtype="string")
+    if stock_codes.isna().any() or stock_codes.str.strip().eq("").any():
+        raise ValueError("execution market stock codes must be present")
+    normalized_codes = stock_codes.str.strip()
+    if normalized_codes.duplicated().any():
+        raise ValueError("execution market contains duplicate stock codes")
+    return {
+        str(stock_code): market.iloc[index]
+        for index, stock_code in enumerate(normalized_codes)
+    }
+
+
+def _mark_price(row: Any) -> float | None:
+    if row is None:
+        return None
+    has_price_record = _boolean_field(row, "has_price_record", "price_record")
+    is_suspended = _boolean_field(row, "is_suspended", "suspension_status")
+    if (
+        has_price_record is None
+        or not has_price_record[0]
+        or is_suspended is None
+        or is_suspended[0]
+    ):
+        return None
+    post_open, reason = _positive_number(row, "post_open")
+    return None if reason is not None else post_open
+
+
+def _validated_state(state: PortfolioState) -> PortfolioState:
+    try:
+        cash = float(state.cash)
+        previous_nav = float(state.previous_nav)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("portfolio state is invalid") from error
+    if not np.isfinite(cash) or cash < -1e-12:
+        raise ValueError("portfolio cash must be non-negative and finite")
+    if not np.isfinite(previous_nav):
+        raise ValueError("portfolio previous_nav must be finite")
+
+    positions: dict[str, Position] = {}
+    for stock_code, position in state.positions.items():
+        if not isinstance(stock_code, str) or not stock_code.strip():
+            raise ValueError("portfolio position stock codes must be present")
+        if stock_code in positions:
+            raise ValueError("portfolio contains duplicate position keys")
+        try:
+            units = float(position.units)
+            last_mark = float(position.last_mark)
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ValueError("portfolio position is invalid") from error
+        if not np.isfinite(units) or units <= 0:
+            raise ValueError("portfolio contains non-positive units")
+        if not np.isfinite(last_mark) or last_mark <= 0:
+            raise ValueError("portfolio contains invalid marks")
+        positions[stock_code] = Position(units=units, last_mark=last_mark)
+    return PortfolioState(cash=max(cash, 0.0), positions=positions, previous_nav=previous_nav)
+
+
+def _desired_stock_codes(desired: tuple[str, ...]) -> tuple[str, ...]:
+    if not isinstance(desired, tuple):
+        raise ValueError("desired portfolio must be a tuple")
+    normalized: list[str] = []
+    for stock_code in desired:
+        if not isinstance(stock_code, str) or not stock_code.strip():
+            raise ValueError("desired stock codes must be present")
+        normalized.append(stock_code.strip())
+    if len(normalized) != len(set(normalized)):
+        raise ValueError("desired portfolio contains duplicate order keys")
+    return tuple(normalized)
+
+
+def _trade_record(
+    *,
+    stock_code: str,
+    signal_date: pd.Timestamp,
+    execution_date: pd.Timestamp,
+    side: str,
+    status: str,
+    reason: str,
+    requested_gross_notional: float,
+    gross_notional: float,
+    cost: float,
+    units: float,
+    row: Any,
+) -> dict[str, Any]:
+    raw_open, _ = _positive_number(row, "raw_open") if row is not None else (None, None)
+    post_open, _ = _positive_number(row, "post_open") if row is not None else (None, None)
+    return {
+        "stock_code": stock_code,
+        "signal_date": signal_date,
+        "execution_date": execution_date,
+        "side": side,
+        "status": status,
+        "reason": reason,
+        "requested_gross_notional": requested_gross_notional,
+        "gross_notional": gross_notional,
+        "cost": cost,
+        "units": units,
+        "raw_open": raw_open,
+        "post_open": post_open,
+    }
+
+
+def _trade_frame(records: list[dict[str, Any]]) -> pd.DataFrame:
+    trades = pd.DataFrame(records, columns=_TRADE_COLUMNS).set_index("stock_code")
+    if trades.index.has_duplicates:
+        raise AssertionError("transition generated duplicate order keys")
+    return trades
+
+
+def transition_at_open(
+    state: PortfolioState,
+    desired: tuple[str, ...],
+    market: pd.DataFrame,
+    signal_date: Any,
+    execution_date: Any,
+    settings: StrategySettings,
+) -> TransitionResult:
+    """Execute one deterministic open-to-open set-difference rebalance."""
+    result_state = _validated_state(state)
+    desired_codes = _desired_stock_codes(desired)
+    market_rows = _market_rows_by_stock(market)
+    signal_timestamp = pd.Timestamp(signal_date).normalize()
+    execution_timestamp = pd.Timestamp(execution_date).normalize()
+
+    for stock_code, position in result_state.positions.items():
+        mark = _mark_price(market_rows.get(stock_code))
+        if mark is not None:
+            position.last_mark = mark
+
+    pre_trade_nav = result_state.cash + sum(
+        position.units * position.last_mark
+        for position in result_state.positions.values()
+    )
+    if not np.isfinite(pre_trade_nav) or pre_trade_nav < 0:
+        raise AssertionError("pre-trade NAV is invalid")
+
+    records: list[dict[str, Any]] = []
+    desired_set = set(desired_codes)
+    held_before_sales = set(result_state.positions)
+    total_cost = 0.0
+
+    for stock_code in sorted(held_before_sales - desired_set):
+        position = result_state.positions[stock_code]
+        row = market_rows.get(stock_code)
+        eligible, reason = sell_decision(row, settings)
+        requested_gross = position.units * position.last_mark
+        if eligible:
+            gross_notional = requested_gross
+            cost = gross_notional * settings.sell_cost_rate
+            result_state.cash += gross_notional - cost
+            total_cost += cost
+            del result_state.positions[stock_code]
+            status = "executed"
+            units = position.units
+        else:
+            gross_notional = 0.0
+            cost = 0.0
+            status = "blocked"
+            units = 0.0
+        records.append(
+            _trade_record(
+                stock_code=stock_code,
+                signal_date=signal_timestamp,
+                execution_date=execution_timestamp,
+                side="sell",
+                status=status,
+                reason=reason,
+                requested_gross_notional=requested_gross,
+                gross_notional=gross_notional,
+                cost=cost,
+                units=units,
+                row=row,
+            )
+        )
+
+    entry_candidates = sorted(desired_set - set(result_state.positions))
+    requested_buy_gross = pre_trade_nav / settings.top_k
+    eligible_buys: dict[str, Any] = {}
+    blocked_buys: dict[str, tuple[Any, str]] = {}
+    for stock_code in entry_candidates:
+        row = market_rows.get(stock_code)
+        eligible, reason = buy_decision(row, settings)
+        if eligible:
+            eligible_buys[stock_code] = row
+        else:
+            blocked_buys[stock_code] = (row, reason)
+
+    gross_buy_capacity = len(eligible_buys) * requested_buy_gross * (1 + settings.buy_cost_rate)
+    buy_scale = min(1.0, result_state.cash / gross_buy_capacity) if gross_buy_capacity else 1.0
+    buy_scale = max(0.0, buy_scale)
+    for stock_code in entry_candidates:
+        if stock_code in blocked_buys:
+            row, reason = blocked_buys[stock_code]
+            status = "blocked"
+            gross_notional = 0.0
+            cost = 0.0
+            units = 0.0
+        elif buy_scale == 0.0:
+            row = eligible_buys[stock_code]
+            reason = "cash"
+            status = "blocked"
+            gross_notional = 0.0
+            cost = 0.0
+            units = 0.0
+        else:
+            row = eligible_buys[stock_code]
+            post_open, reason = _positive_number(row, "post_open")
+            if reason is not None or post_open is None:
+                raise AssertionError("eligible buy has no valid post_open")
+            gross_notional = requested_buy_gross * buy_scale
+            cost = gross_notional * settings.buy_cost_rate
+            units = gross_notional / post_open
+            if units <= 0:
+                raise AssertionError("transition generated non-positive units")
+            result_state.cash -= gross_notional + cost
+            total_cost += cost
+            result_state.positions[stock_code] = Position(units=units, last_mark=post_open)
+            reason = "eligible"
+            status = "executed"
+        records.append(
+            _trade_record(
+                stock_code=stock_code,
+                signal_date=signal_timestamp,
+                execution_date=execution_timestamp,
+                side="buy",
+                status=status,
+                reason=reason,
+                requested_gross_notional=requested_buy_gross,
+                gross_notional=gross_notional,
+                cost=cost,
+                units=units,
+                row=row,
+            )
+        )
+
+    trades = _trade_frame(records)
+    intersection = held_before_sales.intersection(desired_set)
+    if set(trades.index).intersection(intersection):
+        raise AssertionError("transition generated intersection trades")
+    if result_state.cash < -1e-12:
+        raise AssertionError("transition generated negative cash")
+    result_state.cash = max(result_state.cash, 0.0)
+    for position in result_state.positions.values():
+        if position.units <= 0:
+            raise AssertionError("transition generated non-positive units")
+
+    end_nav = result_state.cash + sum(
+        position.units * position.last_mark
+        for position in result_state.positions.values()
+    )
+    if abs(end_nav - (pre_trade_nav - total_cost)) > 1e-10:
+        raise AssertionError("transition NAV accounting does not reconcile")
+    result_state.previous_nav = end_nav
+
+    diagnostics: dict[str, float | int] = {
+        "pre_trade_nav": pre_trade_nav,
+        "end_nav": end_nav,
+        "total_cost": total_cost,
+        "buy_scale": buy_scale,
+        "attempted_order_count": len(trades),
+        "executed_order_count": int(trades["status"].eq("executed").sum()),
+        "blocked_order_count": int(trades["status"].eq("blocked").sum()),
+        "replacement_buy_count": 0,
+    }
+    return TransitionResult(
+        state=result_state,
+        trades=trades,
+        diagnostics=diagnostics,
+        pre_trade_nav=pre_trade_nav,
+        total_cost=total_cost,
+        end_nav=end_nav,
+    )
+
+
 def _require_sha256(value: Any, label: str) -> str:
     if not isinstance(value, str) or len(value) != 64:
         raise ValueError(f"locked-test conclusion has invalid {label} hash")

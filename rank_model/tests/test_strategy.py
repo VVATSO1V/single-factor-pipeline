@@ -179,6 +179,13 @@ def market_row(
     )
 
 
+def market_slice(**rows):
+    return pd.DataFrame.from_dict(
+        {stock_code: row.to_dict() for stock_code, row in rows.items()},
+        orient="index",
+    )
+
+
 class SignalAndRuleTests(unittest.TestCase):
     def test_top100_uses_score_then_stock_code(self):
         predictions = prediction_frame(rows_per_date=1000)
@@ -277,3 +284,158 @@ class SignalAndRuleTests(unittest.TestCase):
         suspended = market_row(is_suspended=True)
         self.assertEqual(buy_decision(suspended, SETTINGS), (False, "suspended"))
         self.assertEqual(sell_decision(suspended, SETTINGS), (False, "suspended"))
+
+
+class TransitionTests(unittest.TestCase):
+    signal_date = pd.Timestamp("2024-01-02")
+    execution_date = pd.Timestamp("2024-01-03")
+
+    def test_intersection_units_never_change(self):
+        from rank_model.stages.strategy import (
+            PortfolioState,
+            Position,
+            transition_at_open,
+        )
+
+        state = PortfolioState(
+            cash=0.0,
+            positions={
+                "A": Position(units=0.1, last_mark=10.0),
+                "B": Position(units=0.2, last_mark=10.0),
+            },
+            previous_nav=3.0,
+        )
+        market = market_slice(
+            A=market_row(),
+            B=market_row(post_open=15.0),
+            C=market_row(),
+        )
+
+        result = transition_at_open(
+            state, ("B", "C"), market, self.signal_date, self.execution_date, SETTINGS
+        )
+
+        self.assertEqual(result.state.positions["B"].units, state.positions["B"].units)
+        self.assertEqual(result.state.positions["B"].last_mark, 15.0)
+        self.assertNotIn("B", result.trades.index)
+
+    def test_blocked_sale_is_carried_and_buy_is_not_replaced(self):
+        from rank_model.stages.strategy import (
+            PortfolioState,
+            Position,
+            transition_at_open,
+        )
+
+        state = PortfolioState(
+            cash=0.0,
+            positions={"A": Position(units=0.1, last_mark=10.0)},
+            previous_nav=1.0,
+        )
+        market = market_slice(
+            A=market_row(is_suspended=True),
+            B=market_row(is_suspended=True),
+        )
+
+        result = transition_at_open(
+            state, ("B",), market, self.signal_date, self.execution_date, SETTINGS
+        )
+
+        self.assertIn("A", result.state.positions)
+        self.assertEqual(result.state.positions["A"].last_mark, 10.0)
+        self.assertNotIn("B", result.state.positions)
+        self.assertEqual(result.diagnostics["replacement_buy_count"], 0)
+        self.assertEqual(result.trades.loc["A", "reason"], "suspended")
+        self.assertEqual(result.trades.loc["B", "reason"], "suspended")
+        self.assertEqual(result.trades.loc["A", "status"], "blocked")
+        self.assertEqual(result.trades.loc["B", "status"], "blocked")
+
+    def test_cash_shortage_scales_all_eligible_buys_equally(self):
+        from rank_model.stages.strategy import (
+            PortfolioState,
+            Position,
+            transition_at_open,
+        )
+
+        state = PortfolioState(
+            cash=0.0006,
+            positions={"C": Position(units=0.09994, last_mark=10.0)},
+            previous_nav=1.0,
+        )
+        market = market_slice(
+            A=market_row(),
+            B=market_row(),
+            C=market_row(is_suspended=True),
+        )
+
+        result = transition_at_open(
+            state, ("A", "B"), market, self.signal_date, self.execution_date, SETTINGS
+        )
+
+        self.assertAlmostEqual(
+            result.trades.loc["A", "gross_notional"],
+            result.trades.loc["B", "gross_notional"],
+        )
+        self.assertLess(result.diagnostics["buy_scale"], 1.0)
+        self.assertEqual(result.trades.loc["C", "status"], "blocked")
+
+    def test_marking_and_all_execution_costs_reconcile_nav(self):
+        from rank_model.stages.strategy import (
+            PortfolioState,
+            Position,
+            transition_at_open,
+        )
+
+        state = PortfolioState(
+            cash=0.0,
+            positions={"A": Position(units=0.1, last_mark=10.0)},
+            previous_nav=1.0,
+        )
+        market = market_slice(
+            A=market_row(raw_open=10.0, post_open=20.0),
+            B=market_row(raw_open=10.0, post_open=10.0),
+        )
+
+        result = transition_at_open(
+            state, ("B",), market, self.signal_date, self.execution_date, SETTINGS
+        )
+
+        self.assertAlmostEqual(result.pre_trade_nav, 2.0)
+        self.assertAlmostEqual(result.trades.loc["A", "cost"], 0.0022)
+        self.assertAlmostEqual(result.trades.loc["B", "cost"], 0.000012)
+        self.assertAlmostEqual(result.total_cost, 0.002212)
+        self.assertAlmostEqual(result.end_nav, result.pre_trade_nav - result.total_cost)
+        self.assertAlmostEqual(result.state.previous_nav, result.end_nav)
+
+    def test_rejects_nonpositive_positions_and_duplicate_order_keys(self):
+        from rank_model.stages.strategy import (
+            PortfolioState,
+            Position,
+            transition_at_open,
+        )
+
+        market = market_slice(A=market_row())
+        invalid_state = PortfolioState(
+            cash=1.0,
+            positions={"A": Position(units=0.0, last_mark=10.0)},
+            previous_nav=1.0,
+        )
+        with self.assertRaisesRegex(ValueError, "non-positive units"):
+            transition_at_open(
+                invalid_state,
+                (),
+                market,
+                self.signal_date,
+                self.execution_date,
+                SETTINGS,
+            )
+
+        valid_state = PortfolioState(cash=1.0, positions={}, previous_nav=1.0)
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            transition_at_open(
+                valid_state,
+                ("A", "A"),
+                market,
+                self.signal_date,
+                self.execution_date,
+                SETTINGS,
+            )
