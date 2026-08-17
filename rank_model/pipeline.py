@@ -513,6 +513,7 @@ def command_backtest_strategy_10d(
     return backtest_staggered_strategy(
         model_name,
         destination=paths["strategy_10d_runs_dir"] / model_name,
+        publication_root=paths["strategy_10d_runs_dir"],
         settings=load_strategy_settings(config),
         source_paths=_strategy_source_paths(paths, model_name),
     )
@@ -534,6 +535,7 @@ def command_compare_strategy_10d(
         paths["daily_vs_10d_comparison"],
         source_paths_by_model,
         LOCKED_MODEL_NAMES,
+        settings=load_strategy_settings(config),
     )
 
 

@@ -45,6 +45,7 @@ from rank_model.stages.strategy import (
     _release_strategy_lock,
     _sealed_strategy_contract,
     _settings_manifest,
+    _strategy_source_hashes,
     _write_json_file,
     _validate_completed_strategy_manifest,
     load_locked_strategy_inputs,
@@ -703,11 +704,86 @@ def _stored_offset_row_counts(directory: Path) -> dict[str, int]:
         ) from error
 
 
+def _authoritative_staggered_contract(
+    model_name: str,
+    source_paths: Mapping[str, Path],
+    settings: StrategySettings,
+) -> tuple[dict[str, str], tuple[OffsetSchedule, ...], pd.DatetimeIndex]:
+    if (
+        not isinstance(settings, StrategySettings)
+        or _settings_manifest(settings) != _STRATEGY_SETTINGS_CONTRACT
+    ):
+        raise ValueError("staggered strategy settings do not match the locked contract")
+    source_hashes = _strategy_source_hashes(source_paths, model_name)
+    _validate_source_provenance(source_paths, source_hashes)
+    try:
+        calendar = pd.read_csv(
+            Path(source_paths["trading_calendar"]),
+            usecols=["date"],
+            dtype={"date": "string"},
+        )
+    except Exception as error:
+        raise ValueError("sealed staggered trading calendar is unreadable") from error
+    official = _calendar_dates(calendar)
+    period = official[(official >= settings.start) & (official <= settings.end)]
+    schedules = tuple(build_offset_schedules(calendar, settings))
+    return source_hashes, schedules, period
+
+
+def _validate_daily_schedule_annotations(
+    daily_path: Path,
+    schedule: OffsetSchedule,
+    period: pd.DatetimeIndex,
+) -> None:
+    try:
+        daily = pd.read_csv(
+            daily_path,
+            usecols=["date", "offset", "is_rebalance", "active_signal_date"],
+            dtype="string",
+            keep_default_na=False,
+        )
+    except Exception as error:
+        raise ValueError(
+            "staggered offset daily schedule annotations are unreadable"
+        ) from error
+    expected_dates = period[period <= schedule.final_horizon_date]
+    expected_date_values = [date.date().isoformat() for date in expected_dates]
+    execution_to_signal = {
+        execution: signal
+        for signal, execution in zip(
+            schedule.signal_dates, schedule.execution_dates, strict=True
+        )
+    }
+    active_signal = ""
+    expected_rebalance: list[str] = []
+    expected_active_signal: list[str] = []
+    for date in expected_dates:
+        signal = execution_to_signal.get(pd.Timestamp(date))
+        if signal is not None:
+            active_signal = pd.Timestamp(signal).date().isoformat()
+            expected_rebalance.append("True")
+        else:
+            expected_rebalance.append("False")
+        expected_active_signal.append(active_signal)
+    if (
+        daily["date"].tolist() != expected_date_values
+        or daily["offset"].tolist() != [str(schedule.offset)] * len(expected_dates)
+        or daily["is_rebalance"].tolist() != expected_rebalance
+        or daily["active_signal_date"].tolist() != expected_active_signal
+    ):
+        raise ValueError(
+            "staggered offset daily schedule annotations do not match the "
+            "authoritative schedule"
+        )
+
+
 def _validate_offset_publication(
     run_directory: Path,
     model_name: str,
     descriptor: Mapping[str, Any],
     source_hashes: Mapping[str, str],
+    authoritative_schedule: OffsetSchedule,
+    period: pd.DatetimeIndex,
 ) -> None:
     expected_files = {*_STRATEGY_OUTPUT_NAMES, "manifest.json"}
     _require_exact_children(run_directory, expected_files, "staggered offset")
@@ -745,6 +821,10 @@ def _validate_offset_publication(
         raise ValueError("staggered offset schedule or formula hash does not match")
     if descriptor.get("schedule") != schedule:
         raise ValueError("staggered offset schedule does not match model manifest")
+    if schedule != _schedule_manifest(authoritative_schedule):
+        raise ValueError(
+            "staggered offset manifest does not match the authoritative schedule"
+        )
 
     output_hashes = manifest.get("output_sha256")
     if (
@@ -769,13 +849,13 @@ def _validate_offset_publication(
     )
     if set(metrics) != set(_SUMMARY_FORMULAS):
         raise ValueError("staggered offset metric formula contract is incomplete")
-    daily = pd.read_csv(run_directory / "daily_nav.csv", usecols=["date"])
     if not schedule.get("signal_dates") or not schedule.get("execution_dates"):
         raise ValueError("staggered offset schedule dates are incomplete")
     if len(schedule["signal_dates"]) != len(schedule["execution_dates"]):
         raise ValueError("staggered offset schedule date counts do not match")
-    if str(daily["date"].iloc[-1])[:10] != schedule.get("final_horizon_date"):
-        raise ValueError("staggered offset final horizon does not match its NAV")
+    _validate_daily_schedule_annotations(
+        run_directory / "daily_nav.csv", authoritative_schedule, period
+    )
 
 
 def _model_manifest_logical_hash(manifest: Mapping[str, Any]) -> str:
@@ -790,11 +870,13 @@ def _validate_staggered_publication(
     run_directory: Path,
     model_name: str,
     source_paths: Mapping[str, Path],
-    source_hashes: Mapping[str, str],
+    settings: StrategySettings,
 ) -> None:
     """Validate a complete model publication and its current provenance."""
     run_directory = Path(run_directory)
-    _validate_source_provenance(source_paths, source_hashes)
+    source_hashes, authoritative_schedules, period = (
+        _authoritative_staggered_contract(model_name, source_paths, settings)
+    )
     expected_root = {
         *(f"offset_{offset:02d}" for offset in range(1, 11)),
         *_STAGGERED_MODEL_OUTPUT_NAMES,
@@ -865,11 +947,14 @@ def _validate_staggered_publication(
         if not isinstance(schedule, Mapping):
             raise ValueError("staggered model offset schedule is invalid")
         schedules.append(schedule)
+        authoritative_schedule = authoritative_schedules[expected_offset - 1]
         _validate_offset_publication(
             run_directory / expected_path,
             model_name,
             descriptor,
             source_hashes,
+            authoritative_schedule,
+            period,
         )
 
     settings_payload = manifest["settings"]
@@ -908,47 +993,68 @@ def _validate_staggered_publication(
     if set(average_metrics) != set(AVERAGE_METRICS):
         raise ValueError("staggered average metric formula contract is incomplete")
     schedule_summary = manifest.get("schedule")
+    authoritative_common_end = min(
+        schedule.final_horizon_date for schedule in authoritative_schedules
+    )
+    expected_average_dates = period[period <= authoritative_common_end]
+    if average_nav["date"].astype(str).str[:10].tolist() != [
+        date.date().isoformat() for date in expected_average_dates
+    ]:
+        raise ValueError("staggered average NAV does not match the authoritative schedule")
     expected_schedule_summary = {
         "horizon_trading_days": STAGGERED_HORIZON,
         "offset_count": STAGGERED_OFFSET_COUNT,
-        "common_start_date": str(average_nav["date"].iloc[0])[:10],
-        "common_end_date": str(average_nav["date"].iloc[-1])[:10],
-        "earliest_final_horizon_date": min(
-            schedule["final_horizon_date"] for schedule in schedules
-        ),
+        "common_start_date": period[0].date().isoformat(),
+        "common_end_date": authoritative_common_end.date().isoformat(),
+        "earliest_final_horizon_date": authoritative_common_end.date().isoformat(),
     }
     if schedule_summary != expected_schedule_summary:
         raise ValueError("staggered model common schedule does not match")
 
 
-def _validate_publication_destination(model_name: str, destination: Path) -> Path:
+def _validate_publication_destination(
+    model_name: str, destination: Path, publication_root: Path
+) -> tuple[Path, Path]:
     destination = Path(destination)
+    publication_root = Path(publication_root)
     if model_name not in LOCKED_MODEL_NAMES:
         raise ValueError(f"strategy model is not frozen: {model_name}")
+    if ".." in destination.parts or ".." in publication_root.parts:
+        raise ValueError(
+            "staggered strategy destination must stay inside its publication root"
+        )
+    _validate_no_reparse_ancestry(
+        publication_root, "staggered strategy publication root"
+    )
+    _validate_no_reparse_ancestry(destination, "staggered strategy destination")
+    resolved_root = publication_root.resolve(strict=False)
+    resolved_destination = destination.resolve(strict=False)
     if (
-        destination.name != model_name
-        or destination.parent.name != "strategy_10d_runs"
-        or ".." in destination.parts
+        resolved_root.name != "strategy_10d_runs"
+        or resolved_destination != resolved_root / model_name
     ):
         raise ValueError(
-            "staggered strategy destination must be strategy_10d_runs/<model>"
+            "staggered strategy destination must be exactly "
+            "<publication root>/<model>"
         )
-    _validate_no_reparse_ancestry(destination, "staggered strategy destination")
-    return destination
+    return resolved_destination, resolved_root
 
 
 def backtest_staggered_strategy(
     model_name: str,
     *,
     destination: Path,
+    publication_root: Path,
     settings: StrategySettings,
     source_paths: Mapping[str, Path],
 ) -> Path:
     """Publish all ten offset paths and aggregate reports atomically."""
-    destination = _validate_publication_destination(model_name, destination)
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination, publication_root = _validate_publication_destination(
+        model_name, destination, publication_root
+    )
+    publication_root.mkdir(parents=True, exist_ok=True)
     _validate_no_reparse_ancestry(destination, "staggered strategy destination")
-    lock_path = destination.parent / ".strategy-10d.lock"
+    lock_path = publication_root / ".strategy-10d.lock"
     if _is_reparse_escape(lock_path):
         raise ValueError(
             "staggered strategy publication lock may not be a symlink, junction, "
@@ -961,7 +1067,7 @@ def backtest_staggered_strategy(
             raise FileExistsError(
                 f"staggered strategy run already exists: {destination}"
             )
-        stale_staging = list(destination.parent.glob(f".{destination.name}.*"))
+        stale_staging = list(publication_root.glob(f".{destination.name}.*"))
         if stale_staging:
             raise FileExistsError(
                 f"partial staggered strategy staging already exists: {stale_staging[0]}"
@@ -991,7 +1097,7 @@ def backtest_staggered_strategy(
         average_metrics = summarize_average_nav(average_nav, settings)
 
         staging = Path(
-            tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent)
+            tempfile.mkdtemp(prefix=f".{destination.name}.", dir=publication_root)
         )
         offset_descriptors = [
             _write_staggered_offset(
@@ -1063,7 +1169,7 @@ def backtest_staggered_strategy(
             staging,
             model_name,
             loaded_paths,
-            inputs.source_hashes,
+            settings,
         )
         _validate_source_provenance(loaded_paths, inputs.source_hashes)
         _validate_no_reparse_ancestry(
@@ -1446,18 +1552,16 @@ def _read_staggered_model_metrics(
     model_name: str,
     source_paths: Mapping[str, Path],
     comparison_directory: Path,
+    settings: StrategySettings,
 ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any]]:
     run_directory = run_root / model_name
     if not run_directory.is_dir():
         raise FileNotFoundError(run_directory)
     manifest_path = run_directory / "manifest.json"
-    manifest = _read_json_object(manifest_path, "staggered model manifest")
-    source_hashes = manifest.get("input_sha256")
-    if not isinstance(source_hashes, Mapping):
-        raise ValueError("staggered model manifest source hashes are invalid")
     _validate_staggered_publication(
-        run_directory, model_name, source_paths, source_hashes
+        run_directory, model_name, source_paths, settings
     )
+    manifest = _read_json_object(manifest_path, "staggered model manifest")
     average_metrics = _read_json_object(
         run_directory / "average_metrics.json", "staggered average metrics"
     )
@@ -1507,6 +1611,8 @@ def compare_staggered_strategy_runs(
     daily_vs_output_path: Path,
     source_paths_by_model: Mapping[str, Mapping[str, Path]],
     model_names: Sequence[str] = LOCKED_MODEL_NAMES,
+    *,
+    settings: StrategySettings,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Publish immutable five-model 10-day and daily-policy comparisons."""
     names = tuple(model_names)
@@ -1542,6 +1648,7 @@ def compare_staggered_strategy_runs(
             model_name,
             source_paths_by_model[model_name],
             comparison_path.parent,
+            settings,
         )
         rows.append(row)
         model_anchors.append(anchor)

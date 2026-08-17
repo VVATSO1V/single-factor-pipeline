@@ -293,7 +293,7 @@ git commit -m "feat(rank-model): simulate staggered 10d paths"
 - Consumes: ten `StaggeredPathBundle` instances.
 - Produces: `build_offset_metrics`, `build_offset_summary`,
   `build_average_nav`, and `summarize_average_nav`.
-- Produces: `backtest_staggered_strategy(model_name, *, destination, settings, source_paths) -> Path`.
+- Produces: `backtest_staggered_strategy(model_name, *, destination, publication_root, settings, source_paths) -> Path`.
 
 - [ ] **Step 1: Write failing aggregation tests**
 
@@ -357,13 +357,15 @@ def backtest_staggered_strategy(
     model_name: str,
     *,
     destination: Path,
+    publication_root: Path,
     settings: StrategySettings,
     source_paths: Mapping[str, Path],
 ) -> Path:
     """Publish all ten offset paths and aggregate reports atomically."""
 ```
 
-Load inputs once with `load_locked_strategy_inputs`, simulate ten paths, build
+Require `destination` to be exactly `<publication_root>/<locked model>`. Load
+inputs once with `load_locked_strategy_inputs`, simulate ten paths, build
 aggregates, write everything under one sibling staging directory, validate all
 hashes, and atomically rename to `strategy_10d_runs/<model>`. Use a distinct
 `.strategy-10d.lock`. Do not call a real five-model input in tests.
