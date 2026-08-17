@@ -21,6 +21,13 @@ from rank_model.stages.strategy import (
     simulate_strategy,
     transition_at_open,
 )
+from rank_model.stages.staggered_strategy import (
+    OffsetSchedule,
+    StaggeredPathBundle,
+    _validate_offset_schedules,
+    build_offset_schedules,
+    simulate_staggered_offset,
+)
 
 
 def _settings(*, start: str = "2024-01-02", end: str = "2024-01-04") -> StrategySettings:
@@ -52,6 +59,24 @@ def _market_row(stock_code: str, raw_open: float, post_open: float, **overrides:
         "limit_down": raw_open * 0.8,
         **overrides,
     }
+
+
+def _schedule_settings(start: pd.Timestamp, end: pd.Timestamp) -> StrategySettings:
+    return StrategySettings(
+        **{
+            **_settings().__dict__,
+            "start": start,
+            "end": end,
+        }
+    )
+
+
+def _sealed_synthetic_calendar() -> pd.DataFrame:
+    signal_dates = pd.bdate_range("2024-01-02", periods=473).append(
+        pd.DatetimeIndex([pd.Timestamp("2025-12-16")])
+    )
+    completion_dates = pd.bdate_range("2025-12-17", periods=11)
+    return pd.DataFrame({"date": signal_dates.append(completion_dates)})
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -229,8 +254,10 @@ class TransitionModeTests(unittest.TestCase):
         self.assertEqual(result.state.positions["KEEP"].units, 1.0)
         self.assertEqual(result.state.positions["KEEP"].last_mark, 12.0)
         self.assertIn("EXIT", result.state.positions)
-        self.assertTrue(result.trades.query("stock_code == 'EXIT'")["side"].eq("sell").all())
-        self.assertTrue(result.trades.query("stock_code == 'EXIT'")["status"].eq("blocked").all())
+        exit_trades = result.trades.query("stock_code == 'EXIT'")
+        self.assertEqual(len(exit_trades), 1)
+        self.assertTrue(exit_trades["side"].eq("sell").all())
+        self.assertTrue(exit_trades["status"].eq("blocked").all())
 
     def test_default_buy_mode_preserves_transition_snapshot(self) -> None:
         market = pd.DataFrame(
@@ -461,6 +488,291 @@ class DailyRegressionTests(unittest.TestCase):
                 "blocked_sale_days": 0,
                 "ending_nav": 1.1,
             },
+        )
+
+
+class ScheduleTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.calendar = _sealed_synthetic_calendar()
+        self.period = pd.DatetimeIndex(self.calendar["date"])
+        self.settings = _schedule_settings(self.period[0], self.period[-1])
+
+    def test_partitions_every_complete_signal_into_ten_offsets(self) -> None:
+        schedules = build_offset_schedules(self.calendar, self.settings)
+
+        self.assertEqual(len(schedules), 10)
+        self.assertEqual(sum(len(schedule.signal_dates) for schedule in schedules), 474)
+        self.assertEqual(
+            {date for schedule in schedules for date in schedule.signal_dates},
+            set(self.period[:-11]),
+        )
+        self.assertEqual(schedules[0].execution_dates[0], self.period[1])
+        self.assertEqual(schedules[9].execution_dates[0], self.period[10])
+        self.assertEqual(
+            min(schedule.final_horizon_date for schedule in schedules),
+            self.period[475],
+        )
+        self.assertEqual(self.period[:-11][0], pd.Timestamp("2024-01-02"))
+        self.assertEqual(self.period[:-11][-1], pd.Timestamp("2025-12-16"))
+
+    def test_offset_schedule_normalizes_date_sequences_to_immutable_tuples(self) -> None:
+        schedule = OffsetSchedule(
+            offset=1,
+            signal_dates=[self.period[0]],
+            execution_dates=[self.period[1]],
+            final_horizon_date=self.period[11],
+        )
+
+        self.assertIsInstance(schedule.signal_dates, tuple)
+        self.assertIsInstance(schedule.execution_dates, tuple)
+
+    def test_rejects_duplicate_dates_and_short_periods(self) -> None:
+        duplicate_calendar = pd.concat(
+            [self.calendar, self.calendar.iloc[[0]]], ignore_index=True
+        )
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            build_offset_schedules(duplicate_calendar, self.settings)
+
+        short_period = self.calendar.iloc[:11].copy()
+        short_settings = _schedule_settings(
+            pd.Timestamp(short_period["date"].iloc[0]),
+            pd.Timestamp(short_period["date"].iloc[-1]),
+        )
+        with self.assertRaisesRegex(ValueError, "at least 12"):
+            build_offset_schedules(short_period, short_settings)
+
+    def test_validator_rejects_missing_or_overlapping_offsets(self) -> None:
+        schedules = build_offset_schedules(self.calendar, self.settings)
+        with self.assertRaisesRegex(ValueError, "exactly 10"):
+            _validate_offset_schedules(schedules[:-1], self.period)
+
+        overlapping = (*schedules[:1], schedules[0], *schedules[2:])
+        with self.assertRaisesRegex(ValueError, "partition"):
+            _validate_offset_schedules(overlapping, self.period)
+
+
+class PathSimulationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dates = pd.bdate_range("2024-01-02", periods=32)
+        self.settings = StrategySettings(
+            **{
+                **_settings().__dict__,
+                "start": self.dates[0],
+                "end": self.dates[-1],
+                "top_k": 2,
+                "expected_cross_section_size": 4,
+                "commission_rate": 0.0,
+                "slippage_rate": 0.0,
+                "sell_stamp_duty_rate": 0.0,
+            }
+        )
+        self.schedule = OffsetSchedule(
+            offset=3,
+            signal_dates=(self.dates[2], self.dates[12], self.dates[20]),
+            execution_dates=(self.dates[3], self.dates[13], self.dates[21]),
+            final_horizon_date=self.dates[31],
+        )
+
+    def _predictions(
+        self, desired_by_date: dict[pd.Timestamp, tuple[str, str]]
+    ) -> pd.DataFrame:
+        rows: list[dict[str, object]] = []
+        for date in self.dates:
+            desired = desired_by_date.get(date, ("A", "B"))
+            scores = {
+                stock_code: float(4 - desired.index(stock_code))
+                if stock_code in desired
+                else 1.0
+                for stock_code in ("A", "B", "C", "D")
+            }
+            rows.extend(
+                {
+                    "date": date,
+                    "stock_code": stock_code,
+                    "score_raw": scores[stock_code],
+                    "split": "test",
+                    "horizon": 10,
+                }
+                for stock_code in ("A", "B", "C", "D")
+            )
+        return pd.DataFrame(rows)
+
+    def _market(
+        self, overrides: dict[tuple[pd.Timestamp, str], dict[str, object]] | None = None
+    ) -> pd.DataFrame:
+        overrides = overrides or {}
+        rows: list[dict[str, object]] = []
+        for date in self.dates:
+            for stock_code in ("A", "B", "C", "D"):
+                row = {"date": date, **_market_row(stock_code, 10.0, 10.0)}
+                row.update(overrides.get((date, stock_code), {}))
+                rows.append(row)
+        return pd.DataFrame(rows)
+
+    def _simulate(
+        self,
+        desired_by_date: dict[pd.Timestamp, tuple[str, str]],
+        overrides: dict[tuple[pd.Timestamp, str], dict[str, object]] | None = None,
+    ) -> StaggeredPathBundle:
+        return simulate_staggered_offset(
+            self._predictions(desired_by_date),
+            self._market(overrides),
+            pd.DataFrame({"date": self.dates}),
+            self.settings,
+            self.schedule,
+        )
+
+    def test_stays_in_cash_before_first_execution_and_marks_between_rebalances(self) -> None:
+        bundle = self._simulate(
+            {
+                self.dates[2]: ("A", "B"),
+                self.dates[4]: ("C", "D"),
+                self.dates[12]: ("C", "D"),
+                self.dates[20]: ("C", "D"),
+            },
+            {(self.dates[4], "A"): {"post_open": 12.0}},
+        )
+
+        daily = bundle.strategy.daily_nav
+        for date in self.dates[:3]:
+            self.assertEqual(daily.loc[date, "nav"], 1.0)
+            self.assertEqual(daily.loc[date, "holding_count"], 0)
+            self.assertFalse(daily.loc[date, "is_rebalance"])
+        self.assertTrue(daily.loc[self.dates[3], "is_rebalance"])
+        self.assertEqual(daily.loc[self.dates[3], "active_signal_date"], self.dates[2])
+        self.assertFalse(daily.loc[self.dates[4], "is_rebalance"])
+        self.assertEqual(daily.loc[self.dates[4], "active_signal_date"], self.dates[2])
+        self.assertEqual(daily.loc[self.dates[4], "nav"], 1.1)
+        self.assertTrue(
+            bundle.strategy.trades.loc[
+                bundle.strategy.trades["execution_date"].eq(self.dates[4])
+            ].empty
+        )
+        self.assertSetEqual(
+            set(
+                bundle.strategy.trades.loc[
+                    bundle.strategy.trades["execution_date"].eq(self.dates[13]),
+                    "stock_code",
+                ]
+            ),
+            {"A", "B", "C", "D"},
+        )
+        diagnostic = bundle.strategy.execution_diagnostics.loc[
+            bundle.strategy.execution_diagnostics["execution_date"].eq(self.dates[4])
+        ].iloc[0]
+        self.assertEqual(diagnostic["offset"], 3)
+        self.assertFalse(diagnostic["is_rebalance"])
+        self.assertEqual(diagnostic["active_signal_date"], self.dates[2])
+
+    def test_retries_a_blocked_sell_on_the_next_day(self) -> None:
+        bundle = self._simulate(
+            {
+                self.dates[2]: ("A", "B"),
+                self.dates[12]: ("C", "D"),
+                self.dates[20]: ("C", "D"),
+            },
+            {(self.dates[13], "A"): {"is_suspended": True}},
+        )
+
+        sales = bundle.strategy.trades.loc[
+            bundle.strategy.trades["stock_code"].eq("A")
+            & bundle.strategy.trades["side"].eq("sell")
+        ]
+        self.assertEqual(sales["execution_date"].tolist()[:2], [self.dates[13], self.dates[14]])
+        self.assertEqual(sales["status"].tolist()[:2], ["blocked", "executed"])
+        self.assertNotIn(
+            "A", bundle.strategy.ending_positions.loc[
+                bundle.strategy.ending_positions["asset_type"].eq("position"), "stock_code"
+            ].tolist(),
+        )
+
+    def test_does_not_retry_a_failed_buy_until_the_next_scheduled_rebalance(self) -> None:
+        bundle = self._simulate(
+            {
+                self.dates[2]: ("A", "B"),
+                self.dates[12]: ("A", "B"),
+                self.dates[20]: ("A", "B"),
+            },
+            {(self.dates[3], "A"): {"is_st": True}},
+        )
+
+        buys = bundle.strategy.trades.loc[
+            bundle.strategy.trades["stock_code"].eq("A")
+            & bundle.strategy.trades["side"].eq("buy")
+        ]
+        self.assertEqual(buys["execution_date"].tolist(), [self.dates[3], self.dates[13]])
+        self.assertEqual(buys["status"].tolist(), ["blocked", "executed"])
+
+    def test_reentering_desired_set_cancels_pending_blocked_exit(self) -> None:
+        suspended_dates = {
+            (date, "A"): {"is_suspended": True}
+            for date in self.dates[13:21]
+        }
+        bundle = self._simulate(
+            {
+                self.dates[2]: ("A", "B"),
+                self.dates[12]: ("C", "D"),
+                self.dates[20]: ("A", "D"),
+            },
+            suspended_dates,
+        )
+
+        final_rebalance = bundle.strategy.trades.loc[
+            bundle.strategy.trades["execution_date"].eq(self.dates[21])
+        ]
+        self.assertNotIn("A", final_rebalance["stock_code"].tolist())
+        self.assertIn(
+            "A", bundle.strategy.ending_positions.loc[
+                bundle.strategy.ending_positions["asset_type"].eq("position"), "stock_code"
+            ].tolist(),
+        )
+
+    def test_preserves_units_for_the_desired_intersection(self) -> None:
+        bundle = self._simulate(
+            {
+                self.dates[2]: ("A", "B"),
+                self.dates[12]: ("B", "C"),
+                self.dates[20]: ("B", "C"),
+            }
+        )
+
+        positions = bundle.strategy.positions
+        initial_units = positions.loc[
+            positions["date"].eq(self.dates[3]) & positions["stock_code"].eq("B"), "units"
+        ].iloc[0]
+        rebalanced_units = positions.loc[
+            positions["date"].eq(self.dates[13]) & positions["stock_code"].eq("B"), "units"
+        ].iloc[0]
+        self.assertEqual(initial_units, rebalanced_units)
+        self.assertTrue(
+            bundle.strategy.trades.loc[
+                bundle.strategy.trades["execution_date"].eq(self.dates[13])
+                & bundle.strategy.trades["stock_code"].eq("B")
+            ].empty
+        )
+
+    def test_ends_at_the_horizon_without_forcing_terminal_liquidation(self) -> None:
+        bundle = self._simulate(
+            {
+                self.dates[2]: ("A", "B"),
+                self.dates[12]: ("C", "D"),
+                self.dates[20]: ("C", "D"),
+            }
+        )
+
+        self.assertEqual(bundle.strategy.daily_nav.index[-1], self.schedule.final_horizon_date)
+        self.assertTrue(
+            bundle.strategy.trades.loc[
+                bundle.strategy.trades["execution_date"].eq(self.schedule.final_horizon_date)
+            ].empty
+        )
+        self.assertSetEqual(
+            set(
+                bundle.strategy.ending_positions.loc[
+                    bundle.strategy.ending_positions["asset_type"].eq("position"), "stock_code"
+                ]
+            ),
+            {"C", "D"},
         )
 
 
