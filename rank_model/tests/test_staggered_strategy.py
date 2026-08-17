@@ -907,6 +907,67 @@ class PublicationTests(unittest.TestCase):
                 source_paths=self.inputs.source_paths,
             )
 
+    def test_rejects_an_output_root_that_becomes_a_junction_after_creation(
+        self,
+    ) -> None:
+        real_is_junction = Path.is_junction
+
+        def output_root_is_junction(path: Path) -> bool:
+            return (path == self.run_root and path.exists()) or real_is_junction(path)
+
+        with mock.patch.object(Path, "is_junction", new=output_root_is_junction):
+            with self.assertRaisesRegex(ValueError, "junction"):
+                backtest_staggered_strategy(
+                    self.model_name,
+                    destination=self.destination,
+                    settings=self.settings,
+                    source_paths=self.inputs.source_paths,
+                )
+
+        self.assertFalse(self.destination.exists())
+
+    def test_rejects_a_junction_in_the_staging_subtree(self) -> None:
+        real_is_junction = Path.is_junction
+
+        def staged_offset_is_junction(path: Path) -> bool:
+            return (
+                path.name == "offset_04"
+                and path.parent.name.startswith(f".{self.model_name}.")
+            ) or real_is_junction(path)
+
+        with mock.patch.object(Path, "is_junction", new=staged_offset_is_junction):
+            with self.assertRaisesRegex(ValueError, "junction"):
+                self._publish()
+
+        self.assertFalse(self.destination.exists())
+        self.assertEqual(list(self.run_root.glob(f".{self.model_name}.*")), [])
+
+    def test_rechecks_destination_ancestry_immediately_before_rename(self) -> None:
+        real_validator = staggered._validate_staggered_publication
+        real_is_junction = Path.is_junction
+        staged_validation_finished = False
+
+        def validate_then_change_ancestry(*args: object, **kwargs: object) -> None:
+            nonlocal staged_validation_finished
+            real_validator(*args, **kwargs)
+            staged_validation_finished = True
+
+        def late_output_root_junction(path: Path) -> bool:
+            return (
+                path == self.run_root and staged_validation_finished
+            ) or real_is_junction(path)
+
+        with mock.patch.object(
+            staggered,
+            "_validate_staggered_publication",
+            side_effect=validate_then_change_ancestry,
+        ), mock.patch.object(Path, "is_junction", new=late_output_root_junction):
+            with self.assertRaisesRegex(ValueError, "junction"):
+                self._publish()
+
+        self.assertFalse(self.destination.exists())
+        self.assertEqual(list(self.run_root.glob(f".{self.model_name}.*")), [])
+
     def test_rejects_a_symlinked_publication_lock(self) -> None:
         lock_path = self.run_root / ".strategy-10d.lock"
         real_is_symlink = Path.is_symlink
@@ -983,6 +1044,39 @@ class PublicationTests(unittest.TestCase):
             list(self.run_root.glob(f".{self.model_name}.*")),
             [],
         )
+
+    def test_cleanup_retry_preserves_the_original_publication_error(self) -> None:
+        real_writer = staggered._write_staggered_offset
+        real_rmtree = staggered.shutil.rmtree
+        writes = 0
+        cleanup_attempts = 0
+
+        def interrupted_writer(*args: object, **kwargs: object) -> object:
+            nonlocal writes
+            writes += 1
+            result = real_writer(*args, **kwargs)
+            if writes == 2:
+                raise RuntimeError("original publication failure")
+            return result
+
+        def transient_cleanup_failure(path: object) -> None:
+            nonlocal cleanup_attempts
+            cleanup_attempts += 1
+            if cleanup_attempts == 1:
+                raise OSError("transient staging cleanup failure")
+            real_rmtree(path)
+
+        with mock.patch.object(
+            staggered.shutil,
+            "rmtree",
+            side_effect=transient_cleanup_failure,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "original publication failure"):
+                self._publish(writer=interrupted_writer)
+
+        self.assertEqual(cleanup_attempts, 2)
+        self.assertFalse(self.destination.exists())
+        self.assertEqual(list(self.run_root.glob(f".{self.model_name}.*")), [])
 
 
 class ScheduleTests(unittest.TestCase):

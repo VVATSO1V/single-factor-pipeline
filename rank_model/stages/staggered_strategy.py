@@ -487,28 +487,78 @@ def _validate_source_provenance(
     for name in _STRATEGY_SOURCE_NAMES:
         path = Path(source_paths[name])
         expected = expected_hashes[name]
-        if path.is_symlink():
-            raise ValueError(f"staggered source artifact may not be a symlink: {name}")
+        if _is_reparse_escape(path):
+            raise ValueError(
+                f"staggered source artifact may not be a symlink or junction: {name}"
+            )
         if not path.is_file() or not _is_sha256(expected):
             raise ValueError(f"staggered source provenance is invalid: {name}")
         if file_sha256(path) != expected:
             raise ValueError(f"staggered source hash changed: {name}")
 
 
+def _is_reparse_escape(path: Path) -> bool:
+    return path.is_symlink() or path.is_junction()
+
+
+def _validate_no_reparse_ancestry(path: Path, label: str) -> None:
+    for component in (path, *path.parents):
+        if _is_reparse_escape(component):
+            raise ValueError(
+                f"{label} may not contain a symlink or junction: {component}"
+            )
+
+
+def _validate_no_reparse_subtree(root: Path, label: str) -> None:
+    _validate_no_reparse_ancestry(root, label)
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        if _is_reparse_escape(directory):
+            raise ValueError(
+                f"{label} may not contain a symlink or junction: {directory}"
+            )
+        try:
+            children = list(directory.iterdir())
+        except OSError as error:
+            raise ValueError(f"{label} is unreadable: {directory}") from error
+        for child in children:
+            if _is_reparse_escape(child):
+                raise ValueError(
+                    f"{label} may not contain a symlink or junction: {child}"
+                )
+            if child.is_dir():
+                pending.append(child)
+
+
+def _remove_staging_best_effort(staging: Path) -> None:
+    for _ in range(2):
+        try:
+            if not staging.exists():
+                return
+            shutil.rmtree(staging)
+            return
+        except Exception:
+            # Preserve the publication failure and retry transient cleanup once.
+            pass
+
+
 def _require_exact_children(
     directory: Path, expected_names: set[str], label: str
 ) -> None:
-    if directory.is_symlink() or not directory.is_dir():
+    if _is_reparse_escape(directory) or not directory.is_dir():
         raise ValueError(f"{label} is missing or escaped: {directory}")
     children = list(directory.iterdir())
-    if any(child.is_symlink() for child in children):
-        raise ValueError(f"{label} contains a symlink escape: {directory}")
+    if any(_is_reparse_escape(child) for child in children):
+        raise ValueError(
+            f"{label} contains a symlink or junction escape: {directory}"
+        )
     if {child.name for child in children} != expected_names:
         raise ValueError(f"{label} artifact set is incomplete: {directory}")
 
 
 def _read_json_object(path: Path, label: str) -> dict[str, Any]:
-    if path.is_symlink() or not path.is_file():
+    if _is_reparse_escape(path) or not path.is_file():
         raise ValueError(f"{label} is missing or escaped: {path}")
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -766,9 +816,7 @@ def _validate_publication_destination(model_name: str, destination: Path) -> Pat
         raise ValueError(
             "staggered strategy destination must be strategy_10d_runs/<model>"
         )
-    for component in (destination, destination.parent, *destination.parent.parents):
-        if component.is_symlink():
-            raise ValueError("staggered strategy destination may not contain a symlink")
+    _validate_no_reparse_ancestry(destination, "staggered strategy destination")
     return destination
 
 
@@ -782,9 +830,12 @@ def backtest_staggered_strategy(
     """Publish all ten offset paths and aggregate reports atomically."""
     destination = _validate_publication_destination(model_name, destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
+    _validate_no_reparse_ancestry(destination, "staggered strategy destination")
     lock_path = destination.parent / ".strategy-10d.lock"
-    if lock_path.is_symlink():
-        raise ValueError("staggered strategy publication lock may not be a symlink")
+    if _is_reparse_escape(lock_path):
+        raise ValueError(
+            "staggered strategy publication lock may not be a symlink or junction"
+        )
     lock = _acquire_strategy_lock(lock_path)
     staging: Path | None = None
     try:
@@ -897,12 +948,16 @@ def backtest_staggered_strategy(
             inputs.source_hashes,
         )
         _validate_source_provenance(loaded_paths, inputs.source_hashes)
+        _validate_no_reparse_ancestry(
+            destination, "staggered strategy destination"
+        )
+        _validate_no_reparse_subtree(staging, "staggered strategy staging")
         os.replace(staging, destination)
         staging = None
     finally:
         try:
-            if staging is not None and staging.exists():
-                shutil.rmtree(staging)
+            if staging is not None:
+                _remove_staging_best_effort(staging)
         finally:
             _release_strategy_lock(lock)
     return destination
