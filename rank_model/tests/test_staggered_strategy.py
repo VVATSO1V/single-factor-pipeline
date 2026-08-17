@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import sys
 import tempfile
 import tomllib
 import unittest
@@ -64,6 +65,23 @@ def _settings(*, start: str = "2024-01-02", end: str = "2024-01-04") -> Strategy
         sell_stamp_duty_rate=0.0005,
         limit_tolerance=1e-8,
         annualization_days=252,
+    )
+
+
+def _locked_strategy_settings() -> StrategySettings:
+    contract = strategy._STRATEGY_SETTINGS_CONTRACT
+    return StrategySettings(
+        start=pd.Timestamp(contract["start"]),
+        end=pd.Timestamp(contract["end"]),
+        top_k=contract["top_k"],
+        expected_cross_section_size=contract["expected_cross_section_size"],
+        min_listing_days=contract["min_listing_days"],
+        initial_nav=contract["initial_nav"],
+        commission_rate=contract["commission_rate"],
+        slippage_rate=contract["slippage_rate"],
+        sell_stamp_duty_rate=contract["sell_stamp_duty_rate"],
+        limit_tolerance=contract["limit_tolerance"],
+        annualization_days=contract["annualization_days"],
     )
 
 
@@ -349,6 +367,10 @@ def _write_synthetic_staggered_comparison_inputs(
     }
     daily_rows: list[dict[str, object]] = []
     daily_sources: list[dict[str, str]] = []
+    common_input_hashes = {
+        name: f"{index + 10:x}" * 64
+        for index, name in enumerate(strategy._COMMON_STRATEGY_SOURCE_NAMES)
+    }
     for model_index, model_name in enumerate(LOCKED_MODEL_NAMES, start=1):
         model_directory = run_root / model_name
         model_directory.mkdir()
@@ -357,7 +379,11 @@ def _write_synthetic_staggered_comparison_inputs(
         }
         _write_json(
             model_directory / "manifest.json",
-            {"model_name": model_name, "input_sha256": input_hashes},
+            {
+                "model_name": model_name,
+                "input_sha256": input_hashes,
+                "settings": strategy._STRATEGY_SETTINGS_CONTRACT,
+            },
         )
         _write_json(
             model_directory / "average_metrics.json",
@@ -391,7 +417,37 @@ def _write_synthetic_staggered_comparison_inputs(
         daily_model_directory = daily_run_root / model_name
         daily_model_directory.mkdir()
         daily_manifest_path = daily_model_directory / "manifest.json"
-        _write_json(daily_manifest_path, {"model_name": model_name})
+        daily_input_hashes = {
+            **common_input_hashes,
+            "prediction": f"{model_index:x}" * 64,
+            "prediction_manifest": f"{model_index + 5:x}" * 64,
+        }
+        _write_json(
+            daily_manifest_path,
+            {
+                "schema_version": 1,
+                "status": "completed",
+                "purpose": "frozen_rank_model_static_strategy_2024_2025",
+                "model_name": model_name,
+                "settings": strategy._STRATEGY_SETTINGS_CONTRACT,
+                "rows": {
+                    "daily_nav": 485,
+                    "execution_dates": 484,
+                    "trades": model_index,
+                    "positions": model_index,
+                    "ending_positions": 100,
+                },
+                "formulas": strategy._SUMMARY_FORMULAS,
+                "observation_conventions": (
+                    strategy._STRATEGY_OBSERVATION_CONVENTIONS
+                ),
+                "input_sha256": daily_input_hashes,
+                "output_sha256": {
+                    name: f"{model_index:x}" * 64
+                    for name in strategy._STRATEGY_OUTPUT_NAMES
+                },
+            },
+        )
         daily_sources.append(
             {
                 "model_name": model_name,
@@ -437,13 +493,9 @@ def _write_synthetic_staggered_comparison_inputs(
                 daily_path, daily_frame, daily_schema
             ),
             "source_strategy_manifests": daily_sources,
-            "sealed_strategy_contract": {
-                "sha256": "a" * 64,
-                "settings_sha256": "b" * 64,
-                "formulas_sha256": "c" * 64,
-                "observation_conventions_sha256": "d" * 64,
-                "common_input_sha256": {},
-            },
+            "sealed_strategy_contract": strategy._sealed_strategy_contract(
+                common_input_hashes
+            ),
         },
     )
     return run_root, daily_path, source_paths_by_model
@@ -841,7 +893,7 @@ class PublicationTests(unittest.TestCase):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary_directory.name)
         self.paths = _aggregation_paths()
-        self.settings = _settings(end="2024-01-22")
+        self.settings = _locked_strategy_settings()
         source_root = self.root / "sources"
         source_root.mkdir()
         self.inputs = _synthetic_locked_inputs(source_root, self.paths)
@@ -999,6 +1051,44 @@ class PublicationTests(unittest.TestCase):
             self.inputs.source_paths,
             self.inputs.source_hashes,
         )
+
+    def test_rejects_resealed_top50_zero_cost_and_listing_setting_tampering(
+        self,
+    ) -> None:
+        self._publish()
+        manifest_path = self.destination / "manifest.json"
+        original = json.loads(manifest_path.read_text(encoding="utf-8"))
+        mutations = {
+            "top50": {"top_k": 50},
+            "zero_cost": {
+                "commission_rate": 0.0,
+                "slippage_rate": 0.0,
+                "sell_stamp_duty_rate": 0.0,
+                "buy_cost_rate": 0.0,
+                "sell_cost_rate": 0.0,
+            },
+            "listing_days": {"min_listing_days": 0},
+        }
+        for name, updates in mutations.items():
+            with self.subTest(name=name):
+                tampered = copy.deepcopy(original)
+                tampered["settings"].update(updates)
+                schedules = [item["schedule"] for item in tampered["offsets"]]
+                tampered["contract_sha256"] = staggered._model_contract_hashes(
+                    tampered["settings"], schedules
+                )
+                tampered["output_sha256"]["manifest.json"] = (
+                    staggered._model_manifest_logical_hash(tampered)
+                )
+                _write_json(manifest_path, tampered)
+                with self.assertRaisesRegex(ValueError, "settings"):
+                    _validate_staggered_publication(
+                        self.destination,
+                        self.model_name,
+                        self.inputs.source_paths,
+                        self.inputs.source_hashes,
+                    )
+                _write_json(manifest_path, original)
 
     def test_rejects_existing_or_escaped_destinations_without_overwrite(self) -> None:
         self.destination.mkdir(parents=True)
@@ -1738,6 +1828,34 @@ class ConfigAndCliTests(unittest.TestCase):
                 set(source_paths), set(strategy._STRATEGY_SOURCE_NAMES)
             )
 
+    def test_cli_execution_failures_are_reported_as_parser_errors(self) -> None:
+        cases = (
+            (
+                ["pipeline", "backtest-strategy-10d", "--model", LOCKED_MODEL_NAMES[0]],
+                "command_backtest_strategy_10d",
+                ValueError("synthetic settings failure"),
+                "synthetic settings failure",
+            ),
+            (
+                ["pipeline", "compare-strategy-10d"],
+                "command_compare_strategy_10d",
+                FileNotFoundError("synthetic missing model"),
+                "synthetic missing model",
+            ),
+        )
+        for argv, command_name, error, expected in cases:
+            with self.subTest(command=argv[1]):
+                stderr = io.StringIO()
+                with mock.patch.object(sys, "argv", argv), mock.patch.object(
+                    pipeline, "load_config", return_value=self.config
+                ), mock.patch.object(
+                    pipeline, command_name, side_effect=error
+                ), redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as raised:
+                        pipeline.main()
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn(expected, stderr.getvalue())
+
 
 class ComparisonTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -1787,6 +1905,15 @@ class ComparisonTests(unittest.TestCase):
             )
         )
         self.assertEqual(len(manifest["source_model_manifests"]), 5)
+        sealed_contract = manifest["sealed_comparison_contract"]
+        self.assertEqual(
+            sealed_contract["strategy_settings"],
+            strategy._STRATEGY_SETTINGS_CONTRACT,
+        )
+        self.assertEqual(
+            sealed_contract["strategy_settings_sha256"],
+            strategy._canonical_json_sha256(strategy._STRATEGY_SETTINGS_CONTRACT),
+        )
         for anchor in manifest["source_model_manifests"]:
             model_manifest = self.root / anchor["path"]
             self.assertEqual(
@@ -1815,6 +1942,136 @@ class ComparisonTests(unittest.TestCase):
         before = {path: path.read_bytes() for path in paths}
         self._compare()
         self.assertEqual(before, {path: path.read_bytes() for path in paths})
+
+    def test_rejects_different_settings_across_the_five_models(self) -> None:
+        manifest_path = self.run_root / LOCKED_MODEL_NAMES[1] / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["settings"]["top_k"] = 50
+        _write_json(manifest_path, manifest)
+        with self.assertRaisesRegex(ValueError, "settings"):
+            self._compare()
+
+    def test_recomputes_and_rejects_a_forged_daily_sealed_contract(self) -> None:
+        manifest_path = self.daily_path.with_suffix(".manifest.json")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        sealed = manifest["sealed_strategy_contract"]
+        altered_settings = {
+            **strategy._STRATEGY_SETTINGS_CONTRACT,
+            "top_k": 50,
+        }
+        forged_payload = {
+            "settings": altered_settings,
+            "formulas": strategy._SUMMARY_FORMULAS,
+            "observation_conventions": strategy._STRATEGY_OBSERVATION_CONVENTIONS,
+            "common_input_sha256": sealed["common_input_sha256"],
+        }
+        sealed["settings_sha256"] = strategy._canonical_json_sha256(
+            altered_settings
+        )
+        sealed["sha256"] = strategy._canonical_json_sha256(forged_payload)
+        _write_json(manifest_path, manifest)
+        with self.assertRaisesRegex(ValueError, "sealed contract"):
+            self._compare()
+
+    def test_rejects_a_resealed_outer_strategy_settings_contract(self) -> None:
+        self._compare()
+        manifest_path = self.output_path.with_suffix(".manifest.json")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        sealed = manifest["sealed_comparison_contract"]
+        sealed["strategy_settings"]["top_k"] = 50
+        sealed["strategy_settings_sha256"] = strategy._canonical_json_sha256(
+            sealed["strategy_settings"]
+        )
+        sealed["sha256"] = strategy._canonical_json_sha256(
+            {key: value for key, value in sealed.items() if key != "sha256"}
+        )
+        _write_json(manifest_path, manifest)
+        with self.assertRaisesRegex(ValueError, "provenance|contract"):
+            self._compare()
+
+    def test_rejects_comparison_csv_or_manifest_reparse_entries(self) -> None:
+        self._compare()
+        real_is_symlink = Path.is_symlink
+
+        def comparison_csv_is_symlink(path: Path) -> bool:
+            return path == self.output_path or real_is_symlink(path)
+
+        with mock.patch.object(Path, "is_symlink", new=comparison_csv_is_symlink):
+            with self.assertRaises((FileNotFoundError, ValueError)):
+                self._compare()
+
+        manifest_path = self.output_path.with_suffix(".manifest.json")
+        real_lstat = Path.lstat
+
+        def comparison_manifest_reparse(path: Path) -> object:
+            result = real_lstat(path)
+            if path == manifest_path:
+                return _windows_reparse_result(result)
+            return result
+
+        with mock.patch.object(
+            staggered, "_is_windows_platform", return_value=True
+        ), mock.patch.object(Path, "lstat", new=comparison_manifest_reparse):
+            with self.assertRaises((FileNotFoundError, ValueError)):
+                self._compare()
+
+    def test_daily_vs_missing_either_partner_fails_closed(self) -> None:
+        self._compare()
+        manifest_path = self.daily_vs_path.with_suffix(".manifest.json")
+        original_manifest = manifest_path.read_bytes()
+        original_csv = self.daily_vs_path.read_bytes()
+        manifest_path.unlink()
+        with self.assertRaisesRegex(ValueError, "exist as a pair"):
+            self._compare()
+        manifest_path.write_bytes(original_manifest)
+        self.daily_vs_path.unlink()
+        with self.assertRaisesRegex(ValueError, "exist as a pair"):
+            self._compare()
+        self.daily_vs_path.write_bytes(original_csv)
+
+    def test_second_publication_failure_cleans_up_and_can_retry(self) -> None:
+        real_replace = os.replace
+        failed = False
+
+        def fail_daily_vs_manifest(source: object, destination: object) -> None:
+            nonlocal failed
+            if (
+                not failed
+                and Path(destination)
+                == self.daily_vs_path.with_suffix(".manifest.json")
+            ):
+                failed = True
+                raise OSError("synthetic second publication failure")
+            real_replace(source, destination)
+
+        with mock.patch.object(
+            staggered, "_validate_staggered_publication"
+        ), mock.patch.object(
+            staggered.os, "replace", side_effect=fail_daily_vs_manifest
+        ):
+            with self.assertRaisesRegex(OSError, "second publication"):
+                staggered.compare_staggered_strategy_runs(
+                    self.run_root,
+                    self.output_path,
+                    self.daily_path,
+                    self.daily_vs_path,
+                    self.source_paths_by_model,
+                )
+        self.assertTrue(self.output_path.is_file())
+        self.assertTrue(self.output_path.with_suffix(".manifest.json").is_file())
+        self.assertFalse(self.daily_vs_path.exists())
+        self.assertFalse(self.daily_vs_path.with_suffix(".manifest.json").exists())
+        self._compare()
+        self.assertTrue(self.daily_vs_path.is_file())
+        self.assertTrue(self.daily_vs_path.with_suffix(".manifest.json").is_file())
+
+    def test_missing_any_model_fails_before_publication(self) -> None:
+        missing = self.run_root / LOCKED_MODEL_NAMES[-1]
+        missing.rename(self.root / "removed-model")
+        with self.assertRaises(FileNotFoundError):
+            self._compare()
+        self.assertFalse(self.output_path.exists())
+        self.assertFalse(self.daily_vs_path.exists())
 
     def test_missing_partner_tampering_and_changed_provenance_fail_closed(self) -> None:
         self._compare()

@@ -20,12 +20,18 @@ from rank_model.stages.strategy import (
     StrategyBundle,
     StrategySettings,
     PortfolioState,
+    _COMMON_STRATEGY_SOURCE_NAMES,
     _DAILY_NAV_COLUMNS,
     _DIAGNOSTIC_COLUMNS,
     _ENDING_POSITION_COLUMNS,
     _POSITION_COLUMNS,
     _STRATEGY_OBSERVATION_CONVENTIONS,
+    _STRATEGY_COMPARISON_COLUMNS,
+    _STRATEGY_COMPARISON_COLUMN_SCHEMA,
+    _STRATEGY_COMPARISON_FIELDS,
+    _STRATEGY_COMPARISON_MANIFEST_NAMES,
     _STRATEGY_OUTPUT_NAMES,
+    _STRATEGY_SETTINGS_CONTRACT,
     _STRATEGY_SOURCE_NAMES,
     _SUMMARY_FORMULAS,
     _TRADE_COLUMNS,
@@ -37,8 +43,10 @@ from rank_model.stages.strategy import (
     _normalize_market_panel,
     _position_rows,
     _release_strategy_lock,
+    _sealed_strategy_contract,
     _settings_manifest,
     _write_json_file,
+    _validate_completed_strategy_manifest,
     load_locked_strategy_inputs,
     select_daily_top,
     summarize_strategy,
@@ -727,8 +735,10 @@ def _validate_offset_publication(
         raise ValueError("staggered offset observation contract does not match")
     schedule = manifest.get("schedule")
     settings_payload = manifest.get("settings")
-    if not isinstance(schedule, Mapping) or not isinstance(settings_payload, Mapping):
+    if not isinstance(schedule, Mapping):
         raise ValueError("staggered offset schedule or settings contract is invalid")
+    if settings_payload != _STRATEGY_SETTINGS_CONTRACT:
+        raise ValueError("staggered offset settings contract does not match")
     if manifest.get("contract_sha256") != _offset_contract_hashes(
         settings_payload, schedule
     ):
@@ -813,6 +823,8 @@ def _validate_staggered_publication(
         raise ValueError("staggered model formula contract does not match")
     if manifest.get("observation_conventions") != _average_observation_conventions():
         raise ValueError("staggered model observation contract does not match")
+    if manifest.get("settings") != _STRATEGY_SETTINGS_CONTRACT:
+        raise ValueError("staggered model settings contract does not match")
 
     output_hashes = manifest.get("output_sha256")
     if (
@@ -860,9 +872,7 @@ def _validate_staggered_publication(
             source_hashes,
         )
 
-    settings_payload = manifest.get("settings")
-    if not isinstance(settings_payload, Mapping):
-        raise ValueError("staggered model settings contract is invalid")
+    settings_payload = manifest["settings"]
     if manifest.get("contract_sha256") != _model_contract_hashes(
         settings_payload, schedules
     ):
@@ -1176,50 +1186,28 @@ def _validate_daily_comparison(
     _validate_no_reparse_ancestry(comparison_path, "daily comparison")
     _validate_no_reparse_ancestry(manifest_path, "daily comparison manifest")
     manifest = _read_json_object(manifest_path, "daily strategy comparison manifest")
-    expected_fields = {
-        "schema_version",
-        "status",
-        "purpose",
-        "comparison",
-        "source_strategy_manifests",
-        "sealed_strategy_contract",
-    }
     if (
-        set(manifest) != expected_fields
+        set(manifest) != _STRATEGY_COMPARISON_MANIFEST_NAMES
         or manifest.get("schema_version") != 1
         or manifest.get("status") != "completed"
         or manifest.get("purpose")
         != "frozen_rank_model_static_strategy_comparison_2024_2025"
     ):
         raise ValueError("daily strategy comparison manifest contract is invalid")
-    integer_metrics = {
-        "elapsed_trading_observations",
-        "buy_attempt_count",
-        "sell_attempt_count",
-        "buy_count",
-        "sell_count",
-        "blocked_sale_days",
-    }
-    schema = (
-        ("model_name", "string"),
-        *(
-            (name, "integer" if name in integer_metrics else "number")
-            for name in _SUMMARY_FORMULAS
-        ),
-    )
+    schema = _STRATEGY_COMPARISON_COLUMN_SCHEMA
     try:
         frame = pd.read_csv(comparison_path, float_precision="round_trip")
     except Exception as error:
         raise ValueError("daily strategy comparison CSV is unreadable") from error
     if (
-        tuple(frame.columns) != tuple(name for name, _ in schema)
+        tuple(frame.columns) != _STRATEGY_COMPARISON_COLUMNS
         or tuple(frame["model_name"].tolist()) != LOCKED_MODEL_NAMES
         or not {"winner", "accept", "champion"}.isdisjoint(frame.columns)
     ):
         raise ValueError("daily strategy comparison CSV contract is invalid")
     comparison = manifest.get("comparison")
     expected_metadata = _comparison_metadata(comparison_path, frame, schema)
-    if not isinstance(comparison, Mapping) or set(comparison) != _COMPARISON_METADATA_FIELDS:
+    if not isinstance(comparison, Mapping) or set(comparison) != _STRATEGY_COMPARISON_FIELDS:
         raise ValueError("daily strategy comparison metadata is invalid")
     if dict(comparison) != expected_metadata:
         raise ValueError("daily strategy comparison hashes or schema do not match")
@@ -1237,28 +1225,26 @@ def _validate_daily_comparison(
         for item in source_manifests
     ]
     _validate_source_anchors(normalized_sources, comparison_path.parent, "strategy_runs")
-    sealed = manifest.get("sealed_strategy_contract")
-    if (
-        not isinstance(sealed, Mapping)
-        or set(sealed)
-        != {
-            "sha256",
-            "settings_sha256",
-            "formulas_sha256",
-            "observation_conventions_sha256",
-            "common_input_sha256",
-        }
-        or any(
-            not _is_sha256(sealed.get(name))
-            for name in (
-                "sha256",
-                "settings_sha256",
-                "formulas_sha256",
-                "observation_conventions_sha256",
-            )
+    common_input_hashes: dict[str, str] | None = None
+    for model_name in LOCKED_MODEL_NAMES:
+        run_directory = comparison_path.parent / "strategy_runs" / model_name
+        source_manifest = _read_json_object(
+            run_directory / "manifest.json", "daily strategy model manifest"
         )
-        or not isinstance(sealed.get("common_input_sha256"), Mapping)
-    ):
+        input_hashes = _validate_completed_strategy_manifest(
+            source_manifest, model_name, run_directory
+        )
+        current_common_hashes = {
+            name: input_hashes[name] for name in _COMMON_STRATEGY_SOURCE_NAMES
+        }
+        if common_input_hashes is None:
+            common_input_hashes = current_common_hashes
+        elif current_common_hashes != common_input_hashes:
+            raise ValueError("daily strategy model manifests have different inputs")
+    if common_input_hashes is None:
+        raise AssertionError("daily strategy comparison has no model manifests")
+    expected_sealed = _sealed_strategy_contract(common_input_hashes)
+    if manifest.get("sealed_strategy_contract") != expected_sealed:
         raise ValueError("daily strategy comparison sealed contract is invalid")
     return frame, {
         "path": manifest_path.name,
@@ -1269,6 +1255,10 @@ def _validate_daily_comparison(
 def _staggered_comparison_contract() -> dict[str, Any]:
     payload = {
         "config": STAGGERED_CONFIG_CONTRACT,
+        "strategy_settings": _STRATEGY_SETTINGS_CONTRACT,
+        "strategy_settings_sha256": _canonical_json_sha256(
+            _STRATEGY_SETTINGS_CONTRACT
+        ),
         "average_formulas": _AVERAGE_FORMULAS,
         "offset_formulas": _SUMMARY_FORMULAS,
         "offset_statistics": list(OFFSET_STATISTICS),
@@ -1456,8 +1446,10 @@ def _read_staggered_model_metrics(
     model_name: str,
     source_paths: Mapping[str, Path],
     comparison_directory: Path,
-) -> tuple[dict[str, Any], dict[str, str]]:
+) -> tuple[dict[str, Any], dict[str, str], dict[str, Any]]:
     run_directory = run_root / model_name
+    if not run_directory.is_dir():
+        raise FileNotFoundError(run_directory)
     manifest_path = run_directory / "manifest.json"
     manifest = _read_json_object(manifest_path, "staggered model manifest")
     source_hashes = manifest.get("input_sha256")
@@ -1502,7 +1494,10 @@ def _read_staggered_model_metrics(
         "path": manifest_path.relative_to(comparison_directory).as_posix(),
         "physical_sha256": file_sha256(manifest_path),
     }
-    return row, anchor
+    settings_payload = manifest.get("settings")
+    if not isinstance(settings_payload, Mapping):
+        raise ValueError("staggered model settings contract is invalid")
+    return row, anchor, dict(settings_payload)
 
 
 def compare_staggered_strategy_runs(
@@ -1540,8 +1535,9 @@ def compare_staggered_strategy_runs(
 
     rows: list[dict[str, Any]] = []
     model_anchors: list[dict[str, str]] = []
+    model_settings: list[dict[str, Any]] = []
     for model_name in names:
-        row, anchor = _read_staggered_model_metrics(
+        row, anchor, settings_payload = _read_staggered_model_metrics(
             root,
             model_name,
             source_paths_by_model[model_name],
@@ -1549,6 +1545,11 @@ def compare_staggered_strategy_runs(
         )
         rows.append(row)
         model_anchors.append(anchor)
+        model_settings.append(settings_payload)
+    if any(settings != model_settings[0] for settings in model_settings[1:]):
+        raise ValueError("staggered model settings must match across all five models")
+    if model_settings[0] != _STRATEGY_SETTINGS_CONTRACT:
+        raise ValueError("staggered model settings do not match the locked contract")
     _validate_source_anchors(model_anchors, comparison_path.parent, root.name)
     staggered_frame = pd.DataFrame(rows, columns=_STAGGERED_COMPARISON_COLUMNS)
 
