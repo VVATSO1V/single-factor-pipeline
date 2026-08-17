@@ -6,6 +6,7 @@ from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
+import stat
 import tempfile
 import unittest
 from unittest import mock
@@ -312,6 +313,16 @@ def _synthetic_locked_inputs(
         ),
         source_paths=source_paths,
         source_hashes={name: file_sha256(path) for name, path in source_paths.items()},
+    )
+
+
+def _windows_reparse_result(result: os.stat_result) -> object:
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return mock.Mock(
+        st_mode=result.st_mode,
+        st_file_attributes=(
+            getattr(result, "st_file_attributes", 0) | reparse_flag
+        ),
     )
 
 
@@ -910,12 +921,15 @@ class PublicationTests(unittest.TestCase):
     def test_rejects_an_output_root_that_becomes_a_junction_after_creation(
         self,
     ) -> None:
-        real_is_junction = Path.is_junction
+        real_lstat = Path.lstat
 
-        def output_root_is_junction(path: Path) -> bool:
-            return (path == self.run_root and path.exists()) or real_is_junction(path)
+        def output_root_reparse_lstat(path: Path) -> object:
+            result = real_lstat(path)
+            if path == self.run_root and path.exists():
+                return _windows_reparse_result(result)
+            return result
 
-        with mock.patch.object(Path, "is_junction", new=output_root_is_junction):
+        with mock.patch.object(Path, "lstat", new=output_root_reparse_lstat):
             with self.assertRaisesRegex(ValueError, "junction"):
                 backtest_staggered_strategy(
                     self.model_name,
@@ -926,16 +940,43 @@ class PublicationTests(unittest.TestCase):
 
         self.assertFalse(self.destination.exists())
 
-    def test_rejects_a_junction_in_the_staging_subtree(self) -> None:
-        real_is_junction = Path.is_junction
+    def test_python_311_fallback_rejects_a_windows_reparse_output_root(self) -> None:
+        real_lstat = Path.lstat
 
-        def staged_offset_is_junction(path: Path) -> bool:
-            return (
+        def python_311_lstat(path: Path) -> object:
+            result = real_lstat(path)
+            if path == self.run_root and path.exists():
+                return _windows_reparse_result(result)
+            return result
+
+        with mock.patch.object(Path, "is_junction", new=None), mock.patch.object(
+            Path,
+            "lstat",
+            new=python_311_lstat,
+        ):
+            with self.assertRaisesRegex(ValueError, "reparse"):
+                backtest_staggered_strategy(
+                    self.model_name,
+                    destination=self.destination,
+                    settings=self.settings,
+                    source_paths=self.inputs.source_paths,
+                )
+
+        self.assertFalse(self.destination.exists())
+
+    def test_rejects_a_junction_in_the_staging_subtree(self) -> None:
+        real_lstat = Path.lstat
+
+        def staged_offset_reparse_lstat(path: Path) -> object:
+            result = real_lstat(path)
+            if (
                 path.name == "offset_04"
                 and path.parent.name.startswith(f".{self.model_name}.")
-            ) or real_is_junction(path)
+            ):
+                return _windows_reparse_result(result)
+            return result
 
-        with mock.patch.object(Path, "is_junction", new=staged_offset_is_junction):
+        with mock.patch.object(Path, "lstat", new=staged_offset_reparse_lstat):
             with self.assertRaisesRegex(ValueError, "junction"):
                 self._publish()
 
@@ -944,7 +985,7 @@ class PublicationTests(unittest.TestCase):
 
     def test_rechecks_destination_ancestry_immediately_before_rename(self) -> None:
         real_validator = staggered._validate_staggered_publication
-        real_is_junction = Path.is_junction
+        real_lstat = Path.lstat
         staged_validation_finished = False
 
         def validate_then_change_ancestry(*args: object, **kwargs: object) -> None:
@@ -952,16 +993,19 @@ class PublicationTests(unittest.TestCase):
             real_validator(*args, **kwargs)
             staged_validation_finished = True
 
-        def late_output_root_junction(path: Path) -> bool:
-            return (
+        def late_output_root_reparse_lstat(path: Path) -> object:
+            result = real_lstat(path)
+            if (
                 path == self.run_root and staged_validation_finished
-            ) or real_is_junction(path)
+            ):
+                return _windows_reparse_result(result)
+            return result
 
         with mock.patch.object(
             staggered,
             "_validate_staggered_publication",
             side_effect=validate_then_change_ancestry,
-        ), mock.patch.object(Path, "is_junction", new=late_output_root_junction):
+        ), mock.patch.object(Path, "lstat", new=late_output_root_reparse_lstat):
             with self.assertRaisesRegex(ValueError, "junction"):
                 self._publish()
 
@@ -1077,6 +1121,53 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(cleanup_attempts, 2)
         self.assertFalse(self.destination.exists())
         self.assertEqual(list(self.run_root.glob(f".{self.model_name}.*")), [])
+
+    def test_persistent_cleanup_failure_leaves_staging_and_blocks_the_next_run(
+        self,
+    ) -> None:
+        real_writer = staggered._write_staggered_offset
+        real_rmtree = staggered.shutil.rmtree
+        writes = 0
+        cleanup_attempts = 0
+
+        def interrupted_writer(*args: object, **kwargs: object) -> object:
+            nonlocal writes
+            writes += 1
+            result = real_writer(*args, **kwargs)
+            if writes == 2:
+                raise RuntimeError("original persistent-cleanup publication failure")
+            return result
+
+        def persistent_cleanup_failure(path: object) -> None:
+            nonlocal cleanup_attempts
+            cleanup_attempts += 1
+            raise OSError("persistent staging cleanup failure")
+
+        with mock.patch.object(
+            staggered.shutil,
+            "rmtree",
+            side_effect=persistent_cleanup_failure,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "original persistent-cleanup publication failure"
+            ):
+                self._publish(writer=interrupted_writer)
+
+        stale_staging = list(self.run_root.glob(f".{self.model_name}.*"))
+        try:
+            self.assertEqual(cleanup_attempts, 2)
+            self.assertEqual(len(stale_staging), 1)
+            self.assertFalse(self.destination.exists())
+            with self.assertRaisesRegex(FileExistsError, "partial.*staging"):
+                backtest_staggered_strategy(
+                    self.model_name,
+                    destination=self.destination,
+                    settings=self.settings,
+                    source_paths=self.inputs.source_paths,
+                )
+        finally:
+            for staging in stale_staging:
+                real_rmtree(staging)
 
 
 class ScheduleTests(unittest.TestCase):

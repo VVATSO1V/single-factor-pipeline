@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import tempfile
 from typing import Any, Mapping, Sequence
 
@@ -489,7 +490,8 @@ def _validate_source_provenance(
         expected = expected_hashes[name]
         if _is_reparse_escape(path):
             raise ValueError(
-                f"staggered source artifact may not be a symlink or junction: {name}"
+                "staggered source artifact may not be a symlink, junction, or "
+                f"Windows reparse point: {name}"
             )
         if not path.is_file() or not _is_sha256(expected):
             raise ValueError(f"staggered source provenance is invalid: {name}")
@@ -498,14 +500,28 @@ def _validate_source_provenance(
 
 
 def _is_reparse_escape(path: Path) -> bool:
-    return path.is_symlink() or path.is_junction()
+    if path.is_symlink():
+        return True
+    if os.name != "nt":
+        return False
+    try:
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise ValueError(
+            f"cannot inspect Windows reparse attributes: {path}"
+        ) from error
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(attributes & reparse_flag)
 
 
 def _validate_no_reparse_ancestry(path: Path, label: str) -> None:
     for component in (path, *path.parents):
         if _is_reparse_escape(component):
             raise ValueError(
-                f"{label} may not contain a symlink or junction: {component}"
+                f"{label} may not contain a symlink, junction, or reparse point: "
+                f"{component}"
             )
 
 
@@ -516,7 +532,8 @@ def _validate_no_reparse_subtree(root: Path, label: str) -> None:
         directory = pending.pop()
         if _is_reparse_escape(directory):
             raise ValueError(
-                f"{label} may not contain a symlink or junction: {directory}"
+                f"{label} may not contain a symlink, junction, or reparse point: "
+                f"{directory}"
             )
         try:
             children = list(directory.iterdir())
@@ -525,7 +542,8 @@ def _validate_no_reparse_subtree(root: Path, label: str) -> None:
         for child in children:
             if _is_reparse_escape(child):
                 raise ValueError(
-                    f"{label} may not contain a symlink or junction: {child}"
+                    f"{label} may not contain a symlink, junction, or reparse point: "
+                    f"{child}"
                 )
             if child.is_dir():
                 pending.append(child)
@@ -551,7 +569,7 @@ def _require_exact_children(
     children = list(directory.iterdir())
     if any(_is_reparse_escape(child) for child in children):
         raise ValueError(
-            f"{label} contains a symlink or junction escape: {directory}"
+            f"{label} contains a symlink, junction, or reparse escape: {directory}"
         )
     if {child.name for child in children} != expected_names:
         raise ValueError(f"{label} artifact set is incomplete: {directory}")
@@ -834,7 +852,8 @@ def backtest_staggered_strategy(
     lock_path = destination.parent / ".strategy-10d.lock"
     if _is_reparse_escape(lock_path):
         raise ValueError(
-            "staggered strategy publication lock may not be a symlink or junction"
+            "staggered strategy publication lock may not be a symlink, junction, "
+            "or reparse point"
         )
     lock = _acquire_strategy_lock(lock_path)
     staging: Path | None = None
