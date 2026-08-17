@@ -949,11 +949,9 @@ class PublicationTests(unittest.TestCase):
                 return _windows_reparse_result(result)
             return result
 
-        with mock.patch.object(Path, "is_junction", new=None), mock.patch.object(
-            Path,
-            "lstat",
-            new=python_311_lstat,
-        ):
+        with mock.patch.object(
+            staggered, "_is_windows_platform", return_value=True
+        ), mock.patch.object(Path, "lstat", new=python_311_lstat):
             with self.assertRaisesRegex(ValueError, "reparse"):
                 backtest_staggered_strategy(
                     self.model_name,

@@ -499,10 +499,14 @@ def _validate_source_provenance(
             raise ValueError(f"staggered source hash changed: {name}")
 
 
+def _is_windows_platform() -> bool:
+    return os.name == "nt"
+
+
 def _is_reparse_escape(path: Path) -> bool:
     if path.is_symlink():
         return True
-    if os.name != "nt":
+    if not _is_windows_platform():
         return False
     try:
         attributes = getattr(path.lstat(), "st_file_attributes", 0)
