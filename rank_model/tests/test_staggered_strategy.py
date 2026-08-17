@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
+import copy
+from contextlib import redirect_stderr, redirect_stdout
+import io
 import json
 import os
 from pathlib import Path
 import stat
 import tempfile
+import tomllib
 import unittest
 from unittest import mock
 
@@ -17,6 +21,7 @@ from pandas.testing import assert_frame_equal
 
 import rank_model.stages.strategy as strategy
 import rank_model.stages.staggered_strategy as staggered
+import rank_model.pipeline as pipeline
 from rank_model.stages.dataset import file_sha256
 from rank_model.stages.strategy import (
     LOCKED_MODEL_NAMES,
@@ -324,6 +329,124 @@ def _windows_reparse_result(result: os.stat_result) -> object:
             getattr(result, "st_file_attributes", 0) | reparse_flag
         ),
     )
+
+
+def _write_synthetic_staggered_comparison_inputs(
+    root: Path,
+) -> tuple[Path, Path, dict[str, dict[str, Path]]]:
+    run_root = root / "strategy_10d_runs"
+    daily_run_root = root / "strategy_runs"
+    run_root.mkdir()
+    daily_run_root.mkdir()
+    source_paths_by_model: dict[str, dict[str, Path]] = {}
+    integer_metrics = {
+        "elapsed_trading_observations",
+        "buy_attempt_count",
+        "sell_attempt_count",
+        "buy_count",
+        "sell_count",
+        "blocked_sale_days",
+    }
+    daily_rows: list[dict[str, object]] = []
+    daily_sources: list[dict[str, str]] = []
+    for model_index, model_name in enumerate(LOCKED_MODEL_NAMES, start=1):
+        model_directory = run_root / model_name
+        model_directory.mkdir()
+        input_hashes = {
+            name: f"{model_index:x}" * 64 for name in strategy._STRATEGY_SOURCE_NAMES
+        }
+        _write_json(
+            model_directory / "manifest.json",
+            {"model_name": model_name, "input_sha256": input_hashes},
+        )
+        _write_json(
+            model_directory / "average_metrics.json",
+            {
+                name: (
+                    400
+                    if name == "elapsed_trading_observations"
+                    else model_index * 0.01 + metric_index * 0.0001
+                )
+                for metric_index, name in enumerate(staggered.AVERAGE_METRICS)
+            },
+        )
+        pd.DataFrame(
+            [
+                {
+                    "statistic": statistic,
+                    **{
+                        metric: model_index * 0.1
+                        + statistic_index * 0.01
+                        + metric_index * 0.0001
+                        for metric_index, metric in enumerate(
+                            staggered._OFFSET_METRIC_COLUMNS
+                        )
+                    },
+                }
+                for statistic_index, statistic in enumerate(OFFSET_STATISTICS)
+            ]
+        ).to_csv(model_directory / "offset_summary.csv", index=False)
+        source_paths_by_model[model_name] = {}
+
+        daily_model_directory = daily_run_root / model_name
+        daily_model_directory.mkdir()
+        daily_manifest_path = daily_model_directory / "manifest.json"
+        _write_json(daily_manifest_path, {"model_name": model_name})
+        daily_sources.append(
+            {
+                "model_name": model_name,
+                "path": f"strategy_runs/{model_name}/manifest.json",
+                "sha256": file_sha256(daily_manifest_path),
+            }
+        )
+        daily_rows.append(
+            {
+                "model_name": model_name,
+                **{
+                    metric: (
+                        484
+                        if metric == "elapsed_trading_observations"
+                        else model_index
+                        if metric in integer_metrics
+                        else model_index * 0.005 + metric_index * 0.0001
+                    )
+                    for metric_index, metric in enumerate(strategy._SUMMARY_FORMULAS)
+                },
+            }
+        )
+
+    daily_path = root / "strategy_comparison.csv"
+    daily_frame = pd.DataFrame(
+        daily_rows, columns=("model_name", *strategy._SUMMARY_FORMULAS)
+    )
+    daily_frame.to_csv(daily_path, index=False)
+    daily_schema = (
+        ("model_name", "string"),
+        *(
+            (metric, "integer" if metric in integer_metrics else "number")
+            for metric in strategy._SUMMARY_FORMULAS
+        ),
+    )
+    _write_json(
+        daily_path.with_suffix(".manifest.json"),
+        {
+            "schema_version": 1,
+            "status": "completed",
+            "purpose": "frozen_rank_model_static_strategy_comparison_2024_2025",
+            "comparison": staggered._comparison_metadata(
+                daily_path, daily_frame, daily_schema
+            ),
+            "source_strategy_manifests": daily_sources,
+            "sealed_strategy_contract": {
+                "sha256": "a" * 64,
+                "settings_sha256": "b" * 64,
+                "formulas_sha256": "c" * 64,
+                "observation_conventions_sha256": "d" * 64,
+                "common_input_sha256": {},
+            },
+        },
+    )
+    return run_root, daily_path, source_paths_by_model
 
 
 class TransitionModeTests(unittest.TestCase):
@@ -1485,6 +1608,245 @@ class PathSimulationTests(unittest.TestCase):
             ),
             {"C", "D"},
         )
+
+
+
+class ConfigAndCliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.config_path = pipeline.DEFAULT_CONFIG_PATH
+        with self.config_path.open("rb") as handle:
+            self.config = tomllib.load(handle)
+
+    def test_accepts_only_the_fixed_staggered_config_and_paths(self) -> None:
+        resolved = pipeline._validate_staggered_strategy_paths(
+            self.config, self.config_path
+        )
+        self.assertEqual(
+            resolved["strategy_10d_runs_dir"],
+            pipeline.PACKAGE_DIR / "strategy_10d_runs",
+        )
+        mutations = {
+            "horizon": 5,
+            "offset_count": 9,
+            "last_complete_signal": "2025-12-17",
+            "retry_blocked_sells_daily": False,
+            "retry_failed_buys_daily": True,
+        }
+        for key, value in mutations.items():
+            with self.subTest(key=key):
+                changed = copy.deepcopy(self.config)
+                changed["strategy_10d"][key] = value
+                with self.assertRaisesRegex(ValueError, "strategy_10d"):
+                    pipeline._validate_staggered_strategy_paths(
+                        changed, self.config_path
+                    )
+        missing = copy.deepcopy(self.config)
+        del missing["strategy_10d"]["horizon"]
+        with self.assertRaisesRegex(ValueError, "strategy_10d"):
+            pipeline._validate_staggered_strategy_paths(missing, self.config_path)
+        for key, value in (
+            ("retry_blocked_sells_daily", 1),
+            ("retry_failed_buys_daily", 0),
+        ):
+            with self.subTest(type_alias=key):
+                changed = copy.deepcopy(self.config)
+                changed["strategy_10d"][key] = value
+                with self.assertRaisesRegex(ValueError, "strategy_10d"):
+                    pipeline._validate_staggered_strategy_paths(
+                        changed, self.config_path
+                    )
+
+    def test_rejects_escaped_model_data_aliased_and_missing_outputs(self) -> None:
+        mutations = (
+            ("strategy_10d_runs_dir", "../../escaped"),
+            ("strategy_10d_comparison", "../model/data/unsafe.csv"),
+            ("daily_vs_10d_comparison", "strategy_comparison.csv"),
+        )
+        for key, value in mutations:
+            with self.subTest(key=key):
+                changed = copy.deepcopy(self.config)
+                changed["paths"][key] = value
+                with self.assertRaises(ValueError):
+                    pipeline._validate_staggered_strategy_paths(
+                        changed, self.config_path
+                    )
+        missing = copy.deepcopy(self.config)
+        del missing["paths"]["strategy_10d_runs_dir"]
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            pipeline._validate_staggered_strategy_paths(missing, self.config_path)
+
+    def test_registers_both_commands_and_rejects_unknown_models(self) -> None:
+        parser = pipeline.make_parser()
+        parsed = parser.parse_args(
+            ["backtest-strategy-10d", "--model", LOCKED_MODEL_NAMES[0]]
+        )
+        self.assertEqual(parsed.command, "backtest-strategy-10d")
+        self.assertEqual(
+            parser.parse_args(["compare-strategy-10d"]).command,
+            "compare-strategy-10d",
+        )
+        for command in ("backtest-strategy-10d", "compare-strategy-10d"):
+            with self.subTest(command=command), redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    parser.parse_args([command, "--help"])
+                self.assertEqual(raised.exception.code, 0)
+        with self.assertRaises(SystemExit) as raised, redirect_stdout(
+            io.StringIO()
+        ), redirect_stderr(io.StringIO()):
+            parser.parse_args(["backtest-strategy-10d", "--model", "unknown"])
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_command_adapters_use_the_exact_eight_sources(self) -> None:
+        paths = pipeline._validate_staggered_strategy_paths(
+            self.config, self.config_path
+        )
+        model_name = LOCKED_MODEL_NAMES[0]
+        with mock.patch.object(
+            pipeline, "_validate_staggered_strategy_paths", return_value=paths
+        ), mock.patch.object(
+            pipeline, "backtest_staggered_strategy", return_value=Path("published")
+        ) as backtest:
+            result = pipeline.command_backtest_strategy_10d(
+                self.config, self.config_path, model_name
+            )
+        self.assertEqual(result, Path("published"))
+        self.assertEqual(
+            set(backtest.call_args.kwargs["source_paths"]),
+            set(strategy._STRATEGY_SOURCE_NAMES),
+        )
+        self.assertEqual(
+            backtest.call_args.kwargs["destination"],
+            paths["strategy_10d_runs_dir"] / model_name,
+        )
+        expected_result = (pd.DataFrame(), pd.DataFrame())
+        with mock.patch.object(
+            pipeline, "_validate_staggered_strategy_paths", return_value=paths
+        ), mock.patch.object(
+            pipeline,
+            "compare_staggered_strategy_runs",
+            return_value=expected_result,
+        ) as compare:
+            result = pipeline.command_compare_strategy_10d(
+                self.config, self.config_path
+            )
+        self.assertIs(result, expected_result)
+        self.assertEqual(
+            set(compare.call_args.args[4]), set(LOCKED_MODEL_NAMES)
+        )
+        for source_paths in compare.call_args.args[4].values():
+            self.assertEqual(
+                set(source_paths), set(strategy._STRATEGY_SOURCE_NAMES)
+            )
+
+
+class ComparisonTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self._reset_fixture()
+
+    def _reset_fixture(self) -> None:
+        self.root = Path(self.temporary.name)
+        (
+            self.run_root,
+            self.daily_path,
+            self.source_paths_by_model,
+        ) = _write_synthetic_staggered_comparison_inputs(self.root)
+        self.output_path = self.root / "strategy_10d_comparison.csv"
+        self.daily_vs_path = self.root / "daily_vs_10d_comparison.csv"
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _compare(self) -> tuple[pd.DataFrame, pd.DataFrame]:
+        with mock.patch.object(staggered, "_validate_staggered_publication"):
+            return staggered.compare_staggered_strategy_runs(
+                self.run_root,
+                self.output_path,
+                self.daily_path,
+                self.daily_vs_path,
+                self.source_paths_by_model,
+            )
+
+    def test_publishes_exact_comparisons_with_physical_manifest_anchors(self) -> None:
+        comparison, daily_vs = self._compare()
+        self.assertEqual(tuple(comparison["model_name"]), LOCKED_MODEL_NAMES)
+        self.assertEqual(
+            tuple(comparison.columns), staggered._STAGGERED_COMPARISON_COLUMNS
+        )
+        self.assertEqual(tuple(daily_vs.columns), staggered._DAILY_VS_10D_COLUMNS)
+        for model_name in LOCKED_MODEL_NAMES:
+            row = daily_vs.loc[daily_vs["model_name"].eq(model_name)].iloc[0]
+            for metric in staggered.DAILY_VS_10D_METRICS:
+                self.assertAlmostEqual(
+                    row[f"difference_{metric}"],
+                    row[f"strategy_10d_{metric}"] - row[f"daily_{metric}"],
+                )
+        manifest = json.loads(
+            self.output_path.with_suffix(".manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(len(manifest["source_model_manifests"]), 5)
+        for anchor in manifest["source_model_manifests"]:
+            model_manifest = self.root / anchor["path"]
+            self.assertEqual(
+                anchor["physical_sha256"], file_sha256(model_manifest)
+            )
+        daily_vs_manifest = json.loads(
+            self.daily_vs_path.with_suffix(".manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            daily_vs_manifest["source_daily_comparison_manifest"][
+                "physical_sha256"
+            ],
+            file_sha256(self.daily_path.with_suffix(".manifest.json")),
+        )
+
+    def test_valid_existing_pairs_are_verified_without_rewrite(self) -> None:
+        self._compare()
+        paths = (
+            self.output_path,
+            self.output_path.with_suffix(".manifest.json"),
+            self.daily_vs_path,
+            self.daily_vs_path.with_suffix(".manifest.json"),
+        )
+        before = {path: path.read_bytes() for path in paths}
+        self._compare()
+        self.assertEqual(before, {path: path.read_bytes() for path in paths})
+
+    def test_missing_partner_tampering_and_changed_provenance_fail_closed(self) -> None:
+        self._compare()
+        self.output_path.with_suffix(".manifest.json").unlink()
+        with self.assertRaisesRegex(ValueError, "exist as a pair"):
+            self._compare()
+
+        self.temporary.cleanup()
+        self.temporary = tempfile.TemporaryDirectory()
+        self._reset_fixture()
+        self._compare()
+        model_manifest = self.run_root / LOCKED_MODEL_NAMES[0] / "manifest.json"
+        model_manifest.write_text(
+            model_manifest.read_text(encoding="utf-8") + "\n", encoding="utf-8"
+        )
+        with self.assertRaisesRegex(ValueError, "provenance|hash"):
+            self._compare()
+
+    def test_comparison_csv_tampering_fails_closed(self) -> None:
+        self._compare()
+        frame = pd.read_csv(self.daily_vs_path)
+        frame.loc[0, "difference_cumulative_return"] += 1.0
+        frame.to_csv(self.daily_vs_path, index=False)
+        with self.assertRaisesRegex(ValueError, "does not match|hash"):
+            self._compare()
+
+    def test_requires_an_existing_valid_daily_comparison_pair(self) -> None:
+        self.daily_path.with_suffix(".manifest.json").unlink()
+        with self.assertRaises(FileNotFoundError):
+            self._compare()
+        self.assertFalse(self.output_path.exists())
+        self.assertFalse(self.daily_vs_path.exists())
 
 
 if __name__ == "__main__":
