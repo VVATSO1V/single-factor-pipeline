@@ -285,6 +285,85 @@ settings, formulas, observation conventions, and source-input provenance. A
 first publication stages both files and rolls the CSV back if the sidecar cannot
 be committed, so readers never accept a CSV without its provenance seal.
 
+## 2024-2025 锁定测试：十交易日错位换仓策略
+
+十交易日策略用于检验“每十个交易日换仓”是否对固定模型的表现更稳健，同时避免
+只选择某一个幸运起始日。它不是把一份资金拆成十份，而是为每个模型建立 **10 条彼此
+独立、各自以 1.0 初始净值运行的满资金路径**。在某条路径首次交易前，该路径始终
+保持全现金；十条路径只在研究汇总时等权平均。
+
+静态测试只使用 2024-01-02 至 2025-12-16 的 474 个完整信号日。按照官方交易日历将
+这些日期编号为 1 至 474；offset `k`（`k = 1..10`）使用编号
+`k, k + 10, k + 20, ...` 的日期。因此，十条路径合起来恰好覆盖每个完整信号日一次，
+不重叠也不遗漏。2025-12-17 至 2025-12-31 的信号没有完整的十日持有期，保留给
+2026 年后的前向模拟，不进入这里的静态测试。
+
+对任一排程信号日 `T`：
+
+```text
+T 收盘后：       只按当天有限的 score_raw 和 stock_code 的确定性顺序选出 Top100
+T+1 复权开盘：   执行该次调仓
+T+11 复权开盘：  该信号的完整十个交易日持有期终值；也是下一次同一路径调仓的执行时点
+```
+
+每条路径在自己的最后一个完整 `T+11` 开盘价处结束估值，不强制清仓。十条路径的
+终止日期最多相差九个交易日。研究平均净值只使用十条路径都实际有净值的共同区间：
+从 2024-01-02 的全现金初值到最早的完整终止日 2025-12-18，绝不为了对齐而向后填充
+任何路径。平均净值、收益、波动率、Sharpe、回撤、换手和成本都由平均后的实际经济量
+重新计算，不能把十条路径的 Sharpe 直接平均。
+
+调仓沿用日频策略的同一执行状态机和交易限制，并采用集合差换仓：新 Top100 与现有
+持仓的交集保留原有单位，不会先卖出再买回；仅尝试卖出不在新集合中的股票，并仅尝试
+买入新集合中尚未持有的股票。被阻塞的卖出订单只要仍不在目标集合中就会在每个交易日
+重试；买入失败后在本轮十交易日周期内不重试，也不以第 101 名或其他股票递补，所以
+未成交部分保持现金。ST、停牌、上市天数、涨跌停、价格有效性、仓位缩放、交易成本和
+持仓估值口径均与日频策略保持一致。
+
+在仓库根目录执行以下命令，按顺序为五个已冻结模型生成十交易日结果，再生成五模型
+汇总和日频对比。此工作流会运行真实的 2024-2025 锁定测试；不要把测试结果用于重新
+调参、重新训练、增删特征或修改策略参数，否则该测试集将不再是独立测试集。
+
+```powershell
+$python = ".\.venv\Scripts\python.exe"
+$models = @(
+  "ridge_rank_regression",
+  "xgboost_rank_regression",
+  "lightgbm_rank_regression",
+  "lightgbm_lambdarank",
+  "mlp_top100_hybrid_rank"
+)
+foreach ($model in $models) {
+  & $python -m rank_model.pipeline --config rank_model\config.toml `
+    backtest-strategy-10d --model $model
+}
+& $python -m rank_model.pipeline --config rank_model\config.toml `
+  compare-strategy-10d
+```
+
+每个模型在 `rank_model/strategy_10d_runs/<model-name>/` 下生成十个
+`offset_01` 至 `offset_10` 路径目录。每条路径都包含 `daily_nav.csv`、
+`trades.parquet`、`positions.parquet`、`execution_diagnostics.csv`、
+`ending_positions.csv`、`metrics_summary.json` 和 `manifest.json`，因此五个模型
+共计 50 份路径报告。模型目录同时包含：
+
+```text
+offset_metrics.csv      # 十条路径各自的指标
+offset_summary.csv      # 每项路径指标的均值、中位数、样本标准差、最小值、最大值
+average_nav.csv         # 十条独立满资金路径的共同区间平均净值
+average_metrics.json    # 由平均净值重新计算的整体指标
+manifest.json           # 排程、来源、设置和全部输出的封存清单
+```
+
+五模型横向结果写入 `rank_model/strategy_10d_comparison.csv` 及其 manifest；
+`rank_model/daily_vs_10d_comparison.csv` 及其 manifest 则对每个模型逐项给出
+“十交易日策略指标 - 日频策略指标”，包括收益、波动率、Sharpe、回撤、现金占比、
+年化换手和总成本。两张表都只呈现结果，不自动选择赢家。
+
+所有十交易日输出都是不可变的。`backtest-strategy-10d` 若发现同一模型目录已经存在
+会拒绝覆盖；`compare-strategy-10d` 若发现完整、哈希和来源均有效的既有 CSV/manifest
+对，会验证后原样返回，不重写文件。缺失、部分写入、来源变化或任何篡改都会失败关闭，
+而不是静默修补或覆盖旧结果。
+
 ## Artifacts
 
 `prepare` creates the following files under `rank_model/data`:
