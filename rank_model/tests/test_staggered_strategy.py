@@ -929,7 +929,9 @@ class PublicationTests(unittest.TestCase):
                 return _windows_reparse_result(result)
             return result
 
-        with mock.patch.object(Path, "lstat", new=output_root_reparse_lstat):
+        with mock.patch.object(
+            staggered, "_is_windows_platform", return_value=True
+        ), mock.patch.object(Path, "lstat", new=output_root_reparse_lstat):
             with self.assertRaisesRegex(ValueError, "junction"):
                 backtest_staggered_strategy(
                     self.model_name,
@@ -974,7 +976,9 @@ class PublicationTests(unittest.TestCase):
                 return _windows_reparse_result(result)
             return result
 
-        with mock.patch.object(Path, "lstat", new=staged_offset_reparse_lstat):
+        with mock.patch.object(
+            staggered, "_is_windows_platform", return_value=True
+        ), mock.patch.object(Path, "lstat", new=staged_offset_reparse_lstat):
             with self.assertRaisesRegex(ValueError, "junction"):
                 self._publish()
 
@@ -1000,6 +1004,8 @@ class PublicationTests(unittest.TestCase):
             return result
 
         with mock.patch.object(
+            staggered, "_is_windows_platform", return_value=True
+        ), mock.patch.object(
             staggered,
             "_validate_staggered_publication",
             side_effect=validate_then_change_ancestry,
