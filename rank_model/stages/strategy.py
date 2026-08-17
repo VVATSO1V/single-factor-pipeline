@@ -377,6 +377,15 @@ class StrategyBundle:
     metrics_summary: dict[str, float | int]
 
 
+@dataclass(frozen=True)
+class LockedStrategyInputs:
+    predictions: pd.DataFrame
+    market_panel: pd.DataFrame
+    trading_calendar: pd.DataFrame
+    source_paths: dict[str, Path]
+    source_hashes: dict[str, str]
+
+
 _TRADE_COLUMNS = (
     "stock_code",
     "signal_date",
@@ -516,8 +525,12 @@ def transition_at_open(
     signal_date: Any,
     execution_date: Any,
     settings: StrategySettings,
+    *,
+    allow_buys: bool = True,
 ) -> TransitionResult:
     """Execute one deterministic open-to-open set-difference rebalance."""
+    if not isinstance(allow_buys, bool):
+        raise ValueError("allow_buys must be boolean")
     result_state = _validated_state(state)
     desired_codes = _desired_stock_codes(desired)
     market_rows = _market_rows_by_stock(market)
@@ -575,7 +588,9 @@ def transition_at_open(
             )
         )
 
-    entry_candidates = sorted(desired_set - set(result_state.positions))
+    entry_candidates = (
+        sorted(desired_set - set(result_state.positions)) if allow_buys else []
+    )
     requested_buy_gross = pre_trade_nav / settings.top_k
     eligible_buys: dict[str, Any] = {}
     blocked_buys: dict[str, tuple[Any, str]] = {}
@@ -1437,18 +1452,13 @@ def _read_strategy_json(path: Path, label: str) -> dict[str, Any]:
     return value
 
 
-def backtest_locked_strategy(
+def load_locked_strategy_inputs(
     model_name: str,
-    *,
-    destination: Path,
     settings: StrategySettings,
     source_paths: Mapping[str, Path],
-) -> Path:
-    """Load sealed inputs, simulate one frozen model, and publish its run."""
-    destination = Path(destination)
-    if destination.exists():
-        raise FileExistsError(f"strategy run already exists: {destination}")
-    _strategy_source_hashes(source_paths, model_name)
+) -> LockedStrategyInputs:
+    """Validate seals once and load prediction, calendar, and market frames."""
+    source_hashes = _strategy_source_hashes(source_paths, model_name)
     paths = {name: Path(source_paths[name]) for name in _STRATEGY_SOURCE_NAMES}
 
     frozen_spec = _read_strategy_json(paths["frozen_models"], "frozen specification")
@@ -1499,11 +1509,32 @@ def backtest_locked_strategy(
     market_panel = _load_strategy_market_panel(
         paths["market_panel"], trading_calendar, settings
     )
+    return LockedStrategyInputs(
+        predictions=predictions,
+        market_panel=market_panel,
+        trading_calendar=trading_calendar,
+        source_paths=paths,
+        source_hashes=source_hashes,
+    )
+
+
+def backtest_locked_strategy(
+    model_name: str,
+    *,
+    destination: Path,
+    settings: StrategySettings,
+    source_paths: Mapping[str, Path],
+) -> Path:
+    """Load sealed inputs, simulate one frozen model, and publish its run."""
+    destination = Path(destination)
+    if destination.exists():
+        raise FileExistsError(f"strategy run already exists: {destination}")
+    inputs = load_locked_strategy_inputs(model_name, settings, source_paths)
 
     bundle = simulate_strategy(
-        predictions,
-        market_panel,
-        trading_calendar,
+        inputs.predictions,
+        inputs.market_panel,
+        inputs.trading_calendar,
         settings,
     )
     return write_strategy_run(
@@ -1511,7 +1542,7 @@ def backtest_locked_strategy(
         destination,
         settings,
         model_name=model_name,
-        source_paths=paths,
+        source_paths=inputs.source_paths,
     )
 
 
