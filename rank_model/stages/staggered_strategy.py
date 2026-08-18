@@ -1766,6 +1766,42 @@ def build_offset_schedules(
     return result
 
 
+def build_dynamic_offset_schedules(
+    calendar: Any,
+    settings: StrategySettings,
+) -> Sequence[OffsetSchedule]:
+    """Partition a dynamic period into ten offsets without sealed-date checks."""
+    official = _calendar_dates(calendar)
+    period = official[(official >= settings.start) & (official <= settings.end)]
+    if len(period) < STAGGERED_COMPLETE_SHIFT + 1:
+        raise ValueError("forward strategy period requires at least 12 official dates")
+
+    eligible = period[:-STAGGERED_COMPLETE_SHIFT]
+    if len(eligible) < STAGGERED_OFFSET_COUNT:
+        raise ValueError("forward strategy requires at least ten complete signal dates")
+    positions = {pd.Timestamp(date): index for index, date in enumerate(period)}
+    schedules: list[OffsetSchedule] = []
+    for offset in range(1, STAGGERED_OFFSET_COUNT + 1):
+        indices = list(range(offset - 1, len(eligible), STAGGERED_OFFSET_COUNT))
+        signal_dates = tuple(eligible[index] for index in indices)
+        execution_dates = tuple(period[positions[date] + 1] for date in signal_dates)
+        schedules.append(
+            OffsetSchedule(
+                offset=offset,
+                signal_dates=signal_dates,
+                execution_dates=execution_dates,
+                final_horizon_date=period[
+                    positions[signal_dates[-1]] + STAGGERED_COMPLETE_SHIFT
+                ],
+            )
+        )
+    result = tuple(schedules)
+    assigned = [date for schedule in result for date in schedule.signal_dates]
+    if len(assigned) != len(set(assigned)) or set(assigned) != set(eligible):
+        raise ValueError("forward schedules must partition every complete signal date")
+    return result
+
+
 _STAGGERED_DAILY_COLUMNS = (
     "offset",
     "is_rebalance",
@@ -1842,6 +1878,8 @@ def simulate_staggered_offset(
     calendar: Any,
     settings: StrategySettings,
     schedule: OffsetSchedule,
+    *,
+    prediction_split: str = "test",
 ) -> StaggeredPathBundle:
     """Value one offset daily and update its desired set only on schedule."""
     official = _calendar_dates(calendar)
@@ -1850,7 +1888,12 @@ def simulate_staggered_offset(
         raise ValueError("strategy period has no official trading dates")
     _validate_path_schedule(schedule, period)
 
-    desired_by_date = select_daily_top(predictions, settings, official)
+    desired_by_date = select_daily_top(
+        predictions,
+        settings,
+        official,
+        expected_split=prediction_split,
+    )
     if set(desired_by_date) != set(period):
         raise ValueError("prediction dates must exactly match the strategy trading calendar")
     market_panel = _normalize_market_panel(market)

@@ -1,0 +1,34 @@
+[project]
+history_start = "2019-01-01"
+strategy_start = "2024-01-01"
+index_code = "000852.XSHG"
+industry_source = "citics_2019"
+env_path = "../.env"
+
+[paths]
+model_config = "../model/config.toml"
+rank_config = "config.toml"
+forward_runs_dir = "forward_strategy_runs"
+market_panel = "../model/data/market_panel.csv"
+trading_calendar = "../model/data/trading_calendar.csv"
+frozen_spec = "frozen_models.json"
+final_runs_dir = "final_runs"
+
+[strategy]
+top_k = 100
+expected_cross_section_size = 1000
+min_listing_days = 120
+initial_nav = 1.0
+commission_bps = 1.0
+slippage_bps = 5.0
+sell_stamp_duty_bps = 5.0
+limit_tolerance = 0.00000001
+annualization_days = 252
+
+[forward]
+horizon = 10
+offset_count = 10
+context_windows = [1, 5, 20]
+mad_width = 3.0
+date_chunk_size = 60
+cap_coverage_threshold = 0.95

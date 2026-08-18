@@ -123,9 +123,29 @@ excluding labels that need 2024 prices. No validation split, early stopping,
 test prediction, or strategy rule is used. The selected hybrid MLP runs a fixed
 12 epochs. Final artifacts are immutable under
 `rank_model/final_runs/<model-name>` and intentionally contain no prediction
-file; 2024-2025 prediction is a later, separate locked-test step. `refit`
-verifies the sealed rank file before opening it and does not read upstream
-source data.
+file; 2024-2025 prediction is a later, separate locked-test step. These five
+frozen model directories are tracked deliverables and must be included when
+sharing the repository; a RiceQuant account can refresh data, but cannot
+recreate the frozen model artifacts without rerunning the research and final
+refit process. `refit` verifies the sealed rank file before opening it and does
+not read upstream source data.
+
+## Frozen Model Delivery
+
+The repository delivers exactly these five inference artifacts:
+
+```text
+rank_model/final_runs/ridge_rank_regression/
+rank_model/final_runs/xgboost_rank_regression/
+rank_model/final_runs/lightgbm_rank_regression/
+rank_model/final_runs/lightgbm_lambdarank/
+rank_model/final_runs/mlp_top100_hybrid_rank/
+```
+
+Each directory contains the frozen model, its fitted preprocessor, feature
+schema, configuration snapshot, and manifest. The forward runner loads these
+files without retraining. Historical CSV and Parquet data remain local runtime
+inputs and do not need to be committed when `--update-data` is used.
 
 ## 2024-2025 Locked Test
 
@@ -258,6 +278,53 @@ excluded from return, turnover, cost, and win-rate observations. Average
 turnover uses the 484 execution rows; annualized turnover multiplies the daily
 average by 252. `total_cost` is the sum of daily trade-level costs, and blocked
 sale days count distinct execution dates with at least one blocked sell.
+
+## Dynamic Forward Strategy
+
+`forward_strategy.py` is the independent entrypoint for extending the strategy
+past the sealed 2024-2025 test. It never trains or refits a model. It loads the
+five tracked artifacts under `rank_model/final_runs`, refreshes or validates the
+17 factor inputs, rebuilds the point-in-time features, scores all five models,
+and runs the same 10-day staggered strategy with ten trading-day offsets.
+
+With a valid RiceQuant account configured in `.env`, run from the repository
+root:
+
+```powershell
+& .\.venv\Scripts\python.exe -m rank_model.forward_strategy `
+  --config .\rank_model\forward_strategy.toml `
+  --run-id forward-2026 `
+  --update-data
+```
+
+`--update-data` obtains the latest completed official trading date, rebuilds
+the complete 2019-to-latest factor and market inputs, and then performs frozen
+inference. It does not change anything under `final_runs`.
+
+When the data has already been copied into the configured local paths, use the
+offline data mode instead:
+
+```powershell
+& .\.venv\Scripts\python.exe -m rank_model.forward_strategy `
+  --config .\rank_model\forward_strategy.toml `
+  --run-id forward-local `
+  --local-only
+```
+
+The local mode requires all 17 factor files, `model/data/market_panel.csv`, and
+`model/data/trading_calendar.csv` to share the same maximum date. It never
+contacts RiceQuant. In either mode, the result is written to
+`rank_model/forward_strategy_runs/<run-id>/`, including the as-of date, the
+last complete 10-day signal date, five prediction files, ten offset paths per
+model, average NAV and metrics, and a five-model comparison table. The final
+incomplete horizon is excluded from the offset schedules, so the latest signal
+date is earlier than the latest available market date by the required T+1 entry
+and ten-day holding window.
+
+A colleague cannot complete this workflow with a RiceQuant account alone:
+the repository must also contain the five tracked frozen model directories
+listed above. The account supplies new observations; it does not recreate the
+frozen model parameters.
 
 Each directory under `rank_model/strategy_runs/<model-name>` contains:
 

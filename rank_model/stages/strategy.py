@@ -167,6 +167,8 @@ def _validate_predictions(
     predictions: pd.DataFrame,
     settings: StrategySettings,
     calendar: Any,
+    *,
+    expected_split: str = "test",
 ) -> pd.DataFrame:
     if not isinstance(predictions, pd.DataFrame):
         raise ValueError("predictions must be a DataFrame")
@@ -190,8 +192,8 @@ def _validate_predictions(
     result["score_raw"] = pd.to_numeric(result["score_raw"], errors="coerce")
     if not np.isfinite(result["score_raw"].to_numpy(dtype="float64")).all():
         raise ValueError("prediction scores must be finite")
-    if not result["split"].astype("string").eq("test").all():
-        raise ValueError("predictions must contain only the test split")
+    if not result["split"].astype("string").eq(expected_split).all():
+        raise ValueError(f"predictions must contain only the {expected_split} split")
     horizons = pd.to_numeric(result["horizon"], errors="coerce")
     if not horizons.eq(10).all():
         raise ValueError("predictions must contain exact horizon metadata 10")
@@ -214,18 +216,32 @@ def validate_prediction_calendar(
     predictions: pd.DataFrame,
     calendar: Any,
     settings: StrategySettings,
+    *,
+    expected_split: str = "test",
 ) -> None:
     """Validate prediction keys, metadata, daily size, and official dates."""
-    _validate_predictions(predictions, settings, calendar)
+    _validate_predictions(
+        predictions,
+        settings,
+        calendar,
+        expected_split=expected_split,
+    )
 
 
 def select_daily_top(
     predictions: pd.DataFrame,
     settings: StrategySettings,
     calendar: Any,
+    *,
+    expected_split: str = "test",
 ) -> dict[pd.Timestamp, tuple[str, ...]]:
     """Select each date's deterministic highest-scoring stock codes."""
-    normalized = _validate_predictions(predictions, settings, calendar)
+    normalized = _validate_predictions(
+        predictions,
+        settings,
+        calendar,
+        expected_split=expected_split,
+    )
     selected: dict[pd.Timestamp, tuple[str, ...]] = {}
     for date, group in normalized.groupby("date", sort=True):
         ordered = group.sort_values(
