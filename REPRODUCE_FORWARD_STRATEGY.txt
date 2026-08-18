@@ -1,0 +1,166 @@
+单因子流水线：从克隆项目到完成 2024 年至最新日期策略回测
+
+适用版本
+---------
+请使用 GitHub main 分支的最新代码。
+本流程不会重新训练模型，只会读取仓库中已经冻结的五个模型，并使用米筐账号重新下载数据。
+
+一、克隆项目
+------------
+
+在 PowerShell 中执行：
+
+Set-Location "C:\Users\你的用户名\Desktop"
+git clone https://github.com/VVATSO1V/single-factor-pipeline.git
+Set-Location ".\single-factor-pipeline"
+
+确认当前分支和版本：
+
+git branch --show-current
+git log -1 --oneline
+
+当前分支应为 main。
+
+二、检查 Python
+---------------
+
+要求 Python 3.11 或更高版本：
+
+python --version
+
+三、创建虚拟环境
+-----------------
+
+在项目根目录执行：
+
+python -m venv .venv
+
+可以激活虚拟环境：
+
+.\.venv\Scripts\Activate.ps1
+
+如果 PowerShell 不允许激活脚本，也可以不激活，后续始终使用：
+
+.\.venv\Scripts\python.exe
+
+四、安装依赖
+------------
+
+先安装项目根目录依赖：
+
+& .\.venv\Scripts\python.exe -m pip install --upgrade pip
+& .\.venv\Scripts\python.exe -m pip install -r .\requirements.txt
+
+再安装模型和策略依赖：
+
+& .\.venv\Scripts\python.exe -m pip install -r .\rank_model\requirements.txt
+
+检查依赖是否安装成功：
+
+& .\.venv\Scripts\python.exe -c "import pandas,numpy,pyarrow,sklearn,joblib,xgboost,lightgbm,torch,rqdatac; print('dependencies ok')"
+
+五、配置米筐账号
+-----------------
+
+在项目根目录打开 .env：
+
+notepad .env
+
+填写以下内容，并替换成实际账号：
+
+RQDATA_USER=米筐用户名
+RQDATA_PASSWORD=米筐密码
+
+保存并关闭文件。
+
+.env 不在 GitHub 中，每位使用者都需要单独配置自己的米筐账号。
+
+六、运行 2024 年至最新日期的五模型策略回测
+--------------------------------------------
+
+必须在项目根目录执行：
+
+& .\.venv\Scripts\python.exe -m rank_model.forward_strategy `
+  --config .\rank_model\forward_strategy.toml `
+  --update-data
+
+程序会自动完成：
+
+1. 从 2019-01-01 下载至最新已完成交易日的数据；
+2. 生成 17 个因子表；
+3. 生成 market_panel.csv 和 trading_calendar.csv；
+4. 合并模型输入特征；
+5. 读取五个已经冻结的模型；
+6. 对 2024-01-01 至最新日期进行预测；
+7. 对五个模型分别进行 10 日交错换仓策略回测。
+
+该命令不会重新训练模型，也不会自动下单。
+
+七、输出位置
+------------
+
+结果会自动写入：
+
+rank_model\forward_strategy_runs\forward_YYYYMMDD_HHMMSS\
+
+例如：
+
+rank_model\forward_strategy_runs\forward_20260818_163105\
+
+如果同一秒已经存在相同目录，程序会自动增加后缀：
+
+forward_20260818_163105_01
+
+八、查看最近一次运行结果
+-------------------------
+
+获取最近一次运行目录：
+
+$run = Get-ChildItem .\rank_model\forward_strategy_runs -Directory |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 1
+
+查看运行路径：
+
+$run.FullName
+
+查看数据截止日期和最后完整信号日期：
+
+Get-Content "$($run.FullName)\asof.json"
+
+查看五个模型的策略指标对比：
+
+Import-Csv "$($run.FullName)\strategy_10d_comparison.csv" |
+  Format-Table
+
+九、主要输出文件
+-----------------
+
+predictions\
+    五个模型的预测结果。
+
+strategy_10d_runs\
+    每个模型的 offset_01 至 offset_10 策略路径。
+
+strategy_10d_comparison.csv
+    五个模型的策略指标汇总。
+
+feature_snapshot.parquet
+    模型预测前实际生成的特征快照。
+
+asof.json
+    本次数据截止日期和最后完整信号日期。
+
+manifest.json
+    本次运行的配置、数据来源和文件哈希。
+
+十、重要说明
+------------
+
+1. 首次运行会重新生成完整的 2019 年至最新日期数据，运行时间较长，并会消耗米筐数据额度。
+2. 最后若干交易日因为还没有完整的 T+1 执行和 10 日持有区间，不会进入完整策略收益统计。
+3. 2024-2025 的旧静态回测结果位于 rank_model\strategy_runs\，可以直接查看。
+4. 新的 2024-最新日期结果位于 rank_model\forward_strategy_runs\。
+5. 不要运行 train 或 refit，除非明确要重新训练模型。
+6. 不要修改 rank_model\final_runs\ 中的冻结模型文件。
+7. 同一 run-id 不会覆盖旧结果；默认使用运行日期和时间自动命名。
