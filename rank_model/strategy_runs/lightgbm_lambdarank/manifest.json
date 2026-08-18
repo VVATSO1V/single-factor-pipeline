@@ -1,0 +1,82 @@
+{
+  "formulas": {
+    "annualized_gross_turnover": "average_gross_turnover * annualization_days",
+    "annualized_one_way_turnover": "average_one_way_turnover * annualization_days",
+    "annualized_return": "cagr",
+    "annualized_turnover": "annualized_one_way_turnover",
+    "annualized_volatility": "sample_std(net_return over execution rows) * sqrt(annualization_days)",
+    "average_cash_ratio": "mean(cash / nav) over all NAV rows including initial state",
+    "average_gross_turnover": "mean(daily gross_turnover over execution rows)",
+    "average_one_way_turnover": "mean(daily gross_turnover / 2 over execution rows)",
+    "average_turnover": "average_one_way_turnover",
+    "blocked_sale_days": "count(distinct execution_date with at least one blocked sell order)",
+    "buy_attempt_count": "count(trade rows with side = buy)",
+    "buy_count": "count(trade rows with side = buy and status = executed)",
+    "buy_fill_rate": "buy_count / buy_attempt_count; 0 when buy_attempt_count is 0",
+    "cagr": "(ending_nav / initial_nav) ** (annualization_days / elapsed_trading_observations) - 1",
+    "cumulative_return": "ending_nav / initial_nav - 1",
+    "elapsed_trading_observations": "count(daily_nav rows excluding initial state)",
+    "ending_nav": "nav on the final daily_nav row",
+    "gross_turnover": "sum(daily gross_turnover over execution rows)",
+    "max_drawdown": "max(1 - nav / running_max_nav) over all NAV rows",
+    "one_way_turnover": "sum(daily gross_turnover / 2 over execution rows)",
+    "sell_attempt_count": "count(trade rows with side = sell)",
+    "sell_count": "count(trade rows with side = sell and status = executed)",
+    "sell_fill_rate": "sell_count / sell_attempt_count; 0 when sell_attempt_count is 0",
+    "sharpe_ratio": "mean(net_return over execution rows) / sample_std(net_return over execution rows) * sqrt(annualization_days); 0 when sample_std is 0",
+    "total_cost": "sum(total_cost over execution rows)",
+    "win_rate": "count(net_return > 0 over execution rows) / elapsed_trading_observations"
+  },
+  "input_sha256": {
+    "frozen_models": "dab7b46711906853a7785825c899de1fdffd37b244cf1a97f5af55b80092dd38",
+    "locked_test_comparison": "901fcc8eaeef3f968aac587333c82957bd067bc24d370f00eb599f677ddb4e76",
+    "locked_test_conclusion": "cc60be232ac75234966267a31c8b2988cf9364d5c7100c4127d4a8649408eb30",
+    "locked_test_schema": "c0dcfed0b4b6f2a104f57847d9881ee1dfe1d26009e66ebacaae27a5df2fe305",
+    "market_panel": "5b390a005d9547ae8b57b319fd3270594a5fa1b5df1f64216af017d70a64f710",
+    "prediction": "ba317b60dd5e8eb6f2dfd4b1ca57d2cafa6b92784dce59a3325b9194d4d89b4a",
+    "prediction_manifest": "71a0b941d6f1547745e004be62a780138a44b4265351c8d14e97eb895fb18cb6",
+    "trading_calendar": "c7250c5c2c35eef013e4c93ebe9dab0ec43ae5335b6bf97fce68b48003072a94"
+  },
+  "model_name": "lightgbm_lambdarank",
+  "observation_conventions": {
+    "annualization_factor": 252,
+    "blocked_sale_day_count": "distinct execution dates with at least one blocked sell",
+    "fill_rate_denominator": "attempted order rows on the same side",
+    "initial_nav_row": "included in max_drawdown and average_cash_ratio; excluded from return, turnover, cost, and win-rate observations",
+    "return_denominator": "prior execution's ending NAV",
+    "turnover_denominator": "same execution's marked pre-trade NAV"
+  },
+  "output_sha256": {
+    "daily_nav.csv": "8fe94212de0018a9391330b854ff8e6a4fe28571a65935ec4da0158bd4a9332f",
+    "ending_positions.csv": "151178a35a7fb0cdb5f2565a93e42dc547018e84baed6b6863f4266774c0ec76",
+    "execution_diagnostics.csv": "3fd14590a7e355609aeaed4ccbd226a68c46b24f9a21536a094f60ba8c434d53",
+    "metrics_summary.json": "fa878d086d5b17f6d418eed127bd37bac30832ffac87b019ba68e3644a9313ab",
+    "positions.parquet": "66e8c6707edf374cf16030f4da32aa90e63e5a3dbfdd6a677346688a2b227d70",
+    "trades.parquet": "002138c12a7796ae13d739a89cf68a15bae2168269aec2c90f6f5b9d5c66a413"
+  },
+  "purpose": "frozen_rank_model_static_strategy_2024_2025",
+  "rows": {
+    "daily_nav": 485,
+    "ending_positions": 102,
+    "execution_dates": 484,
+    "positions": 48779,
+    "trades": 16970
+  },
+  "schema_version": 1,
+  "settings": {
+    "annualization_days": 252,
+    "buy_cost_rate": 0.0006,
+    "commission_rate": 0.0001,
+    "end": "2025-12-31",
+    "expected_cross_section_size": 1000,
+    "initial_nav": 1.0,
+    "limit_tolerance": 1e-08,
+    "min_listing_days": 120,
+    "sell_cost_rate": 0.0011,
+    "sell_stamp_duty_rate": 0.0005,
+    "slippage_rate": 0.0005,
+    "start": "2024-01-01",
+    "top_k": 100
+  },
+  "status": "completed"
+}
