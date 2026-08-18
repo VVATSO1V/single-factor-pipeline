@@ -9,10 +9,13 @@
 - T+1 开盘进入的 1、5、10 日绝对收益标签。
 - 建模主表、特征白名单和 T+1 执行审计字段。
 - 2019-2022 训练、2023 验证、2024-2025 锁定测试的样本索引。
-- Ridge、XGBoost、LightGBM 和 MLP 神经网络 1、5、10 日 baseline
-  的预处理、调参、训练和验证集预测。
+- Ridge、XGBoost、LightGBM 和 MLP 神经网络 1、5、10 日 baseline 的预处理、
+  调参、训练和验证集预测。
+- Residual Rank MLP 和 10 日 Context/Decomposition 实验入口及其开发期约束。
 
-完整评价、2019-2023 最终重训、锁定测试和策略回测尚未实现。
+当前统一入口已经覆盖数据检查、市场数据获取、建模数据构建和开发期训练。
+完整评价命令、2019-2023 最终重训、2024-2025 锁定测试和策略回测不在当前
+`model.pipeline` 入口中实现，不能把 `train` 的 validation 输出当成锁定测试结果。
 
 ## 核心口径
 
@@ -64,6 +67,19 @@ model/
 - `README.md`：运行和数据口径说明。
 
 `stages` 是内部实现，不应直接运行。以后增加预处理、训练、评价和策略时，也继续由 `pipeline.py` 统一调用。
+
+各模块职责如下：
+
+| 模块 | 作用 |
+|---|---|
+| `market.py` | 读取或构建市场面板、交易日历和 T+1 所需行情字段 |
+| `features.py` | 将因子长表合并为宽表，并整理模型特征列 |
+| `labels.py` | 根据 `post_open` 构建 1、5、10 日绝对开盘到开盘收益 |
+| `dataset.py` | 合并特征和标签，生成时间切分、退出日期和审计字段 |
+| `preprocessing.py` | 按日去极值、横截面标准化和缺失值处理 |
+| `training.py` | 注册模型、训练候选、用 2023 validation 选模型并保存 run |
+| `context.py` | 构造市场和行业环境特征 |
+| `context_training.py` | 运行 10 日 Context/Decomposition 开发实验 |
 
 ## 配置
 
@@ -154,6 +170,54 @@ torch
 
 各因子目录的 `data/factor.csv` 必须先由单因子构建脚本生成。`model` 不会自动调用 17 个因子的构建脚本，也不会重复计算因子。
 
+## 快速运行流程
+
+下面命令都在项目根目录执行，并显式传入配置文件，方便复现：
+
+```powershell
+Set-Location "C:\Users\cbnb\Desktop\单因子测试流水线"
+$python = ".\.venv\Scripts\python.exe"
+$config = ".\model\config.toml"
+
+# 1. 只读检查输入、字段、因子顺序和时间划分
+& $python -m model.pipeline --config $config doctor
+
+# 2. 只有需要从米筐重新获取 market panel 时才运行
+& $python -m model.pipeline --config $config fetch-market
+
+# 3. 使用本地 market panel 和17个 factor.csv 构建建模数据
+& $python -m model.pipeline --config $config prepare-data
+
+# 4. 训练一个模型的1、5、10日开发期 baseline
+& $python -m model.pipeline --config $config train `
+  --model ridge `
+  --horizon all `
+  --run-id ridge_baseline
+```
+
+各命令的输入输出关系：
+
+```text
+doctor
+  只读检查，不写数据，不访问米筐
+        ↓
+fetch-market（可选）
+  米筐 → model/data/market_panel.csv + trading_calendar.csv
+        ↓
+prepare-data
+  17 个 factor.csv + market panel
+  → factor_wide.csv → target.csv → model_dataset.parquet
+  → model_sample_index.parquet + model_split_summary.json
+        ↓
+train
+  model_dataset + sample_index
+  → model/runs/<run_id>/ 模型、预处理器、validation 预测和 manifest
+```
+
+`fetch-market` 是当前唯一会访问米筐的模型命令；`prepare-data`、`prepare-context`
+和 `train` 只读取本地文件。已有 market panel 时不要重复执行 `fetch-market --force`，
+避免无必要地消耗米筐额度。
+
 ## 统一命令
 
 ### 1. 检查环境和数据契约
@@ -222,6 +286,21 @@ sample_index + split_summary
 
 ### 4. 训练模型 baseline
 
+`--model` 决定训练器，`--horizon` 决定训练 1、5、10 日中的一个或全部，
+`--run-id` 是本次实验的唯一目录名。不同模型或参数必须使用不同的 `run-id`，
+避免覆盖已有实验。
+
+| 模型名 | 作用 | 支持期限 |
+|---|---|---|
+| `ridge` | 线性正则化基线，用于判断因子线性增量 | 1、5、10、`all` |
+| `xgboost` | CPU 树模型，捕捉非线性和特征交互 | 1、5、10、`all` |
+| `lightgbm` | CPU 轻量梯度提升树，捕捉非线性和交互 | 1、5、10、`all` |
+| `mlp` | CPU PyTorch 神经网络基线 | 1、5、10、`all` |
+| `residual_rank_mlp` | Ridge 预测之上的残差和排序开发实验 | 1、5、10、`all` |
+| `context_decomposition` | 10 日市场/行业环境与个股分解实验 | 仅10 |
+
+单独训练一个模型：
+
 ```powershell
 .\.venv\Scripts\python.exe -m model.pipeline train `
   --model ridge `
@@ -249,6 +328,19 @@ sample_index + split_summary
   --horizon all `
   --run-id mlp_baseline
 ```
+
+只训练 10 日模型时，把 `--horizon all` 改成 `--horizon 10`。例如：
+
+```powershell
+Set-Location "C:\Users\cbnb\Desktop\单因子测试流水线"
+.\.venv\Scripts\python.exe -m model.pipeline --config .\model\config.toml train `
+  --model lightgbm `
+  --horizon 10 `
+  --run-id lightgbm_10d_baseline
+```
+
+训练命令不会读取 2024-2025 作为模型选择依据，也不会使用 `entry_tradeable`
+删除训练样本；当前输出主要用于 2023 validation 的开发期比较。
 
 ```powershell
 .\.venv\Scripts\python.exe -m model.pipeline train `

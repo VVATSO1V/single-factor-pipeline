@@ -1,6 +1,11 @@
 # 单因子测试流水线
 
-这是一套标准化的 A 股横截面单因子测试流水线。使用者只需要准备两张标准 CSV：
+这是一套标准化的 A 股横截面单因子测试和多因子建模项目，分为两个相互衔接的层次：
+
+- 单因子层：分别构建和检验每个因子；
+- 模型层：把已经生成的因子合并成建模数据，训练多因子模型。
+
+使用者只需要准备两张标准 CSV：
 
 1. `factor.csv`：待测因子值
 2. `market_panel.csv`：股票池、行情、交易状态、行业和市值暴露
@@ -14,6 +19,10 @@
 ├─ single_factor_pipeline.py
 ├─ README.md
 ├─ .env.example
+├─ model/
+│  ├─ README.md
+│  ├─ config.toml
+│  └─ pipeline.py
 └─ reverse_20d/
    ├─ build_market_panel.py
    ├─ build_factor.py
@@ -35,6 +44,22 @@
 ```
 
 `reverse_20d` 是一个 20 日反转因子的完整示例。以后测试新因子时，可以复制这个文件夹，改成新的因子名，再重写其中的 `build_factor.py`。
+
+## 多因子模型入口
+
+多因子模型的完整说明、数据格式、时间划分、模型参数和 PowerShell 运行命令统一写在：
+
+[`model/README.md`](model/README.md)
+
+模型层会读取各因子目录已经生成的 `data/factor.csv`，按 `model/config.toml` 中的路径合并，生成建模数据，并训练 Ridge、XGBoost、LightGBM 和 MLP 等模型。根 README 只说明项目分层，不重复模型层的详细口径。
+
+模型层的统一入口是：
+
+```powershell
+.\.venv\Scripts\python.exe -m model.pipeline --config .\model\config.toml doctor
+```
+
+后续的 `fetch-market`、`prepare-data`、`prepare-context` 和 `train` 命令及其参数，请以 [`model/README.md`](model/README.md) 为准。
 
 ## 环境
 
@@ -340,13 +365,14 @@ reverse_20d/data/factor.csv
 
 ## 当前范围
 
-当前版本暂不包含：
+单因子层负责因子构建、预处理和横截面回测；模型层负责多因子数据和模型训练。当前根项目不负责：
 
 ```text
 与已有因子库的相关性
 交易成本扣减
 分钟级成交模拟
-多因子合成
-组合优化
-机器学习预测
+自动实盘下单
 ```
+
+模型训练和模型输出请查看 `model/README.md`。自动交易执行层是独立的
+`matic-trading` 仓库，不属于本项目根仓库的上传范围。
