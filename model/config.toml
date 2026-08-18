@@ -15,6 +15,8 @@ model_dataset = "data/model_dataset.parquet"
 model_schema = "data/model_dataset_schema.json"
 sample_index = "data/model_sample_index.parquet"
 split_summary = "data/model_split_summary.json"
+context_dataset = "data/context_dataset_10d.parquet"
+context_schema = "data/context_dataset_10d_schema.json"
 runs_dir = "runs"
 
 [factors]
@@ -61,3 +63,153 @@ end = "2023-12-31"
 
 [execution]
 min_listing_days = 120
+
+[context]
+development_end = "2023-12-31"
+windows = [1, 5, 20]
+industry_shrink_k = 10.0
+cap_coverage_threshold = 0.95
+champion_run = "runs/residual_rank_mlp_development"
+hac_lag = 10
+min_prediction_std_ratio = 0.05
+test_contamination_disclosure = "2024-2025 target aggregates were viewed during a prior audit and are not a pristine untouched test."
+
+[preprocessing]
+mad_width = 3.0
+date_chunk_size = 60
+dtype = "float32"
+expected_cross_section_size = 1000
+
+[models.ridge]
+lambda_grid = [0.000001, 0.00001, 0.0001, 0.001, 0.01, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0]
+solver = "cholesky"
+rank_ic_tolerance = 0.000000000001
+
+[models.xgboost]
+objective = "reg:squarederror"
+eval_metric = "rmse"
+tree_method = "hist"
+learning_rate = 0.05
+max_boost_rounds = 300
+early_stopping_rounds = 30
+subsample = 0.8
+colsample_bytree = 0.8
+reg_lambda = 10.0
+reg_alpha = 0.1
+gamma = 0.0
+max_bin = 256
+seed = 42
+nthread = 0
+rank_ic_tolerance = 0.0005
+candidates = [
+  { name = "shallow", max_depth = 3, min_child_weight = 50.0 },
+  { name = "balanced", max_depth = 4, min_child_weight = 100.0 },
+  { name = "deep_regularized", max_depth = 5, min_child_weight = 200.0 },
+]
+
+[models.lightgbm]
+objective = "regression"
+metric = "rmse"
+boosting_type = "gbdt"
+learning_rate = 0.05
+max_boost_rounds = 300
+early_stopping_rounds = 30
+bagging_fraction = 0.8
+bagging_freq = 1
+feature_fraction = 0.8
+lambda_l2 = 10.0
+lambda_l1 = 0.1
+min_gain_to_split = 0.0
+max_bin = 255
+seed = 42
+num_threads = 0
+deterministic = true
+force_col_wise = true
+rank_ic_tolerance = 0.0005
+candidates = [
+  { name = "shallow", num_leaves = 7, max_depth = 3, min_data_in_leaf = 200 },
+  { name = "balanced", num_leaves = 15, max_depth = 4, min_data_in_leaf = 500 },
+  { name = "leafwise_regularized", num_leaves = 31, max_depth = 5, min_data_in_leaf = 1000 },
+]
+
+[models.mlp]
+framework = "pytorch"
+loss = "mse"
+optimizer = "adamw"
+activation = "relu"
+device = "cpu"
+learning_rate = 0.001
+batch_size = 8192
+max_epochs = 80
+early_stopping_patience = 10
+early_stopping_min_delta = 0.00000001
+lr_scheduler_patience = 3
+lr_scheduler_factor = 0.5
+min_learning_rate = 0.00001
+gradient_clip_norm = 1.0
+seed = 42
+num_threads = 4
+target_standardization = false
+rank_ic_tolerance = 0.0005
+candidates = [
+  { name = "small", hidden_layers = [64, 32], dropout = 0.1, weight_decay = 0.0001 },
+  { name = "balanced", hidden_layers = [128, 64, 32], dropout = 0.1, weight_decay = 0.0001 },
+  { name = "regularized", hidden_layers = [128, 64, 32], dropout = 0.3, weight_decay = 0.001 },
+]
+
+[models.residual_rank_mlp]
+ridge_lambda = 1.0
+gamma_grid = [0.0, 0.25, 0.5, 1.0]
+rank_lambda_grid = [0.0, 0.1, 0.25, 0.5]
+dates_per_batch = 8
+pairs_per_stock = 8
+adjacent_pair_fraction = 0.5
+top_group_weight = 2.0
+second_group_weight = 1.5
+huber_mad_multiplier = 1.5
+rank_ic_tolerance = 0.0005
+max_epochs = 80
+early_stopping_patience = 10
+early_stopping_min_delta = 0.00000001
+learning_rate = 0.001
+lr_scheduler_patience = 3
+lr_scheduler_factor = 0.5
+min_learning_rate = 0.00001
+gradient_clip_norm = 1.0
+num_threads = 4
+seed = 42
+stability_seeds = [42, 43, 44]
+target_standardization = false
+candidates = [
+  { name = "small", hidden_layers = [64, 32], dropout = 0.1, weight_decay = 0.0001 },
+  { name = "balanced", hidden_layers = [128, 64, 32], dropout = 0.1, weight_decay = 0.0001 },
+  { name = "regularized", hidden_layers = [128, 64, 32], dropout = 0.3, weight_decay = 0.001 },
+]
+
+[models.context_decomposition]
+lambda_grid = [0.1, 1.0, 10.0]
+rounds_grid = [10, 20, 40, 80, 120, 200]
+prediction_years = [2020, 2021, 2022]
+lightgbm_objective = "regression"
+lightgbm_metric = "rmse"
+lightgbm_learning_rate = 0.05
+lightgbm_num_leaves = 31
+lightgbm_max_depth = 5
+lightgbm_min_data_in_leaf = 1000
+lightgbm_bagging_fraction = 0.8
+lightgbm_bagging_freq = 1
+lightgbm_feature_fraction = 0.8
+lightgbm_lambda_l2 = 10.0
+lightgbm_lambda_l1 = 0.1
+lightgbm_seed = 42
+lightgbm_num_threads = 0
+mlp_hidden_layers = [128, 64, 32]
+mlp_dropout = 0.3
+mlp_weight_decay = 0.001
+mlp_epochs = 6
+mlp_seed = 42
+mlp_huber_mad_multiplier = 1.5
+mlp_learning_rate = 0.001
+mlp_dates_per_batch = 8
+mlp_gradient_clip_norm = 1.0
+mlp_num_threads = 4

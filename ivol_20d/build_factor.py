@@ -219,12 +219,14 @@ def build_factor(
     window: int,
     start_date: str,
 ) -> pd.DataFrame:
-    stock_return = close.pct_change()
+    if window < 2:
+        raise ValueError("window must be at least 2")
+    stock_return = close.pct_change(fill_method=None)
     market_return = (
         index_close.set_index("date")["index_close"]
         .sort_index()
         .astype(float)
-        .pct_change()
+        .pct_change(fill_method=None)
     )
     market_return = market_return.reindex(stock_return.index)
 
@@ -235,7 +237,7 @@ def build_factor(
     )
     residual_var = stock_var - stock_market_cov.pow(2).div(market_var, axis=0)
     residual_var = residual_var.mask(market_var <= 0, axis=0)
-    residual_var = residual_var.where(residual_var >= 0, 0.0)
+    residual_var = residual_var.mask(residual_var < 0, 0.0)
     factor = np.sqrt(residual_var)
     return long_factor_from_wide(factor, start_date)
 

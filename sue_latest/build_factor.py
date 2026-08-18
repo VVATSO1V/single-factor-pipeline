@@ -4,8 +4,11 @@ The event-level factor is:
 
     sue_latest = (actual_np - expected_np) / std(previous 8 earnings surprises)
 
-Only earnings appraisal events with announcement dates on or before T are used.
-The latest event value is forward-filled to each trading date.
+Only the first official financial-report event for each fiscal quarter is used.
+When RQData omits adjusted actual profit for annual reports, the profit
+difference is reconstructed from profit_ex_rate and consensus profit.
+The latest event value becomes effective on the next trading date and is then
+forward-filled until the next valid quarterly event.
 """
 
 from __future__ import annotations
@@ -158,7 +161,7 @@ def fetch_expectation_events(
             end_date=end_date,
             report_year=None,
             report_periods=None,
-            report_types=["financial_reports", "current_performance"],
+            report_types=["financial_reports"],
             appraisal_results=None,
         )
         if raw is not None:
@@ -177,17 +180,46 @@ def prepare_event_factor(
     expected_column: str,
     history_quarters: int,
 ) -> pd.DataFrame:
+    if history_quarters < 2:
+        raise ValueError("history_quarters must be at least 2")
     frame = events.copy()
     if frame.empty:
         return pd.DataFrame(columns=[*KEYS, "factor_value"])
 
     frame[actual_column] = pd.to_numeric(frame[actual_column], errors="coerce")
     frame[expected_column] = pd.to_numeric(frame[expected_column], errors="coerce")
-    frame = frame.dropna(subset=["date", "stock_code", actual_column, expected_column])
-    if "report_period" in frame.columns:
-        frame["_period_order"] = frame["report_period"].map(PERIOD_ORDER).fillna(0)
+    if "profit_ex_rate" in frame.columns:
+        frame["profit_ex_rate"] = pd.to_numeric(
+            frame["profit_ex_rate"], errors="coerce"
+        )
     else:
-        frame["_period_order"] = 0
+        frame["profit_ex_rate"] = np.nan
+    required = {"report_year", "report_period"}
+    missing = sorted(required.difference(frame.columns))
+    if missing:
+        raise RuntimeError(f"SUE event data is missing columns: {missing}")
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
+    frame["report_year"] = pd.to_numeric(frame["report_year"], errors="coerce")
+    frame["report_period"] = frame["report_period"].astype(str).str.lower()
+    frame["_period_order"] = frame["report_period"].map(PERIOD_ORDER)
+    frame = frame.dropna(
+        subset=[
+            "date",
+            "stock_code",
+            "report_year",
+            "_period_order",
+            expected_column,
+        ]
+    )
+    frame["raw_surprise"] = frame[actual_column] - frame[expected_column]
+    reconstructed = frame["profit_ex_rate"] * frame[expected_column].abs()
+    frame["raw_surprise"] = frame["raw_surprise"].fillna(reconstructed)
+    frame = frame.dropna(subset=["raw_surprise"])
+    frame["quarter_ord"] = (
+        frame["report_year"].astype(int) * 4
+        + frame["_period_order"].astype(int)
+        - 1
+    )
     if "appraisal_standard" in frame.columns:
         frame["_standard_order"] = pd.to_numeric(
             frame["appraisal_standard"], errors="coerce"
@@ -195,21 +227,38 @@ def prepare_event_factor(
     else:
         frame["_standard_order"] = 99
 
-    sort_columns = ["stock_code", "date"]
-    if "report_year" in frame.columns:
-        sort_columns.append("report_year")
-    sort_columns += ["_period_order", "_standard_order"]
-    frame = frame.sort_values(sort_columns)
-    frame = frame.drop_duplicates(["stock_code", "date"], keep="last")
-    frame["raw_surprise"] = frame[actual_column] - frame[expected_column]
-    frame = frame.sort_values(["stock_code", "date"])
-    frame["surprise_std"] = (
-        frame.groupby("stock_code")["raw_surprise"]
-        .transform(lambda s: s.shift(1).rolling(history_quarters, min_periods=4).std())
+    period_keys = ["stock_code", "report_year", "report_period"]
+    frame = frame.sort_values([*period_keys, "date", "_standard_order"])
+    frame = frame.drop_duplicates([*period_keys, "date"], keep="first")
+    frame = frame.sort_values([*period_keys, "date"])
+    frame = frame.drop_duplicates(period_keys, keep="first")
+
+    rows = []
+    for stock_code, stock_events in frame.groupby("stock_code", sort=True):
+        surprise_by_quarter: dict[int, float] = {}
+        for _, event in stock_events.sort_values("date").iterrows():
+            quarter = int(event["quarter_ord"])
+            previous = [
+                surprise_by_quarter.get(prior_quarter)
+                for prior_quarter in range(quarter - history_quarters, quarter)
+            ]
+            if all(value is not None and np.isfinite(value) for value in previous):
+                surprise_std = np.std(previous, ddof=1)
+                if np.isfinite(surprise_std) and surprise_std > 0:
+                    rows.append(
+                        {
+                            "date": event["date"],
+                            "stock_code": stock_code,
+                            "factor_value": event["raw_surprise"] / surprise_std,
+                        }
+                    )
+            surprise_by_quarter[quarter] = float(event["raw_surprise"])
+
+    if not rows:
+        return pd.DataFrame(columns=[*KEYS, "factor_value"])
+    return pd.DataFrame(rows).replace([np.inf, -np.inf], np.nan).dropna(
+        subset=["factor_value"]
     )
-    frame["factor_value"] = frame["raw_surprise"] / frame["surprise_std"]
-    frame["factor_value"] = frame["factor_value"].replace([np.inf, -np.inf], np.nan)
-    return frame[[*KEYS, "factor_value"]].dropna(subset=["factor_value"])
 
 
 def daily_factor_from_events(
@@ -220,25 +269,41 @@ def daily_factor_from_events(
 ) -> pd.DataFrame:
     if event_factor.empty:
         return pd.DataFrame(columns=[*KEYS, "factor_value"])
-    wide = (
-        event_factor.pivot(index="date", columns="stock_code", values="factor_value")
-        .sort_index()
-        .reindex(dates.union(event_factor["date"]))
-        .sort_index()
-        .ffill()
-        .reindex(dates)
-    )
-    wide = wide.reindex(columns=stocks)
-    wide.index.name = "date"
-    wide.columns.name = "stock_code"
-    result = (
-        wide[wide.index >= pd.Timestamp(start_date)]
-        .stack(future_stack=True)
-        .rename("factor_value")
-        .reset_index()
-        .dropna(subset=["factor_value"])
-    )
-    return result[[*KEYS, "factor_value"]].sort_values(KEYS)
+    events = event_factor.sort_values(KEYS).drop_duplicates(KEYS, keep="last")
+    output_dates = dates[dates >= pd.Timestamp(start_date)]
+    event_groups = {
+        stock_code: stock_events
+        for stock_code, stock_events in events.groupby("stock_code", sort=False)
+    }
+    rows = []
+    for stock_code in stocks:
+        stock_events = event_groups.get(stock_code)
+        if stock_events is None:
+            continue
+        event_dates = stock_events["date"].to_numpy(dtype="datetime64[ns]")
+        event_values = stock_events["factor_value"].to_numpy(dtype=float)
+        positions = np.searchsorted(
+            event_dates,
+            output_dates.to_numpy(dtype="datetime64[ns]"),
+            side="left",
+        ) - 1
+        valid = positions >= 0
+        values = np.full(len(output_dates), np.nan)
+        values[valid] = event_values[positions[valid]]
+        finite = np.isfinite(values)
+        if finite.any():
+            rows.append(
+                pd.DataFrame(
+                    {
+                        "date": output_dates[finite],
+                        "stock_code": stock_code,
+                        "factor_value": values[finite],
+                    }
+                )
+            )
+    if not rows:
+        return pd.DataFrame(columns=[*KEYS, "factor_value"])
+    return pd.concat(rows, ignore_index=True)[[*KEYS, "factor_value"]].sort_values(KEYS)
 
 
 def build_factor(
@@ -295,6 +360,11 @@ def main() -> None:
         args.history_quarters,
         args.start_date,
     )
+    if factor.empty:
+        raise RuntimeError(
+            "SUE factor is empty; existing factor.csv was not overwritten. "
+            "Check RQData event coverage and selected columns."
+        )
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
     factor.to_csv(args.output_path, index=False, encoding="utf-8-sig")
     print(f"factor written: {args.output_path.resolve()} shape={factor.shape}")

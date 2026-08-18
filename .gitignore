@@ -14,3 +14,13 @@ real_acceptance_outputs/
 real_acceptance_outputs_smoke/
 
 .agents/
+
+# Local execution repository and brainstorming runtime files
+matic-trading/
+.superpowers/
+
+# Generated rank-model runs and backtest outputs
+rank_model/runs/
+rank_model/locked_test_runs/
+rank_model/strategy_runs/
+rank_model/strategy_10d_runs/

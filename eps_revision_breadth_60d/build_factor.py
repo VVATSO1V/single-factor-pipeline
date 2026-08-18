@@ -2,10 +2,12 @@
 
 The factor is:
 
-    eps_revision_breadth_60d(T) = (up analysts - down analysts) / covered analysts
+    eps_revision_breadth_60d(T)
+        = (up institutes - down institutes) / comparable institutes
 
-An analyst/institute is classified as up or down when its latest visible EPS
-forecast changes versus its previous visible forecast for the same fiscal year.
+For each institute, only its latest comparable revision during the rolling
+window is counted. A revision compares two visible EPS forecasts for the same
+fiscal year, so first-time coverage is not treated as an up or down revision.
 """
 
 from __future__ import annotations
@@ -182,38 +184,67 @@ def fetch_eps_reports(
 
 def classify_revision_events(reports: pd.DataFrame, eps_field: str) -> pd.DataFrame:
     frame = reports.copy()
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
     frame[eps_field] = pd.to_numeric(frame[eps_field], errors="coerce")
-    frame = frame.dropna(subset=[eps_field])
+    frame = frame.dropna(
+        subset=["date", "stock_code", "institute", "fiscal_year", eps_field]
+    )
     frame = frame.sort_values(["stock_code", "institute", "fiscal_year", "date"])
     group_keys = ["stock_code", "institute", "fiscal_year"]
     frame["previous_eps"] = frame.groupby(group_keys, dropna=False)[eps_field].shift(1)
     frame = frame.dropna(subset=["previous_eps"])
-    frame["up"] = (frame[eps_field] > frame["previous_eps"]).astype(float)
-    frame["down"] = (frame[eps_field] < frame["previous_eps"]).astype(float)
-    frame["covered"] = 1.0
-    return frame[[*KEYS, "institute", "up", "down", "covered"]]
+    frame["direction"] = np.sign(frame[eps_field] - frame["previous_eps"])
+    return frame[[*KEYS, "institute", "fiscal_year", "direction"]]
 
 
-def rolling_unique_count(
+def rolling_latest_revision_breadth(
     events: pd.DataFrame,
     dates: pd.DatetimeIndex,
     stocks: list[str],
-    value_column: str,
     window: int,
 ) -> pd.DataFrame:
+    if window <= 0:
+        raise ValueError("window must be positive")
+    dates = pd.DatetimeIndex(pd.to_datetime(dates)).normalize().sort_values().unique()
     result = pd.DataFrame(index=dates, columns=stocks, dtype=float)
+    event_groups = {
+        stock_code: stock_events
+        for stock_code, stock_events in events.groupby("stock_code", sort=False)
+    }
     for done, stock in enumerate(stocks, start=1):
-        stock_events = events.loc[events["stock_code"] == stock, ["date", "institute", value_column]]
-        stock_events = stock_events[stock_events[value_column] > 0]
-        if not stock_events.empty:
-            matrix = (
-                stock_events.assign(value=1.0)
-                .drop_duplicates(["date", "institute"])
-                .pivot(index="date", columns="institute", values="value")
-                .reindex(dates)
-                .fillna(0.0)
+        stock_events = event_groups.get(stock)
+        if stock_events is not None and not stock_events.empty:
+            stock_events = stock_events[
+                ["date", "institute", "fiscal_year", "direction"]
+            ].copy()
+            positions = dates.searchsorted(
+                pd.DatetimeIndex(stock_events["date"]),
+                side="left",
             )
-            result[stock] = matrix.rolling(window=window, min_periods=1).max().sum(axis=1)
+            stock_events = stock_events.loc[positions < len(dates)].copy()
+            positions = positions[positions < len(dates)]
+            if stock_events.empty:
+                continue
+            stock_events["effective_date"] = dates[positions]
+            stock_events = (
+                stock_events.sort_values(
+                    ["effective_date", "date", "fiscal_year", "institute"]
+                )
+                .drop_duplicates(["effective_date", "institute"], keep="last")
+            )
+            matrix = (
+                stock_events.pivot(
+                    index="effective_date",
+                    columns="institute",
+                    values="direction",
+                )
+                .reindex(dates)
+            )
+            latest = matrix if window == 1 else matrix.ffill(limit=window - 1)
+            covered = latest.notna().sum(axis=1)
+            up = latest.gt(0).sum(axis=1)
+            down = latest.lt(0).sum(axis=1)
+            result[stock] = (up - down).div(covered.where(covered > 0))
         if done % 100 == 0 or done == len(stocks):
             print(f"build rolling breadth progress: {done}/{len(stocks)} stocks", flush=True)
     return result
@@ -244,10 +275,7 @@ def build_factor(
     events = classify_revision_events(reports, eps_field)
     if events.empty:
         return pd.DataFrame(columns=[*KEYS, "factor_value"])
-    up = rolling_unique_count(events, dates, stocks, "up", window)
-    down = rolling_unique_count(events, dates, stocks, "down", window)
-    covered = rolling_unique_count(events, dates, stocks, "covered", window)
-    factor = (up - down).div(covered.where(covered > 0))
+    factor = rolling_latest_revision_breadth(events, dates, stocks, window)
     factor = factor.replace([np.inf, -np.inf], np.nan)
     return long_factor_from_wide(factor, start_date)
 

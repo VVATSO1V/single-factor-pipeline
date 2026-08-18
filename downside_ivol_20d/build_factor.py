@@ -219,27 +219,89 @@ def build_factor(
     window: int,
     start_date: str,
 ) -> pd.DataFrame:
-    stock_return = close.pct_change()
+    if window < 2:
+        raise ValueError("window must be at least 2")
+    stock_return = close.pct_change(fill_method=None)
     market_return = (
         index_close.set_index("date")["index_close"]
         .sort_index()
         .astype(float)
-        .pct_change()
+        .pct_change(fill_method=None)
     )
     market_return = market_return.reindex(stock_return.index)
 
-    market_var = market_return.rolling(window=window, min_periods=window).var()
-    stock_mean = stock_return.rolling(window=window, min_periods=window).mean()
-    market_mean = market_return.rolling(window=window, min_periods=window).mean()
-    stock_market_cov = stock_return.rolling(window=window, min_periods=window).cov(
-        market_return
+    factor = pd.DataFrame(
+        np.nan,
+        index=stock_return.index,
+        columns=stock_return.columns,
+        dtype=float,
     )
-    beta = stock_market_cov.div(market_var, axis=0)
-    beta = beta.mask(market_var <= 0, axis=0)
-    alpha = stock_mean - beta.mul(market_mean, axis=0)
-    residual = stock_return - alpha - beta.mul(market_return, axis=0)
-    downside_residual = residual.where(residual < 0, 0.0)
-    factor = downside_residual.rolling(window=window, min_periods=window).std()
+    if len(stock_return) < window:
+        return long_factor_from_wide(factor, start_date)
+
+    market_values = market_return.to_numpy(dtype=float)
+    market_windows = np.lib.stride_tricks.sliding_window_view(
+        market_values,
+        window_shape=window,
+    )
+    market_finite = np.isfinite(market_windows)
+    market_valid = market_finite.all(axis=1)
+    market_mean = np.sum(
+        np.where(market_finite, market_windows, 0.0),
+        axis=1,
+    ) / window
+    market_centered = np.where(
+        market_finite,
+        market_windows - market_mean[:, None],
+        0.0,
+    )
+    market_ss = np.sum(market_centered**2, axis=1)
+
+    batch_size = 100
+    total = len(stock_return.columns)
+    for offset in range(0, total, batch_size):
+        columns = stock_return.columns[offset : offset + batch_size]
+        stock_values = stock_return.loc[:, columns].to_numpy(dtype=float)
+        stock_windows = np.lib.stride_tricks.sliding_window_view(
+            stock_values,
+            window_shape=window,
+            axis=0,
+        )
+        stock_finite = np.isfinite(stock_windows)
+        valid = (
+            stock_finite.all(axis=2)
+            & market_valid[:, None]
+            & (market_ss[:, None] > 0)
+        )
+        stock_mean = np.sum(
+            np.where(stock_finite, stock_windows, 0.0),
+            axis=2,
+        ) / window
+        stock_centered = np.where(
+            stock_finite,
+            stock_windows - stock_mean[:, :, None],
+            0.0,
+        )
+        covariance_sum = np.sum(
+            stock_centered * market_centered[:, None, :],
+            axis=2,
+        )
+        beta = np.full(covariance_sum.shape, np.nan, dtype=float)
+        np.divide(
+            covariance_sum,
+            market_ss[:, None],
+            out=beta,
+            where=valid,
+        )
+        residual = stock_centered - beta[:, :, None] * market_centered[:, None, :]
+        downside_residual = np.minimum(residual, 0.0)
+        downside_std = np.std(downside_residual, axis=2, ddof=1)
+        downside_std[~valid] = np.nan
+        factor.loc[stock_return.index[window - 1 :], columns] = downside_std
+
+        done = min(offset + len(columns), total)
+        print(f"calculate factor progress: {done}/{total} stocks", flush=True)
+
     return long_factor_from_wide(factor, start_date)
 
 

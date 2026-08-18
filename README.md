@@ -183,6 +183,11 @@ ICIR       = IC均值 / IC标准差
 | `ic_series.csv` | 每日 1/5/10 日 IC |
 | `summary.csv` | IC 均值、ICIR、IC 为正比例等汇总 |
 
+IC 默认使用全部交易日。慢频因子可以通过 `--ic-frequency weekly` 或
+`--ic-frequency monthly` 分别选择每周、每月最后一个有效交易日计算 IC。
+该参数只影响 IC 序列、IC 汇总和年度 IC 统计；分组收益、日度净值和换手率
+仍按日计算。ICIR 年化倍数会分别使用 `sqrt(252)`、`sqrt(52)` 或 `sqrt(12)`。
+
 ### 2. 十分组收益与单调性
 
 每天按因子值从低到高分成 G1 到 G10，计算各组未来平均收益。
@@ -318,6 +323,7 @@ reverse_20d/data/factor.csv
   --min-listing-days 120 `
   --mad-width 3 `
   --direction positive `
+  --ic-frequency daily `
   --report
 ```
 

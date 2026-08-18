@@ -1,0 +1,191 @@
+{
+  "comparison": {
+    "column_schema": [
+      [
+        "model_name",
+        "string"
+      ],
+      [
+        "elapsed_trading_observations",
+        "integer"
+      ],
+      [
+        "cumulative_return",
+        "number"
+      ],
+      [
+        "cagr",
+        "number"
+      ],
+      [
+        "annualized_return",
+        "number"
+      ],
+      [
+        "annualized_volatility",
+        "number"
+      ],
+      [
+        "sharpe_ratio",
+        "number"
+      ],
+      [
+        "max_drawdown",
+        "number"
+      ],
+      [
+        "win_rate",
+        "number"
+      ],
+      [
+        "average_cash_ratio",
+        "number"
+      ],
+      [
+        "gross_turnover",
+        "number"
+      ],
+      [
+        "one_way_turnover",
+        "number"
+      ],
+      [
+        "average_gross_turnover",
+        "number"
+      ],
+      [
+        "average_one_way_turnover",
+        "number"
+      ],
+      [
+        "average_turnover",
+        "number"
+      ],
+      [
+        "annualized_gross_turnover",
+        "number"
+      ],
+      [
+        "annualized_one_way_turnover",
+        "number"
+      ],
+      [
+        "annualized_turnover",
+        "number"
+      ],
+      [
+        "total_cost",
+        "number"
+      ],
+      [
+        "buy_attempt_count",
+        "integer"
+      ],
+      [
+        "sell_attempt_count",
+        "integer"
+      ],
+      [
+        "buy_count",
+        "integer"
+      ],
+      [
+        "sell_count",
+        "integer"
+      ],
+      [
+        "buy_fill_rate",
+        "number"
+      ],
+      [
+        "sell_fill_rate",
+        "number"
+      ],
+      [
+        "blocked_sale_days",
+        "integer"
+      ],
+      [
+        "ending_nav",
+        "number"
+      ]
+    ],
+    "columns": [
+      "model_name",
+      "elapsed_trading_observations",
+      "cumulative_return",
+      "cagr",
+      "annualized_return",
+      "annualized_volatility",
+      "sharpe_ratio",
+      "max_drawdown",
+      "win_rate",
+      "average_cash_ratio",
+      "gross_turnover",
+      "one_way_turnover",
+      "average_gross_turnover",
+      "average_one_way_turnover",
+      "average_turnover",
+      "annualized_gross_turnover",
+      "annualized_one_way_turnover",
+      "annualized_turnover",
+      "total_cost",
+      "buy_attempt_count",
+      "sell_attempt_count",
+      "buy_count",
+      "sell_count",
+      "buy_fill_rate",
+      "sell_fill_rate",
+      "blocked_sale_days",
+      "ending_nav"
+    ],
+    "logical_sha256": "c8ccce3040aca602d93be43a1d9f4482ac35e8a5e9494d4253896e2e42234fb1",
+    "path": "strategy_comparison.csv",
+    "physical_sha256": "be4728e184d69a98b5b39346f70cad9ac30b2dac122ff1a9db9ac01a113cfe1c",
+    "row_count": 5
+  },
+  "purpose": "frozen_rank_model_static_strategy_comparison_2024_2025",
+  "schema_version": 1,
+  "sealed_strategy_contract": {
+    "common_input_sha256": {
+      "frozen_models": "dab7b46711906853a7785825c899de1fdffd37b244cf1a97f5af55b80092dd38",
+      "locked_test_comparison": "901fcc8eaeef3f968aac587333c82957bd067bc24d370f00eb599f677ddb4e76",
+      "locked_test_conclusion": "cc60be232ac75234966267a31c8b2988cf9364d5c7100c4127d4a8649408eb30",
+      "locked_test_schema": "c0dcfed0b4b6f2a104f57847d9881ee1dfe1d26009e66ebacaae27a5df2fe305",
+      "market_panel": "5b390a005d9547ae8b57b319fd3270594a5fa1b5df1f64216af017d70a64f710",
+      "trading_calendar": "c7250c5c2c35eef013e4c93ebe9dab0ec43ae5335b6bf97fce68b48003072a94"
+    },
+    "formulas_sha256": "a50ea150fde8791a29cc8c45d504c7129ef5429efc4529779fa7855753171f15",
+    "observation_conventions_sha256": "b6d2c4609ac29cd85698b2645590e9e30625a5b48c7307b4beff4edd0a5aa011",
+    "settings_sha256": "04494f5e7fb3c00b0a0d907f10d7cf5f0a9f0f4fbf1a86550133664e10a8b50b",
+    "sha256": "3cff55a4c45544c86298e10d080076f3c961a7e3a5786f79e4b5ea121a328cf6"
+  },
+  "source_strategy_manifests": [
+    {
+      "model_name": "ridge_rank_regression",
+      "path": "strategy_runs/ridge_rank_regression/manifest.json",
+      "sha256": "b44fd4a842c9a67eb61db25c6584e68d5af15c6d3c9f77f65c6ed5f913ced98f"
+    },
+    {
+      "model_name": "xgboost_rank_regression",
+      "path": "strategy_runs/xgboost_rank_regression/manifest.json",
+      "sha256": "1d25ea9c3e625f8b6ec34a11d4e083fd6241308f5b1fdaf78b9d30e04f551869"
+    },
+    {
+      "model_name": "lightgbm_rank_regression",
+      "path": "strategy_runs/lightgbm_rank_regression/manifest.json",
+      "sha256": "2a3d8c3c0328cbe06cfc707afb35568f63ab3e4b5a016125e9e4738f71f0b865"
+    },
+    {
+      "model_name": "lightgbm_lambdarank",
+      "path": "strategy_runs/lightgbm_lambdarank/manifest.json",
+      "sha256": "cf0268f274a336d266704e7f70ba180cfb07dc71a1201260eade1eceea5cde9c"
+    },
+    {
+      "model_name": "mlp_top100_hybrid_rank",
+      "path": "strategy_runs/mlp_top100_hybrid_rank/manifest.json",
+      "sha256": "771eb39e7b73384518f00215b98373782984ff75da61ece37a3d87d01f269bfc"
+    }
+  ],
+  "status": "completed"
+}

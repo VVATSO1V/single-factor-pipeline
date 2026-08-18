@@ -23,6 +23,11 @@ import pandas as pd
 
 
 KEYS = ["date", "stock_code"]
+IC_PERIODS_PER_YEAR = {
+    "daily": 252,
+    "weekly": 52,
+    "monthly": 12,
+}
 
 
 @dataclass(frozen=True)
@@ -36,6 +41,7 @@ class PipelineConfig:
     min_listing_days: int = 120
     mad_width: float = 3.0
     direction: str = "positive"
+    ic_frequency: str = "daily"
 
     def __post_init__(self) -> None:
         path_fields = [
@@ -52,6 +58,8 @@ class PipelineConfig:
             raise ValueError("factor_name cannot be empty")
         if self.direction not in {"positive", "negative"}:
             raise ValueError("direction must be 'positive' or 'negative'")
+        if self.ic_frequency not in IC_PERIODS_PER_YEAR:
+            raise ValueError("ic_frequency must be 'daily', 'weekly', or 'monthly'")
         if self.quantiles < 2:
             raise ValueError("quantiles must be at least 2")
         if self.min_listing_days < 0:
@@ -397,10 +405,26 @@ def _cross_section_correlation(
     return pearson, rank_ic, len(clean)
 
 
+def select_ic_sample(sample: pd.DataFrame, frequency: str) -> pd.DataFrame:
+    if frequency not in IC_PERIODS_PER_YEAR:
+        raise ValueError("frequency must be 'daily', 'weekly', or 'monthly'")
+    if frequency == "daily" or sample.empty:
+        return sample.copy()
+
+    dates = pd.Series(
+        pd.DatetimeIndex(sample["date"].dropna().unique()).sort_values(),
+        name="date",
+    )
+    period_code = "W-FRI" if frequency == "weekly" else "M"
+    selected_dates = dates.groupby(dates.dt.to_period(period_code)).max()
+    return sample[sample["date"].isin(selected_dates)].copy()
+
+
 def compute_ic(
     sample: pd.DataFrame,
     variants: dict[str, str],
     windows: tuple[int, ...],
+    periods_per_year: int = 252,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     rows = []
     summaries = []
@@ -445,7 +469,7 @@ def compute_ic(
                         else np.nan
                     ),
                     "rank_icir_annualized": (
-                        rank_values.mean() / rank_std * np.sqrt(252)
+                        rank_values.mean() / rank_std * np.sqrt(periods_per_year)
                         if pd.notna(rank_std) and rank_std > 0
                         else np.nan
                     ),
@@ -762,7 +786,15 @@ def run_pipeline(config: PipelineConfig) -> dict[str, pd.DataFrame]:
     if sample["factor_neutralized"].notna().any():
         variants["neutralized"] = "factor_neutralized"
 
-    ic_series, summary = compute_ic(sample, variants, config.return_windows)
+    ic_sample = select_ic_sample(sample, config.ic_frequency)
+    data_quality["ic_frequency"] = config.ic_frequency
+    data_quality["ic_dates"] = ic_sample["date"].nunique()
+    ic_series, summary = compute_ic(
+        ic_sample,
+        variants,
+        config.return_windows,
+        IC_PERIODS_PER_YEAR[config.ic_frequency],
+    )
     quantile_daily, quantile_summary, membership = compute_quantile_returns(
         sample,
         variants,
@@ -813,6 +845,12 @@ def parse_args() -> argparse.Namespace:
         default="positive",
     )
     parser.add_argument(
+        "--ic-frequency",
+        choices=sorted(IC_PERIODS_PER_YEAR),
+        default="daily",
+        help="Dates used for IC only; group returns, NAV, and turnover remain daily.",
+    )
+    parser.add_argument(
         "--report",
         action="store_true",
         help="Generate report.html and figures after writing CSV outputs.",
@@ -837,6 +875,7 @@ def main() -> None:
         min_listing_days=args.min_listing_days,
         mad_width=args.mad_width,
         direction=args.direction,
+        ic_frequency=args.ic_frequency,
     )
     run_pipeline(config)
     print(f"Pipeline completed: {config.output_dir}")
