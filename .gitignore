@@ -24,3 +24,6 @@ rank_model/runs/
 rank_model/locked_test_runs/
 rank_model/strategy_runs/
 rank_model/strategy_10d_runs/
+
+# PDF reports are kept local and are not committed
+output/pdf/
