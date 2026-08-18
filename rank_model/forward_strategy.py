@@ -84,6 +84,18 @@ def _forward_paths(config: Mapping[str, Any], config_path: Path) -> dict[str, Pa
     return resolved
 
 
+def _automatic_run_id(output_root: Path) -> str:
+    """Return a readable local-time run id that does not overwrite a run."""
+    timestamp = pd.Timestamp.now(tz="Asia/Shanghai").strftime("%Y%m%d_%H%M%S")
+    stem = f"forward_{timestamp}"
+    candidate = stem
+    suffix = 1
+    while (Path(output_root) / candidate).exists():
+        candidate = f"{stem}_{suffix:02d}"
+        suffix += 1
+    return candidate
+
+
 def _date_from_csv(path: Path) -> pd.Timestamp:
     if not path.is_file():
         raise FileNotFoundError(path)
@@ -263,11 +275,13 @@ def _source_hashes(
 def run_forward(
     config_path: Path,
     *,
-    run_id: str,
+    run_id: str | None,
     update_data: bool,
 ) -> Path:
     config, model_config, model_config_path = _load_configs(config_path)
     paths = _forward_paths(config, config_path)
+    if run_id is None:
+        run_id = _automatic_run_id(paths["forward_runs_dir"])
     factor_paths, market_panel_path, trading_calendar_path = _model_paths(
         model_config, model_config_path
     )
@@ -384,7 +398,11 @@ def make_parser() -> argparse.ArgumentParser:
         description="Update inputs, score frozen rank models, and run forward strategy."
     )
     parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--run-id", required=True)
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help="Optional output run id; defaults to forward_YYYYMMDD_HHMMSS.",
+    )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--update-data", action="store_true")
     mode.add_argument("--local-only", action="store_true")

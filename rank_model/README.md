@@ -293,9 +293,13 @@ root:
 ```powershell
 & .\.venv\Scripts\python.exe -m rank_model.forward_strategy `
   --config .\rank_model\forward_strategy.toml `
-  --run-id forward-2026 `
   --update-data
 ```
+
+When `--run-id` is omitted, the runner creates a readable local-time directory
+such as `forward_20260818_153045`. If that name already exists, it appends a
+sequence suffix instead of overwriting the previous run. A manual `--run-id`
+can still be supplied when a fixed name is needed.
 
 `--update-data` obtains the latest completed official trading date, rebuilds
 the complete 2019-to-latest factor and market inputs, and then performs frozen
@@ -307,7 +311,6 @@ offline data mode instead:
 ```powershell
 & .\.venv\Scripts\python.exe -m rank_model.forward_strategy `
   --config .\rank_model\forward_strategy.toml `
-  --run-id forward-local `
   --local-only
 ```
 
