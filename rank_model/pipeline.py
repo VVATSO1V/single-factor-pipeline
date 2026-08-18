@@ -54,6 +54,16 @@ from rank_model.stages.locked_test import (
     predict_locked_test_model,
     prepare_locked_test_dataset,
 )
+from rank_model.stages.strategy import (
+    backtest_locked_strategy,
+    compare_strategy_runs,
+    load_strategy_settings,
+)
+from rank_model.stages.staggered_strategy import (
+    STAGGERED_CONFIG_CONTRACT,
+    backtest_staggered_strategy,
+    compare_staggered_strategy_runs,
+)
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -136,6 +146,8 @@ def load_config(config_path: Path) -> dict[str, Any]:
             f"mad_width={LOCKED_MAD_WIDTH}, windows={list(LOCKED_WINDOWS)}, "
             f"cap_coverage_threshold={LOCKED_CAP_COVERAGE_THRESHOLD}"
         )
+    load_strategy_settings(config)
+    _validate_staggered_strategy_paths(config, path)
     return config
 
 
@@ -161,9 +173,9 @@ def _is_within(path: Path, directory: Path) -> bool:
 
 
 def _is_model_data_path(path: Path) -> bool:
-    """Accept a source only when it is directly beneath a model/data directory."""
-    parent = path.resolve().parent
-    return parent.name == "data" and parent.parent.name == "model"
+    """Accept a source only when it is directly beneath this worktree's model/data."""
+    expected = (PACKAGE_DIR.parent / "model" / "data").resolve()
+    return path.resolve().parent == expected
 
 
 def _is_inside_model_data(path: Path) -> bool:
@@ -264,6 +276,111 @@ def _validate_locked_test_paths(
     return resolved
 
 
+def _validate_strategy_paths(
+    config: dict[str, Any], config_path: Path
+) -> dict[str, Path]:
+    source_names = ("market_panel", "trading_calendar")
+    sealed_names = (
+        "locked_test_schema",
+        "locked_test_runs_dir",
+        "frozen_spec",
+        "locked_test_conclusion",
+        "locked_test_comparison",
+    )
+    output_names = ("strategy_runs_dir", "strategy_comparison")
+    required = (*source_names, *sealed_names, *output_names)
+    try:
+        resolved = {
+            name: resolve_config_path(config_path, config["paths"][name])
+            for name in required
+        }
+    except (KeyError, TypeError) as error:
+        raise ValueError("strategy paths are incomplete") from error
+    for name in source_names:
+        if not _is_model_data_path(resolved[name]):
+            raise ValueError(f"paths.{name} must resolve directly under model/data")
+    for name in (*sealed_names, *output_names):
+        if not _is_within(resolved[name], PACKAGE_DIR) or _is_inside_model_data(
+            resolved[name]
+        ):
+            raise ValueError(
+                f"paths.{name} must resolve under rank_model outside model/data"
+            )
+    expected_runs_directory = (PACKAGE_DIR / "strategy_runs").resolve()
+    if resolved["strategy_runs_dir"] != expected_runs_directory:
+        raise ValueError(
+            "paths.strategy_runs_dir must resolve to rank_model/strategy_runs"
+        )
+    expected_comparison = (PACKAGE_DIR / "strategy_comparison.csv").resolve()
+    if resolved["strategy_comparison"] != expected_comparison:
+        raise ValueError(
+            "paths.strategy_comparison must resolve to "
+            "rank_model/strategy_comparison.csv"
+        )
+    return resolved
+
+
+def _validate_staggered_strategy_paths(
+    config: dict[str, Any], config_path: Path
+) -> dict[str, Path]:
+    """Resolve the fixed 10-day strategy outputs without aliasing daily artifacts."""
+    resolved = _validate_strategy_paths(config, config_path)
+    output_names = (
+        "strategy_10d_runs_dir",
+        "strategy_10d_comparison",
+        "daily_vs_10d_comparison",
+    )
+    try:
+        staggered = config["strategy_10d"]
+        staggered_outputs = {
+            name: resolve_config_path(config_path, config["paths"][name])
+            for name in output_names
+        }
+    except (KeyError, TypeError) as error:
+        raise ValueError("staggered strategy paths or settings are incomplete") from error
+    if (
+        not isinstance(staggered, dict)
+        or set(staggered) != set(STAGGERED_CONFIG_CONTRACT)
+        or any(
+            type(staggered[name]) is not type(expected)
+            or staggered[name] != expected
+            for name, expected in STAGGERED_CONFIG_CONTRACT.items()
+        )
+    ):
+        raise ValueError(
+            "strategy_10d must keep horizon=10, offset_count=10, "
+            "last_complete_signal=2025-12-16, retry_blocked_sells_daily=true, "
+            "and retry_failed_buys_daily=false"
+        )
+    expected = {
+        "strategy_10d_runs_dir": (PACKAGE_DIR / "strategy_10d_runs").resolve(),
+        "strategy_10d_comparison": (
+            PACKAGE_DIR / "strategy_10d_comparison.csv"
+        ).resolve(),
+        "daily_vs_10d_comparison": (
+            PACKAGE_DIR / "daily_vs_10d_comparison.csv"
+        ).resolve(),
+    }
+    daily_artifacts = {
+        resolved["strategy_runs_dir"],
+        resolved["strategy_comparison"],
+        resolved["strategy_comparison"].with_suffix(".manifest.json"),
+    }
+    for name, output in staggered_outputs.items():
+        if not _is_within(output, PACKAGE_DIR) or _is_inside_model_data(output):
+            raise ValueError(
+                f"paths.{name} must resolve under rank_model outside model/data"
+            )
+        if output != expected[name]:
+            raise ValueError(f"paths.{name} must resolve to {expected[name]}")
+        if output in daily_artifacts:
+            raise ValueError(f"paths.{name} must not alias a daily strategy artifact")
+    if len(set(staggered_outputs.values())) != len(staggered_outputs):
+        raise ValueError("staggered strategy outputs must be distinct")
+    resolved.update(staggered_outputs)
+    return resolved
+
+
 def command_prepare_test(config: dict[str, Any], config_path: Path) -> dict[str, Any]:
     """Publish the sealed local 2024-2025 rank-model dataset."""
     paths = _validate_configured_paths(config, config_path)
@@ -346,6 +463,79 @@ def command_compare_test(
         output_runs_directory=paths["locked_test_runs_dir"],
         output_path=paths["locked_test_comparison"],
         model_names=LOCKED_MODEL_NAMES,
+    )
+
+
+def _strategy_source_paths(paths: dict[str, Path], model_name: str) -> dict[str, Path]:
+    locked_run_directory = paths["locked_test_runs_dir"] / model_name
+    return {
+        "prediction": locked_run_directory / "predictions_10d.parquet",
+        "prediction_manifest": locked_run_directory / "manifest.json",
+        "locked_test_schema": paths["locked_test_schema"],
+        "market_panel": paths["market_panel"],
+        "trading_calendar": paths["trading_calendar"],
+        "frozen_models": paths["frozen_spec"],
+        "locked_test_conclusion": paths["locked_test_conclusion"],
+        "locked_test_comparison": paths["locked_test_comparison"],
+    }
+
+
+def command_backtest_strategy(
+    config: dict[str, Any], config_path: Path, model_name: str
+) -> Path:
+    """Run and publish one immutable frozen-model strategy report."""
+    paths = _validate_strategy_paths(config, config_path)
+    return backtest_locked_strategy(
+        model_name,
+        destination=paths["strategy_runs_dir"] / model_name,
+        settings=load_strategy_settings(config),
+        source_paths=_strategy_source_paths(paths, model_name),
+    )
+
+
+def command_compare_strategy(
+    config: dict[str, Any], config_path: Path
+) -> pd.DataFrame:
+    """Publish one descriptive comparison for all frozen-model strategies."""
+    paths = _validate_strategy_paths(config, config_path)
+    return compare_strategy_runs(
+        paths["strategy_runs_dir"],
+        paths["strategy_comparison"],
+        LOCKED_MODEL_NAMES,
+    )
+
+
+def command_backtest_strategy_10d(
+    config: dict[str, Any], config_path: Path, model_name: str
+) -> Path:
+    """Run and publish one immutable staggered ten-day strategy report."""
+    paths = _validate_staggered_strategy_paths(config, config_path)
+    return backtest_staggered_strategy(
+        model_name,
+        destination=paths["strategy_10d_runs_dir"] / model_name,
+        publication_root=paths["strategy_10d_runs_dir"],
+        settings=load_strategy_settings(config),
+        source_paths=_strategy_source_paths(paths, model_name),
+    )
+
+
+def command_compare_strategy_10d(
+    config: dict[str, Any], config_path: Path
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Publish the frozen five-model 10-day and daily-policy comparisons."""
+    paths = _validate_staggered_strategy_paths(config, config_path)
+    source_paths_by_model = {
+        model_name: _strategy_source_paths(paths, model_name)
+        for model_name in LOCKED_MODEL_NAMES
+    }
+    return compare_staggered_strategy_runs(
+        paths["strategy_10d_runs_dir"],
+        paths["strategy_10d_comparison"],
+        paths["strategy_comparison"],
+        paths["daily_vs_10d_comparison"],
+        source_paths_by_model,
+        LOCKED_MODEL_NAMES,
+        settings=load_strategy_settings(config),
     )
 
 
@@ -682,13 +872,37 @@ def make_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "compare-test", help="Compare all completed locked-test model reports."
     )
+    strategy_parser = subparsers.add_parser(
+        "backtest-strategy", help="Run one frozen model's static strategy."
+    )
+    strategy_parser.add_argument(
+        "--model", required=True, choices=LOCKED_MODEL_NAMES
+    )
+    subparsers.add_parser(
+        "compare-strategy", help="Compare all five completed strategy runs."
+    )
+    strategy_10d_parser = subparsers.add_parser(
+        "backtest-strategy-10d",
+        help="Run one frozen model's staggered ten-day strategy.",
+    )
+    strategy_10d_parser.add_argument(
+        "--model", required=True, choices=LOCKED_MODEL_NAMES
+    )
+    subparsers.add_parser(
+        "compare-strategy-10d",
+        help="Compare all five staggered ten-day strategy runs.",
+    )
     return parser
 
 
 def main() -> None:
-    args = make_parser().parse_args()
+    parser = make_parser()
+    args = parser.parse_args()
     config_path = Path(args.config).resolve()
-    config = load_config(config_path)
+    try:
+        config = load_config(config_path)
+    except (FileNotFoundError, ValueError) as error:
+        parser.error(str(error))
     if args.command == "doctor":
         try:
             checks = command_doctor(config, config_path)
@@ -778,6 +992,47 @@ def main() -> None:
             parser = make_parser()
             parser.error(str(error))
         print(f"locked-test comparison written: rows={len(comparison)}")
+        return
+    if args.command == "backtest-strategy":
+        try:
+            directory = command_backtest_strategy(
+                config, config_path, args.model
+            )
+        except (FileNotFoundError, ValueError, FileExistsError) as error:
+            parser = make_parser()
+            parser.error(str(error))
+        print(f"strategy run written: {directory}")
+        return
+    if args.command == "compare-strategy":
+        try:
+            comparison = command_compare_strategy(config, config_path)
+        except (FileNotFoundError, ValueError, FileExistsError) as error:
+            parser = make_parser()
+            parser.error(str(error))
+        print(f"strategy comparison written: rows={len(comparison)}")
+        return
+    if args.command == "backtest-strategy-10d":
+        try:
+            directory = command_backtest_strategy_10d(
+                config, config_path, args.model
+            )
+        except (FileNotFoundError, ValueError, FileExistsError) as error:
+            parser = make_parser()
+            parser.error(str(error))
+        print(f"staggered 10-day strategy run written: {directory}")
+        return
+    if args.command == "compare-strategy-10d":
+        try:
+            comparison, daily_vs = command_compare_strategy_10d(
+                config, config_path
+            )
+        except (FileNotFoundError, ValueError, FileExistsError) as error:
+            parser = make_parser()
+            parser.error(str(error))
+        print(
+            "staggered 10-day comparisons written: "
+            f"models={len(comparison)} daily_vs_rows={len(daily_vs)}"
+        )
         return
     if args.command != "prepare":
         raise NotImplementedError(f"{args.command} is not wired in this task")

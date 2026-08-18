@@ -15,52 +15,6 @@ rank_label_coverage = "data/rank_label_coverage.csv"
 runs_dir = "runs"
 frozen_spec = "frozen_models.json"
 final_runs_dir = "final_runs"
-full_model_dataset = "../model/data/model_dataset.parquet"
-full_model_schema = "../model/data/model_dataset_schema.json"
-full_sample_index = "../model/data/model_sample_index.parquet"
-full_split_summary = "../model/data/model_split_summary.json"
-market_panel = "../model/data/market_panel.csv"
-trading_calendar = "../model/data/trading_calendar.csv"
-locked_test_dataset = "data/locked_test_rank_dataset_10d.parquet"
-locked_test_schema = "data/locked_test_rank_dataset_10d_schema.json"
-locked_test_label_coverage = "data/locked_test_rank_label_coverage.csv"
-locked_test_runs_dir = "locked_test_runs"
-locked_test_comparison = "locked_test_runs/locked_test_comparison.csv"
-locked_test_conclusion = "locked_test_conclusion.json"
-strategy_runs_dir = "strategy_runs"
-strategy_comparison = "strategy_comparison.csv"
-strategy_10d_runs_dir = "strategy_10d_runs"
-strategy_10d_comparison = "strategy_10d_comparison.csv"
-daily_vs_10d_comparison = "daily_vs_10d_comparison.csv"
-
-[locked_test]
-start = "2024-01-01"
-end = "2025-12-31"
-mad_width = 3.0
-date_chunk_size = 60
-expected_cross_section_size = 1000
-windows = [1, 5, 20]
-cap_coverage_threshold = 0.95
-
-[strategy]
-start = "2024-01-01"
-end = "2025-12-31"
-top_k = 100
-expected_cross_section_size = 1000
-min_listing_days = 120
-initial_nav = 1.0
-commission_bps = 1.0
-slippage_bps = 5.0
-sell_stamp_duty_bps = 5.0
-limit_tolerance = 1e-8
-annualization_days = 252
-
-[strategy_10d]
-horizon = 10
-offset_count = 10
-last_complete_signal = "2025-12-16"
-retry_blocked_sells_daily = true
-retry_failed_buys_daily = false
 
 [[finalization.candidates]]
 run_id = "real-2023-ridge"

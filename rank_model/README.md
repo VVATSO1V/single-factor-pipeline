@@ -123,9 +123,29 @@ excluding labels that need 2024 prices. No validation split, early stopping,
 test prediction, or strategy rule is used. The selected hybrid MLP runs a fixed
 12 epochs. Final artifacts are immutable under
 `rank_model/final_runs/<model-name>` and intentionally contain no prediction
-file; 2024-2025 prediction is a later, separate locked-test step. `refit`
-verifies the sealed rank file before opening it and does not read upstream
-source data.
+file; 2024-2025 prediction is a later, separate locked-test step. These five
+frozen model directories are tracked deliverables and must be included when
+sharing the repository; a RiceQuant account can refresh data, but cannot
+recreate the frozen model artifacts without rerunning the research and final
+refit process. `refit` verifies the sealed rank file before opening it and does
+not read upstream source data.
+
+## Frozen Model Delivery
+
+The repository delivers exactly these five inference artifacts:
+
+```text
+rank_model/final_runs/ridge_rank_regression/
+rank_model/final_runs/xgboost_rank_regression/
+rank_model/final_runs/lightgbm_rank_regression/
+rank_model/final_runs/lightgbm_lambdarank/
+rank_model/final_runs/mlp_top100_hybrid_rank/
+```
+
+Each directory contains the frozen model, its fitted preprocessor, feature
+schema, configuration snapshot, and manifest. The forward runner loads these
+files without retraining. Historical CSV and Parquet data remain local runtime
+inputs and do not need to be committed when `--update-data` is used.
 
 ## 2024-2025 Locked Test
 
@@ -177,6 +197,242 @@ sealed; a normal rerun fails instead of overwriting it. Dataset creation,
 per-model inference, evaluation, and comparison all exclude concurrent writers.
 `entry_tradeable` and all T+1 status filters remain excluded here and enter only
 the later strategy backtest.
+
+## 2024-2025 Static Strategy
+
+After all five sealed locked-test prediction runs exist, run the same static
+Top100 strategy for every frozen model and publish the descriptive comparison:
+
+```powershell
+$models = @(
+  "ridge_rank_regression",
+  "xgboost_rank_regression",
+  "lightgbm_rank_regression",
+  "lightgbm_lambdarank",
+  "mlp_top100_hybrid_rank"
+)
+foreach ($model in $models) {
+  & $python -m rank_model.pipeline --config rank_model\config.toml `
+    backtest-strategy --model $model
+}
+& $python -m rank_model.pipeline --config rank_model\config.toml compare-strategy
+```
+
+Both commands preserve immutable outputs. `backtest-strategy` fails when its
+model directory already exists. `compare-strategy` validates an existing CSV
+and sidecar against all five current run manifests and returns without rewriting
+either file when the pair is valid. A legacy CSV without a sidecar gains one
+only after its exact schema and values are proven equal to freshly derived run
+summaries. Tampered output, changed provenance, or any other incomplete pair
+fails without overwrite. Delete neither output as part of a normal rerun.
+
+The strategy period is the 485 official dates from 2024-01-02 through
+2025-12-31. A Top100 signal observed after the close on date T executes only at
+the next official open T+1, producing 484 execution observations plus one
+initial NAV row. The 2025-12-31 signal is not executed because its next open is
+outside the sealed period; dates from 2026 onward remain reserved for forward
+simulation. Orders use only finite `score_raw`, with `stock_code` ascending as
+the deterministic tie breaker. Targets, locked-test metrics, and comparison
+results never enter selection, sizing, or execution.
+
+Rebalancing uses strict set differences. Existing Top100 holdings are untouched,
+holdings outside Top100 become sell attempts, and new Top100 names become buy
+attempts. A blocked sell remains held and is retried while outside Top100. A
+blocked buy is not replaced by rank 101 or any other name. Every eligible buy
+requests `pre_trade_nav / 100`; when available cash cannot fund all eligible
+buys plus costs, one common scale factor is applied to all of them.
+
+A buy requires a non-ST, non-suspended stock with at least 120 listing days,
+valid positive open, adjusted-open, and limit data, and an open at neither
+limit. A sell is blocked only by suspension, missing valid execution or
+valuation data, or an open at limit-down; ST status, listing age, and limit-up
+do not block a sale. Limit checks use unadjusted `raw_open`, `limit_up`, and
+`limit_down`; units and valuation use adjusted `post_open`. A holding without a
+valid mark carries its last valid adjusted-open mark until trading resumes. The
+period ends without forced liquidation.
+
+The execution and report formulas are:
+
+```text
+pre_trade_nav = cash + sum(units * current_or_carried_post_open)
+requested_buy_gross = pre_trade_nav / 100
+buy_cost = executed_buy_gross * (0.0001 commission + 0.0005 slippage)
+sell_cost = executed_sell_gross *
+            (0.0001 commission + 0.0005 slippage + 0.0005 stamp duty)
+end_nav = pre_trade_nav - total_cost
+gross_return = pre_trade_nav / prior_execution_end_nav - 1
+net_return = end_nav / prior_execution_end_nav - 1
+gross_turnover = (executed_buy_gross + executed_sell_gross) / pre_trade_nav
+one_way_turnover = gross_turnover / 2
+cumulative_return = ending_nav / initial_nav - 1
+cagr = (ending_nav / initial_nav) ** (252 / 484) - 1
+annualized_volatility = sample_std(net_return) * sqrt(252)
+sharpe_ratio = mean(net_return) / sample_std(net_return) * sqrt(252)
+max_drawdown = max(1 - nav / running_max_nav)
+win_rate = count(net_return > 0) / 484
+fill_rate = executed_orders / attempted_orders, separately by side
+```
+
+The initial NAV row is included in maximum drawdown and average cash ratio, but
+excluded from return, turnover, cost, and win-rate observations. Average
+turnover uses the 484 execution rows; annualized turnover multiplies the daily
+average by 252. `total_cost` is the sum of daily trade-level costs, and blocked
+sale days count distinct execution dates with at least one blocked sell.
+
+## Dynamic Forward Strategy
+
+`forward_strategy.py` is the independent entrypoint for extending the strategy
+past the sealed 2024-2025 test. It never trains or refits a model. It loads the
+five tracked artifacts under `rank_model/final_runs`, refreshes or validates the
+17 factor inputs, rebuilds the point-in-time features, scores all five models,
+and runs the same 10-day staggered strategy with ten trading-day offsets.
+
+With a valid RiceQuant account configured in `.env`, run from the repository
+root:
+
+```powershell
+& .\.venv\Scripts\python.exe -m rank_model.forward_strategy `
+  --config .\rank_model\forward_strategy.toml `
+  --update-data
+```
+
+When `--run-id` is omitted, the runner creates a readable local-time directory
+such as `forward_20260818_153045`. If that name already exists, it appends a
+sequence suffix instead of overwriting the previous run. A manual `--run-id`
+can still be supplied when a fixed name is needed.
+
+`--update-data` obtains the latest completed official trading date, rebuilds
+the complete 2019-to-latest factor and market inputs, and then performs frozen
+inference. It does not change anything under `final_runs`.
+
+When the data has already been copied into the configured local paths, use the
+offline data mode instead:
+
+```powershell
+& .\.venv\Scripts\python.exe -m rank_model.forward_strategy `
+  --config .\rank_model\forward_strategy.toml `
+  --local-only
+```
+
+The local mode requires all 17 factor files, `model/data/market_panel.csv`, and
+`model/data/trading_calendar.csv` to share the same maximum date. It never
+contacts RiceQuant. In either mode, the result is written to
+`rank_model/forward_strategy_runs/<run-id>/`, including the as-of date, the
+last complete 10-day signal date, five prediction files, ten offset paths per
+model, average NAV and metrics, and a five-model comparison table. The final
+incomplete horizon is excluded from the offset schedules, so the latest signal
+date is earlier than the latest available market date by the required T+1 entry
+and ten-day holding window.
+
+A colleague cannot complete this workflow with a RiceQuant account alone:
+the repository must also contain the five tracked frozen model directories
+listed above. The account supplies new observations; it does not recreate the
+frozen model parameters.
+
+Each directory under `rank_model/strategy_runs/<model-name>` contains:
+
+```text
+daily_nav.csv
+trades.parquet
+positions.parquet
+execution_diagnostics.csv
+ending_positions.csv
+metrics_summary.json
+manifest.json
+```
+
+The manifest records fixed settings, formula and observation contracts, row
+counts, and SHA-256 hashes for all eight sealed inputs and six report outputs.
+`ending_positions.csv` contains the final positions and cash snapshot for
+forward simulation. `rank_model/strategy_comparison.csv` contains exactly five
+rows with `model_name` plus the exact strategy metric schema; it intentionally
+has no winner, decision, acceptance, rejection, or parameter-update field.
+The adjacent `rank_model/strategy_comparison.manifest.json` is the comparison
+commit marker. It binds the CSV's physical and canonical logical SHA-256 hashes,
+ordered column/type schema and row count, the relative paths and SHA-256 hashes
+of all five source strategy manifests, and a sealed contract hash over common
+settings, formulas, observation conventions, and source-input provenance. A
+first publication stages both files and rolls the CSV back if the sidecar cannot
+be committed, so readers never accept a CSV without its provenance seal.
+
+## 2024-2025 锁定测试：十交易日错位换仓策略
+
+十交易日策略用于检验“每十个交易日换仓”是否对固定模型的表现更稳健，同时避免
+只选择某一个幸运起始日。它不是把一份资金拆成十份，而是为每个模型建立 **10 条彼此
+独立、各自以 1.0 初始净值运行的满资金路径**。在某条路径首次交易前，该路径始终
+保持全现金；十条路径只在研究汇总时等权平均。
+
+静态测试只使用 2024-01-02 至 2025-12-16 的 474 个完整信号日。按照官方交易日历将
+这些日期编号为 1 至 474；offset `k`（`k = 1..10`）使用编号
+`k, k + 10, k + 20, ...` 的日期。因此，十条路径合起来恰好覆盖每个完整信号日一次，
+不重叠也不遗漏。2025-12-17 至 2025-12-31 的信号没有完整的十日持有期，保留给
+2026 年后的前向模拟，不进入这里的静态测试。
+
+对任一排程信号日 `T`：
+
+```text
+T 收盘后：       只按当天有限的 score_raw 和 stock_code 的确定性顺序选出 Top100
+T+1 复权开盘：   执行该次调仓
+T+11 复权开盘：  该信号的完整十个交易日持有期终值；也是下一次同一路径调仓的执行时点
+```
+
+每条路径在自己的最后一个完整 `T+11` 开盘价处结束估值，不强制清仓。十条路径的
+终止日期最多相差九个交易日。研究平均净值只使用十条路径都实际有净值的共同区间：
+从 2024-01-02 的全现金初值到最早的完整终止日 2025-12-18，绝不为了对齐而向后填充
+任何路径。平均净值、收益、波动率、Sharpe、回撤、换手和成本都由平均后的实际经济量
+重新计算，不能把十条路径的 Sharpe 直接平均。
+
+调仓沿用日频策略的同一执行状态机和交易限制，并采用集合差换仓：新 Top100 与现有
+持仓的交集保留原有单位，不会先卖出再买回；仅尝试卖出不在新集合中的股票，并仅尝试
+买入新集合中尚未持有的股票。被阻塞的卖出订单只要仍不在目标集合中就会在每个交易日
+重试；买入失败后在本轮十交易日周期内不重试，也不以第 101 名或其他股票递补，所以
+未成交部分保持现金。ST、停牌、上市天数、涨跌停、价格有效性、仓位缩放、交易成本和
+持仓估值口径均与日频策略保持一致。
+
+在仓库根目录执行以下命令，按顺序为五个已冻结模型生成十交易日结果，再生成五模型
+汇总和日频对比。此工作流会运行真实的 2024-2025 锁定测试；不要把测试结果用于重新
+调参、重新训练、增删特征或修改策略参数，否则该测试集将不再是独立测试集。
+
+```powershell
+$python = ".\.venv\Scripts\python.exe"
+$models = @(
+  "ridge_rank_regression",
+  "xgboost_rank_regression",
+  "lightgbm_rank_regression",
+  "lightgbm_lambdarank",
+  "mlp_top100_hybrid_rank"
+)
+foreach ($model in $models) {
+  & $python -m rank_model.pipeline --config rank_model\config.toml `
+    backtest-strategy-10d --model $model
+}
+& $python -m rank_model.pipeline --config rank_model\config.toml `
+  compare-strategy-10d
+```
+
+每个模型在 `rank_model/strategy_10d_runs/<model-name>/` 下生成十个
+`offset_01` 至 `offset_10` 路径目录。每条路径都包含 `daily_nav.csv`、
+`trades.parquet`、`positions.parquet`、`execution_diagnostics.csv`、
+`ending_positions.csv`、`metrics_summary.json` 和 `manifest.json`，因此五个模型
+共计 50 份路径报告。模型目录同时包含：
+
+```text
+offset_metrics.csv      # 十条路径各自的指标
+offset_summary.csv      # 每项路径指标的均值、中位数、样本标准差、最小值、最大值
+average_nav.csv         # 十条独立满资金路径的共同区间平均净值
+average_metrics.json    # 由平均净值重新计算的整体指标
+manifest.json           # 排程、来源、设置和全部输出的封存清单
+```
+
+五模型横向结果写入 `rank_model/strategy_10d_comparison.csv` 及其 manifest；
+`rank_model/daily_vs_10d_comparison.csv` 及其 manifest 则对每个模型逐项给出
+“十交易日策略指标 - 日频策略指标”，包括收益、波动率、Sharpe、回撤、现金占比、
+年化换手和总成本。两张表都只呈现结果，不自动选择赢家。
+
+所有十交易日输出都是不可变的。`backtest-strategy-10d` 若发现同一模型目录已经存在
+会拒绝覆盖；`compare-strategy-10d` 若发现完整、哈希和来源均有效的既有 CSV/manifest
+对，会验证后原样返回，不重写文件。缺失、部分写入、来源变化或任何篡改都会失败关闭，
+而不是静默修补或覆盖旧结果。
 
 ## Artifacts
 

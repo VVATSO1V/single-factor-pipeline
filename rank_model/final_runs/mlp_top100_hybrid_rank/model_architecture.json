@@ -1,0 +1,12 @@
+{
+  "activation": "relu",
+  "dropout": 0.1,
+  "hidden_layers": [
+    128,
+    64,
+    32
+  ],
+  "input_dim": 142,
+  "model_name": "mlp_top100_hybrid_rank",
+  "output_bias": 0.5
+}
